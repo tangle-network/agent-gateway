@@ -9,6 +9,7 @@ export {
 export {
   checkRateLimit,
   MemoryRateLimitStore,
+  KvRateLimitStore,
   type RateLimitConfig,
   type RateLimitResult,
   type RateLimitStore,
@@ -23,8 +24,17 @@ export {
 } from './api-keys'
 export {
   MemoryNonceStore,
+  KvNonceStore,
   type NonceStore,
 } from './nonce-store'
+export {
+  ConsoleObserver,
+  CompositeObserver,
+  generateRequestId,
+  type GatewayObserver,
+  type RequestContext,
+  type AuthFailureReason,
+} from './observer'
 export {
   createPublishRoutes,
   type PublishedConfig,

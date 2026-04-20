@@ -10,6 +10,7 @@ import { verifyX402, verifyMpp, defaultVerifyApiKey } from './verify'
 import { filterConsumerMessagesStrict, redactSystemPromptFromOutput } from './filter'
 import { checkRateLimit, MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import { MemoryNonceStore } from './nonce-store'
+import { generateRequestId, type GatewayObserver, type RequestContext } from './observer'
 
 /**
  * Create a Hono router that serves the agent gateway.
@@ -28,6 +29,7 @@ export function createAgentGateway(config: GatewayConfig) {
   const globalRateLimit = config.rateLimit ?? { limit: 60, windowSeconds: 60 }
   const nonceStore = config.nonceStore ?? new MemoryNonceStore()
   const requiredScope = config.requiredScope ?? 'chat'
+  const obs: GatewayObserver | undefined = config.observer
 
   // --- Discovery endpoint (no auth) ---
 
@@ -75,6 +77,10 @@ export function createAgentGateway(config: GatewayConfig) {
   gw.post('/:slug/chat/completions', async (c) => {
     const slug = c.req.param('slug')
     const startMs = Date.now()
+    const requestId = generateRequestId()
+    const ctx: RequestContext = { requestId, agentSlug: slug, startMs }
+
+    await obs?.onRequestStart?.(ctx)
 
     // 1. Resolve agent
     const agent = await config.resolveAgent(slug)
@@ -85,6 +91,7 @@ export function createAgentGateway(config: GatewayConfig) {
     // 2. Body size limit (before parsing — DoS prevention)
     const contentLength = parseInt(c.req.header('Content-Length') ?? '0', 10)
     if (contentLength > 65536) {
+      await obs?.onBodyTooLarge?.(ctx, contentLength)
       return c.json(
         { error: { message: 'Request body too large (max 64KB)', type: 'invalid_request' } },
         413,
@@ -111,9 +118,10 @@ export function createAgentGateway(config: GatewayConfig) {
     if (spendAuthHeader) {
       const signer = await verifyX402(spendAuthHeader, config.x402, nonceStore)
       if (!signer) {
+        await obs?.onAuthFailure?.(ctx, { method: 'x402', code: 'invalid_spend_auth', httpStatus: 402 })
         return c.json(
           { error: { message: 'Invalid X-Payment-Signature', type: 'authentication_error', code: 'invalid_spend_auth' } },
-          { status: 402, headers: { 'X-Payment-Required': 'spendauth' } },
+          { status: 402, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': requestId } },
         )
       }
       consumerId = signer
@@ -123,9 +131,10 @@ export function createAgentGateway(config: GatewayConfig) {
       if (!signer) {
         const realm = config.mpp.realm
         const method = config.mpp.method ?? 'blueprintevm'
+        await obs?.onAuthFailure?.(ctx, { method: 'mpp', code: 'invalid_mpp_credential', httpStatus: 401 })
         return c.json(
           { error: { message: 'Invalid Payment credential', type: 'authentication_error', code: 'invalid_mpp_credential' } },
-          { status: 401, headers: { 'WWW-Authenticate': `Payment realm="${realm}", method="${method}"` } },
+          { status: 401, headers: { 'WWW-Authenticate': `Payment realm="${realm}", method="${method}"`, 'X-Request-Id': requestId } },
         )
       }
       consumerId = signer
@@ -134,14 +143,19 @@ export function createAgentGateway(config: GatewayConfig) {
       const verify = config.verifyApiKey ?? defaultVerifyApiKey
       const key = await verify(authHeader)
       if (!key) {
-        return c.json({ error: { message: 'Invalid API key', type: 'authentication_error' } }, 401)
+        await obs?.onAuthFailure?.(ctx, { method: 'apikey', code: 'invalid_api_key', httpStatus: 401 })
+        return c.json(
+          { error: { message: 'Invalid API key', type: 'authentication_error' } },
+          { status: 401, headers: { 'X-Request-Id': requestId } },
+        )
       }
 
       // Scope enforcement — API key must include the required scope
       if (key.scopes && key.scopes.length > 0 && !key.scopes.includes(requiredScope)) {
+        await obs?.onAuthFailure?.(ctx, { method: 'apikey', code: 'insufficient_scope', httpStatus: 403 })
         return c.json(
           { error: { message: `API key missing required scope: ${requiredScope}`, type: 'forbidden', code: 'insufficient_scope' } },
-          403,
+          { status: 403, headers: { 'X-Request-Id': requestId } },
         )
       }
 
@@ -150,11 +164,15 @@ export function createAgentGateway(config: GatewayConfig) {
       keyInfo = key
     } else {
       // No payment — return 402 with instructions
+      await obs?.onAuthFailure?.(ctx, { method: 'none', code: 'payment_required', httpStatus: 402 })
       const methods: string[] = ['x402']
       if (config.mpp) methods.push('mpp')
       methods.push('api_key')
 
-      const headers: Record<string, string> = { 'X-Payment-Required': methods.join(', ') }
+      const headers: Record<string, string> = {
+        'X-Payment-Required': methods.join(', '),
+        'X-Request-Id': requestId,
+      }
       if (config.mpp) {
         headers['WWW-Authenticate'] = `Payment realm="${config.mpp.realm}", method="${config.mpp.method ?? 'blueprintevm'}"`
       }
@@ -180,6 +198,8 @@ export function createAgentGateway(config: GatewayConfig) {
       }, { status: 402, headers })
     }
 
+    await obs?.onPaymentVerified?.(ctx, { method: paymentMethod, consumerId: consumerId!, keyId: keyInfo?.keyId })
+
     // 4. Rate limit — per-key override or global
     const effectiveRateLimit = keyInfo?.rateLimitPerMinute
       ? { limit: keyInfo.rateLimitPerMinute, windowSeconds: 60 }
@@ -187,9 +207,10 @@ export function createAgentGateway(config: GatewayConfig) {
 
     const rl = await checkRateLimit(consumerId!, effectiveRateLimit, rateLimitStore)
     if (!rl.allowed) {
+      await obs?.onRateLimited?.(ctx, { consumerId: consumerId!, retryAfterSeconds: rl.retryAfterSeconds ?? 60 })
       return c.json(
         { error: { message: 'Rate limit exceeded', type: 'rate_limit_error', retry_after: rl.retryAfterSeconds } },
-        { status: 429, headers: { 'Retry-After': String(rl.retryAfterSeconds ?? 60) } },
+        { status: 429, headers: { 'Retry-After': String(rl.retryAfterSeconds ?? 60), 'X-Request-Id': requestId } },
       )
     }
 
@@ -197,13 +218,16 @@ export function createAgentGateway(config: GatewayConfig) {
     const { messages: filtered, injectionWarnings } = filterConsumerMessagesStrict(body.messages, maxLen)
 
     if (injectionWarnings.length > 0) {
-      // Log injection attempt
-      console.warn(`[agent-gateway] injection detected from ${consumerId}: ${injectionWarnings.join(', ')}`)
+      await obs?.onInjectionDetected?.(ctx, {
+        consumerId: consumerId!,
+        patterns: injectionWarnings,
+        blocked: !!config.blockInjection,
+      })
 
       if (config.blockInjection) {
         return c.json(
           { error: { message: 'Request rejected: potential prompt injection detected', type: 'content_policy_violation' } },
-          400,
+          { status: 400, headers: { 'X-Request-Id': requestId } },
         )
       }
       // In non-blocking mode, continue but the warning is logged for auditing
@@ -219,7 +243,7 @@ export function createAgentGateway(config: GatewayConfig) {
     }
 
     // 6. Get sandbox and stream response with output filtering
-    let inputTokens = Math.ceil(userMessage.length / 4)
+    const inputTokens = Math.ceil(userMessage.length / 4)
     let outputTokens = 0
 
     const stream = new ReadableStream({
@@ -272,7 +296,7 @@ export function createAgentGateway(config: GatewayConfig) {
           const ownerEarned = totalCost * (1 - agent.platformFeePercent)
           const platformFee = totalCost * agent.platformFeePercent
 
-          await config.recordUsage({
+          const usageEvent = {
             agentId: agent.id,
             agentSlug: agent.slug,
             consumerId: consumerId!,
@@ -283,18 +307,26 @@ export function createAgentGateway(config: GatewayConfig) {
             ownerEarnedUsd: ownerEarned,
             platformFeeUsd: platformFee,
             durationMs: Date.now() - startMs,
-          })
+          }
+
+          await config.recordUsage(usageEvent)
+          await obs?.onRequestComplete?.(ctx, usageEvent)
 
           if (config.settlePayment) {
-            await config.settlePayment({ method: paymentMethod, consumerId: consumerId! }, totalCost).catch(err => {
-              console.error(`[agent-gateway] settlement failed for ${consumerId}: ${err instanceof Error ? err.message : err}`)
+            await config.settlePayment({ method: paymentMethod, consumerId: consumerId! }, totalCost).catch(async err => {
+              const msg = err instanceof Error ? err.message : String(err)
+              console.error(`[agent-gateway] settlement failed for ${consumerId}: ${msg}`)
+              await obs?.onSettlementError?.(ctx, { consumerId: consumerId!, method: paymentMethod, errorMessage: msg })
             })
           }
         } catch (err) {
           // Sanitize error — never expose stack traces or internal paths
-          const safeMessage = err instanceof Error
-            ? (err.message.includes('/') || err.message.includes('\\') ? 'Internal agent error' : err.message)
-            : 'Internal agent error'
+          const rawMessage = err instanceof Error ? err.message : String(err)
+          const safeMessage =
+            rawMessage.includes('/') || rawMessage.includes('\\')
+              ? 'Internal agent error'
+              : rawMessage
+          await obs?.onStreamError?.(ctx, { consumerId: consumerId!, errorMessage: rawMessage })
           controller.enqueue(
             encoder.encode(`data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`),
           )
@@ -308,6 +340,7 @@ export function createAgentGateway(config: GatewayConfig) {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
+        'X-Request-Id': requestId,
         'X-Agent-Slug': agent.slug,
         'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
         'X-Payment-Method': paymentMethod,

@@ -147,6 +147,14 @@ export interface GatewayConfig {
 
   /** Nonce replay protection store (default: in-memory). Rejects reused x402 nonces. */
   nonceStore?: import('./nonce-store').NonceStore
+
+  /**
+   * Observability hook. When set, the gateway emits typed events for request
+   * lifecycle, auth outcomes, rate limits, injection detection, usage, errors,
+   * and settlement failures. See ./observer.ts for the interface and
+   * ConsoleObserver / CompositeObserver implementations.
+   */
+  observer?: import('./observer').GatewayObserver
 }
 
 // --- Chat completion types (OpenAI-compatible) ---

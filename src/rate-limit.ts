@@ -1,6 +1,9 @@
 /**
- * Sliding window rate limiter.
- * In-memory by default. Override with KV-backed store for Workers.
+ * Sliding-window rate limiter.
+ *
+ * Two implementations:
+ *   - MemoryRateLimitStore — single-worker, ephemeral, good for tests
+ *   - KvRateLimitStore     — Cloudflare Workers KV, distributed
  */
 
 export interface RateLimitConfig {
@@ -23,6 +26,10 @@ export interface RateLimitStore {
   /** Set timestamps for this key (with TTL) */
   set(key: string, timestamps: number[], ttlSeconds: number): Promise<void>
 }
+
+// ---------------------------------------------------------------------------
+// In-memory implementation
+// ---------------------------------------------------------------------------
 
 /** In-memory rate limit store with periodic eviction */
 export class MemoryRateLimitStore implements RateLimitStore {
@@ -52,6 +59,60 @@ export class MemoryRateLimitStore implements RateLimitStore {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Cloudflare KV implementation
+// ---------------------------------------------------------------------------
+
+/** Minimal KV shape — see nonce-store.ts for rationale. */
+export interface KVNamespace {
+  get(key: string, options?: { type?: 'text' | 'json' }): Promise<string | null>
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>
+  delete(key: string): Promise<void>
+}
+
+/**
+ * KV-backed RateLimitStore for distributed Cloudflare Workers deployments.
+ *
+ * Stores timestamp arrays per consumer. Reads are O(1); writes replace the
+ * full array (cap is already filtered by checkRateLimit before write).
+ *
+ * Consistency note: Workers KV is eventually consistent within ~60s. An
+ * attacker sitting on two isolates could technically exceed the limit by
+ * ~2x for that window. For payment rate limits this is acceptable; for
+ * abuse prevention on free endpoints consider Durable Objects instead.
+ */
+export class KvRateLimitStore implements RateLimitStore {
+  constructor(
+    private readonly kv: KVNamespace,
+    private readonly prefix: string = 'rl',
+  ) {}
+
+  async get(key: string): Promise<number[]> {
+    const raw = await this.kv.get(this.key(key))
+    if (!raw) return []
+    try {
+      const arr = JSON.parse(raw) as unknown
+      return Array.isArray(arr) ? (arr as number[]).filter((t) => typeof t === 'number') : []
+    } catch {
+      return []
+    }
+  }
+
+  async set(key: string, timestamps: number[], ttlSeconds: number): Promise<void> {
+    // KV minimum TTL is 60 seconds
+    const ttl = Math.max(ttlSeconds, 60)
+    await this.kv.put(this.key(key), JSON.stringify(timestamps), { expirationTtl: ttl })
+  }
+
+  private key(key: string): string {
+    return `${this.prefix}:${key}`
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Core limiter
+// ---------------------------------------------------------------------------
 
 export async function checkRateLimit(
   consumerId: string,
