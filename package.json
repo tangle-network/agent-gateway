@@ -1,0 +1,45 @@
+{
+  "name": "@tangle-network/agent-gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "x402 + API key payment gateway for Tangle agent products. Mount on any Hono app to expose agents as paid OpenAI-compatible endpoints.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./middleware": {
+      "types": "./dist/middleware.d.ts",
+      "import": "./dist/middleware.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@tangle-network/sandbox": ">=0.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@tangle-network/sandbox": {
+      "optional": true
+    }
+  }
+}
