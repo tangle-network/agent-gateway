@@ -33,13 +33,5 @@
     "@types/node": "^25.6.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0"
-  },
-  "peerDependencies": {
-    "@tangle-network/sandbox": ">=0.0.1"
-  },
-  "peerDependenciesMeta": {
-    "@tangle-network/sandbox": {
-      "optional": true
-    }
   }
 }
