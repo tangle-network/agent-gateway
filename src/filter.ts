@@ -17,21 +17,52 @@ const INJECTION_PATTERNS = [
   // Prompt extraction
   /what\s+(is|are)\s+your\s+(system\s+)?(prompt|instructions?|rules?|directives?)/i,
   /repeat\s+(your|the)\s+(system\s+)?(prompt|instructions?)/i,
-  /output\s+(your|the)\s+(system\s+)?(prompt|instructions?)/i,
-  /show\s+me\s+(your|the)\s+(system|hidden|secret)\s+(prompt|instructions?|message)/i,
+  /output\s+(your|the)\s+((system|initial|original|first|full|real|hidden|secret|raw|exact)\s+)?(prompt|instructions?)/i,
+  /show\s+(me\s+)?(your|the)\s+((system|hidden|secret|initial|original)\s+)?(prompt|instructions?|message|directives?)/i,
+  /tell\s+me\s+(your|the)\s+(system\s+)?(prompt|instructions?|rules?)/i,
+  // Developer/debug/admin/jailbreak mode override
+  /(developer|debug|admin|god|sudo|jailbreak|unrestricted|maintenance)\s+mode/i,
+  // Safety/safeguard disablement
+  /(disable|bypass|override|remove|turn\s+off)\s+(your\s+|the\s+)?(safety|safeguards?|guardrails?|filters?|restrictions?|rules?|limitations?|content\s+policy)/i,
+  // Role reversal
+  /(from\s+now\s+on|starting\s+now|now)\s+you('re|\s+are)\s+(the\s+)?(user|human|customer|assistant)/i,
+  /i('m|\s+am)\s+(the\s+)?(assistant|ai|model|llm|bot)/i,
+  // Tool-call / JSON-shaped spoofs
+  /"(?:tool|function|action|call)"\s*:\s*"[^"]*(exfiltrate|leak|reveal|dump|extract|steal)[^"]*"/i,
+  /exfiltrate[_\s]*(system|prompt|secret|vault|config|data)/i,
   // Data exfiltration
   /read\s+(the\s+)?(vault|workspace|config|secret|\.env)/i,
   /cat\s+\/home\/agent\/(vault|config|\.env|secrets?)/i,
   /list\s+(all\s+)?(vault|workspace|secret)\s+(files?|contents?|data)/i,
 ]
 
-// Unicode normalization — collapse homoglyphs and zero-width chars
+// Unicode normalization.
+//
+// Attacks insert zero-width chars between every word so `\s+`-anchored
+// regexes don't fire. Stripping entirely leaves attack text as one glued
+// token which ALSO dodges `\s+`. Split the handling: U+200B ZWSP,
+// U+200C ZWNJ, U+FEFF ZWNBSP are commonly used in attacks and get
+// replaced with a real SPACE so regexes see tokenized text. U+200D ZWJ
+// + directional marks are legitimately used in scripts like Hindi and
+// Arabic; strip without replacement so we don't spuriously split
+// legitimate words. NFKC collapses homoglyphs (Cyrillic a → Latin a, fullwidth → ascii).
 function normalizeUnicode(text: string): string {
   return text
-    // Remove zero-width chars (ZWJ, ZWNJ, ZWS, ZWSP)
-    .replace(/[\u200B-\u200F\u2028-\u202F\u2060\uFEFF]/g, '')
-    // Normalize to NFKC (collapses homoglyphs like а→a, е→e)
+    .replace(/[\u200B\u200C\uFEFF]/g, ' ')
+    .replace(/[\u200D\u200E\u200F\u2028-\u202F\u2060]/g, '')
     .normalize('NFKC')
+}
+
+// Detection-only normalization on top of `normalizeUnicode`. Collapses
+// punctuation/bracket runs between word chars into a single space so
+// adversarial noise (`Ignore,,, all...`, `(ignore) [all] {previous}`)
+// survives \s+-anchored pattern match. Never applied to redaction
+// because redaction patterns reference literal punctuation
+// (`config\.json`, `\.env`) that we must preserve.
+function normalizeForDetection(text: string): string {
+  return normalizeUnicode(text)
+    .replace(/[(){}\[\]<>,.!?:;"`~]+/g, ' ')
+    .replace(/\s+/g, ' ')
 }
 
 /**
@@ -39,7 +70,7 @@ function normalizeUnicode(text: string): string {
  * Returns array of matched pattern descriptions, empty if clean.
  */
 export function detectInjection(content: string): string[] {
-  const normalized = normalizeUnicode(content)
+  const normalized = normalizeForDetection(content)
   const matches: string[] = []
 
   for (const pattern of INJECTION_PATTERNS) {
