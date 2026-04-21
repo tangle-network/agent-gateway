@@ -124,6 +124,18 @@ function normalizeForDetection(text: string): string {
     .replace(/\s+/g, ' ')
 }
 
+// Third pass: also collapse square brackets. Literal `[system]` /
+// `[INST]` patterns are matched against the other two passes (which
+// preserve brackets); this pass catches the OPPOSITE evasion where
+// the attacker wraps tokens in brackets to split them for \s+-anchored
+// regexes — e.g. `(ignore) [all] {previous} <instructions>` should
+// still match the baseline pattern.
+function normalizeForDetectionNoBrackets(text: string): string {
+  return normalizeForDetection(text)
+    .replace(/[\[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+}
+
 /**
  * Detect prompt injection attempts.
  * Returns array of matched pattern descriptions, empty if clean.
@@ -137,10 +149,11 @@ function normalizeForDetection(text: string): string {
 export function detectInjection(content: string): string[] {
   const stripNorm = normalizeUnicode(content)
   const detectNorm = normalizeForDetection(content)
+  const noBracketNorm = normalizeForDetectionNoBrackets(content)
   const matches: string[] = []
 
   for (const pattern of INJECTION_PATTERNS) {
-    if (pattern.test(stripNorm) || pattern.test(detectNorm)) {
+    if (pattern.test(stripNorm) || pattern.test(detectNorm) || pattern.test(noBracketNorm)) {
       matches.push(pattern.source.slice(0, 60))
     }
   }

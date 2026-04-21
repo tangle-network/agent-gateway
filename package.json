@@ -1,6 +1,6 @@
 {
   "name": "@tangle-network/agent-gateway",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "type": "module",
   "description": "x402 + API key payment gateway for Tangle agent products. Mount on any Hono app to expose agents as paid OpenAI-compatible endpoints.",
   "exports": {
