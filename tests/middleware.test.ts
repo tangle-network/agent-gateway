@@ -63,21 +63,26 @@ interface Harness {
   agent: AgentMeta
   sandbox: StubSandbox
   usage: GatewayUsageEvent[]
-  settlements: Array<{ method: string; consumerId: string; cost: number }>
+  settlements: Array<{ method: string; consumerId: string; requestId: string; cost: number }>
 }
 
 function buildHarness(cfg: Partial<GatewayConfig> = {}, chunks = ['Hello', ', ', 'world!']): Harness {
   const sandbox = new StubSandbox(chunks)
   const agent = makeAgent()
   const usage: GatewayUsageEvent[] = []
-  const settlements: Array<{ method: string; consumerId: string; cost: number }> = []
+  const settlements: Array<{ method: string; consumerId: string; requestId: string; cost: number }> = []
 
   const gw = createAgentGateway({
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async (evt) => { usage.push(evt) },
     settlePayment: async (payment, cost) => {
-      settlements.push({ method: payment.method, consumerId: payment.consumerId, cost })
+      settlements.push({
+        method: payment.method,
+        consumerId: payment.consumerId,
+        requestId: payment.requestId,
+        cost,
+      })
     },
     x402: { operatorAddress, chainId: 3799, demoMode: true },
     rateLimitStore: new MemoryRateLimitStore(),
@@ -245,6 +250,40 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     // Settlement invoked
     expect(settlements).toHaveLength(1)
     expect(settlements[0].method).toBe('x402')
+
+    // requestId is present on BOTH the usage event and the
+    // settlement, AND they match — this is the contract that lets
+    // consumers correlate revenue per-request without scanning a
+    // FIFO queue keyed by consumerId.
+    expect(usage[0].requestId).toMatch(/.+/)
+    expect(settlements[0].requestId).toBe(usage[0].requestId)
+  })
+
+  it('threads a unique requestId per concurrent request — regression: two same-consumer requests get distinct ids', async () => {
+    const { app, settlements, usage } = buildHarness({}, ['ok'])
+    const requests = await Promise.all([
+      app.request('/v1/agents/test-agent/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth({ nonce: '1001' }) },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'a' }] }),
+      }),
+      app.request('/v1/agents/test-agent/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth({ nonce: '1002' }) },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'b' }] }),
+      }),
+    ])
+    // Drain both streams so the gateway runs settlement.
+    await Promise.all(requests.map((r) => readSse(r)))
+
+    expect(settlements).toHaveLength(2)
+    expect(usage).toHaveLength(2)
+    const settleIds = new Set(settlements.map((s) => s.requestId))
+    const usageIds = new Set(usage.map((u) => u.requestId))
+    expect(settleIds.size).toBe(2)
+    expect(usageIds.size).toBe(2)
+    // Per-request match: every settlement's requestId appears in usage.
+    for (const s of settlements) expect(usageIds.has(s.requestId)).toBe(true)
   })
 
   it('rejects nonce replay across requests — regression: same signed payload must not pay for two requests', async () => {

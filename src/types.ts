@@ -52,6 +52,16 @@ export interface MppConfig {
 export interface PaymentResult {
   method: PaymentMethod
   consumerId: string
+  /**
+   * Per-request id (matches `RequestContext.requestId` from the
+   * Observer pattern). Threaded into `settlePayment` so callers can
+   * attribute revenue deterministically per-request without scanning
+   * a FIFO queue keyed by consumerId — when the same consumer is
+   * paying for two concurrent requests against agents A and B, FIFO
+   * misroutes one. With `requestId` the call site can write a
+   * settlement row keyed exactly to the request that earned it.
+   */
+  requestId: string
 }
 
 export interface ApiKeyInfo {
@@ -68,6 +78,15 @@ export interface ApiKeyInfo {
 // --- Usage tracking ---
 
 export interface GatewayUsageEvent {
+  /**
+   * Per-request id (matches `RequestContext.requestId`). Lets
+   * `recordUsage` correlate the usage row to the same request that
+   * `settlePayment` settles, observability hooks observe, and
+   * `onRequestComplete` reports — without re-deriving from a
+   * synthetic key. Required field as of 0.4.0; the gateway always has
+   * it in scope at the recordUsage call site.
+   */
+  requestId: string
   agentId: string
   agentSlug: string
   consumerId: string

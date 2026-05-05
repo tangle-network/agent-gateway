@@ -297,6 +297,7 @@ export function createAgentGateway(config: GatewayConfig) {
           const platformFee = totalCost * agent.platformFeePercent
 
           const usageEvent = {
+            requestId: ctx.requestId,
             agentId: agent.id,
             agentSlug: agent.slug,
             consumerId: consumerId!,
@@ -313,7 +314,10 @@ export function createAgentGateway(config: GatewayConfig) {
           await obs?.onRequestComplete?.(ctx, usageEvent)
 
           if (config.settlePayment) {
-            await config.settlePayment({ method: paymentMethod, consumerId: consumerId! }, totalCost).catch(async err => {
+            await config.settlePayment(
+              { method: paymentMethod, consumerId: consumerId!, requestId: ctx.requestId },
+              totalCost,
+            ).catch(async err => {
               const msg = err instanceof Error ? err.message : String(err)
               console.error(`[agent-gateway] settlement failed for ${consumerId}: ${msg}`)
               await obs?.onSettlementError?.(ctx, { consumerId: consumerId!, method: paymentMethod, errorMessage: msg })
