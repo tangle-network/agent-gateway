@@ -23,6 +23,14 @@ import { generateRequestId, type GatewayObserver, type RequestContext } from './
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
 export function createAgentGateway(config: GatewayConfig) {
+  // Production gateways must verify x402 signatures. Tests and local
+  // dev can opt into the explicit demo path.
+  if (!config.x402.verifySigner && !config.x402.demoMode) {
+    throw new Error(
+      'createAgentGateway: x402.verifySigner is required in production. ' +
+        'For tests, set x402.demoMode: true explicitly.',
+    )
+  }
   const gw = new Hono()
   const maxLen = config.maxMessageLength ?? 8000
   const rateLimitStore: RateLimitStore = config.rateLimitStore ?? new MemoryRateLimitStore()
@@ -240,6 +248,29 @@ export function createAgentGateway(config: GatewayConfig) {
 
     if (!userMessage) {
       return c.json({ error: { message: 'No user message provided', type: 'invalid_request' } }, 400)
+    }
+
+    // 5b. Optional host authorization. Runs after payment/rate-limit
+    // checks and before sandbox allocation.
+    if (config.authorizeConsumer) {
+      const authz = await config.authorizeConsumer(agent, {
+        method: paymentMethod,
+        consumerId: consumerId!,
+        keyId: keyInfo?.keyId,
+        requestId,
+      })
+      if (!authz.allow) {
+        return c.json(
+          {
+            error: {
+              message: authz.reason,
+              type: 'authorization_denied',
+              code: authz.code,
+            },
+          },
+          { status: 403, headers: { 'X-Request-Id': requestId } },
+        )
+      }
     }
 
     // 6. Get sandbox and stream response with output filtering

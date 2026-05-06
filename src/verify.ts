@@ -5,8 +5,12 @@ import type { NonceStore } from './nonce-store'
  * Verify x402 SpendAuth signature (EIP-712).
  * Returns the signer address (commitment) if valid, null otherwise.
  *
- * DEMO MODE (demoMode: true): accepts any well-formed header structure.
- * PRODUCTION: requires config.verifySigner callback for on-chain verification.
+ *   demoMode: true               — accepts any well-formed header
+ *                                  shape after replay/expiry checks.
+ *                                  Tests + local dev only.
+ *   verifySigner present         — production verification path.
+ *   neither                      — rejected by createAgentGateway and
+ *                                  by this function as defense-in-depth.
  */
 export async function verifyX402(
   spendAuthHeader: string,
@@ -37,12 +41,11 @@ export async function verifyX402(
       await nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
     }
 
-    // Production: delegate to on-chain verification
     if (config.verifySigner) {
       const verified = await config.verifySigner(raw)
       if (!verified) return null
     } else if (!config.demoMode) {
-      console.warn('[agent-gateway] x402 verification running without verifySigner — set demoMode: true to suppress this warning')
+      return null
     }
 
     return raw.commitment
