@@ -467,6 +467,88 @@ describe('POST /:slug/chat/completions — injection blocking', () => {
   })
 })
 
+describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
+  it('blocks consumers an authorizeConsumer hook denies — regression: hosts must be able to allowlist', async () => {
+    const calls: Array<{ agentId: string; consumerId: string; requestId: string }> = []
+    const { app } = buildHarness({
+      authorizeConsumer: async (agent, consumer) => {
+        calls.push({ agentId: agent.id, consumerId: consumer.consumerId, requestId: consumer.requestId })
+        return { allow: false, reason: 'consumer not on allowlist for this instance', code: 'consumer_not_allowed' }
+      },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth({ nonce: '5001' }) },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(res.status).toBe(403)
+    const body = await res.json() as { error: { message: string; code: string; type: string } }
+    expect(body.error.code).toBe('consumer_not_allowed')
+    expect(body.error.type).toBe('authorization_denied')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].consumerId).toBeTruthy()
+    expect(calls[0].requestId).toMatch(/.+/)
+  })
+
+  it('allows the call to proceed when authorizeConsumer returns allow: true', async () => {
+    const { app, usage } = buildHarness({
+      authorizeConsumer: async () => ({ allow: true }),
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth({ nonce: '5002' }) },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(res.status).toBe(200)
+    await readSse(res)
+    expect(usage).toHaveLength(1)
+  })
+
+  it('does not call getSandbox when authorizeConsumer denies — regression: never pay sandbox cost for a forbidden caller', async () => {
+    let getSandboxCalls = 0
+    const sandbox = new StubSandbox(['ok'])
+    const { app } = buildHarness({
+      getSandbox: async () => { getSandboxCalls++; return sandbox },
+      authorizeConsumer: async () => ({ allow: false, reason: 'no', code: 'denied' }),
+    })
+    await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth({ nonce: '5003' }) },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(getSandboxCalls).toBe(0)
+  })
+})
+
+describe('createAgentGateway — production-config guard', () => {
+  it('refuses to boot when neither verifySigner nor demoMode is set', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: { operatorAddress, chainId: 3799 }, // no verifySigner, no demoMode
+    })).toThrow(/verifySigner is required in production/)
+  })
+
+  it('boots when demoMode: true is set explicitly (test path)', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: { operatorAddress, chainId: 3799, demoMode: true },
+    })).not.toThrow()
+  })
+
+  it('boots when verifySigner is supplied (production path)', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: { operatorAddress, chainId: 3799, verifySigner: async () => true },
+    })).not.toThrow()
+  })
+})
+
 describe('POST /:slug/chat/completions — error safety', () => {
   it('sanitizes errors from sandbox — regression: stack traces must not leak internal paths', async () => {
     const throwingBox: SandboxBox = {

@@ -21,6 +21,40 @@ export interface AgentMeta {
   remoteBearerToken: string | null
   /** Whether agent is published and accepting requests */
   enabled: boolean
+  /**
+   * CLI harness backend that runs this agent inside the sandbox sidecar.
+   *
+   * When set, the host's `getSandbox()` SHOULD return a `SandboxBox`
+   * whose `streamPrompt` POSTs to the sidecar's
+   * `POST /agent/invoke/chat/completions` endpoint with
+   * `model: "<harness>/<harnessModel>"` — that endpoint runs the
+   * harness against the sandbox workspace and streams OpenAI-shape
+   * `chat.completion.chunk` frames back.
+   *
+   * When unset (legacy / template mode), the host's `streamPrompt`
+   * falls back to the template's own `/api/chat/completions` (proxied
+   * via the sidecar's `/agent/invoke`).
+   *
+   * Known harnesses (registered in agent-dev-container's
+   * cli-agent-bindings.ts): opencode, claude-code, codex, kimi-code,
+   * amp, factory-droids, pi, hermes, openclaw, forge, acp, cursor.
+   * Aliases the sidecar canonicalizes: claude → claude-code,
+   * kimi → kimi-code, factory → factory-droids.
+   */
+  harness?: string
+  /**
+   * Model identifier to pass after the harness in the
+   * `<harness>/<model>` slash form. Format is harness-specific:
+   *   claude-code:   "sonnet", "opus", or a versioned id like
+   *                  "claude-sonnet-4-20250514"
+   *   opencode:      "anthropic/claude-sonnet-4-5", "openai/gpt-4o", …
+   *                  (opencode embeds provider before model)
+   *   codex:         "gpt-5-codex"
+   *   kimi-code:     "kimi-for-coding"
+   *
+   * Only meaningful when `harness` is set; ignored otherwise.
+   */
+  harnessModel?: string
 }
 
 // --- Payment ---
@@ -122,6 +156,16 @@ export interface GatewayConfig {
 
   /** Get a sandbox instance for the agent. Called after payment is verified. */
   getSandbox: (agent: AgentMeta) => Promise<SandboxBox>
+
+  /**
+   * Optional host authorization hook fired after payment verification
+   * and before sandbox resolution. Use it for per-agent allowlists,
+   * per-consumer quotas, contract scope checks, and instance ownership.
+   */
+  authorizeConsumer?: (
+    agent: AgentMeta,
+    consumer: { method: PaymentMethod; consumerId: string; keyId?: string; requestId: string },
+  ) => Promise<{ allow: true } | { allow: false; reason: string; code: string }>
 
   /** Record a usage event after request completes. */
   recordUsage: (event: GatewayUsageEvent) => Promise<void>
