@@ -153,6 +153,15 @@ export interface SandboxStreamEvent {
     part?: { type?: string; text?: string }
     delta?: string
     finalText?: string
+    /**
+     * Optional sandbox-side signal that the agent has paused and is waiting
+     * for additional input from the caller. The A2A gateway translates this
+     * into an `input-required` task status; the caller can then submit a
+     * follow-up `message/send` with the same `taskId` to continue. Ignored
+     * by the OpenAI-compat path. Carry an optional `prompt` to surface to
+     * the caller (rendered as the input-required message body).
+     */
+    inputRequired?: { prompt?: string }
   }
 }
 
@@ -242,7 +251,33 @@ export interface GatewayConfig {
    * `InMemoryTaskStore`; swap in D1/postgres/DO for durable deployments.
    */
   a2a?: {
+    /**
+     * Where tasks live. Defaults to `InMemoryTaskStore`; swap in
+     * `SqlTaskStore` (D1, postgres, sqlite, libSQL) for durability across
+     * gateway restarts.
+     */
     taskStore?: import('./a2a/task-store').TaskStore
+    /**
+     * Where push notification configs live. When set, the gateway advertises
+     * `capabilities.pushNotifications: true` and exposes the four
+     * `tasks/pushNotificationConfig/*` JSON-RPC methods. Defaults to
+     * undefined (push support disabled), so the agent card honestly reflects
+     * what the gateway will actually do.
+     */
+    pushStore?: import('./a2a/push-notifications').PushNotificationStore
+    /**
+     * Shared HMAC secret used to sign webhook deliveries (`X-A2A-Signature:
+     * sha256=<hex>`). The consumer's webhook verifies the body against this
+     * secret to confirm the call originated from this gateway. Required when
+     * `pushStore` is set; without it, deliveries fire unsigned and a
+     * malicious party that knows the webhook URL can forge deliveries.
+     */
+    webhookSecret?: string
+    /**
+     * Optional fetcher override for webhook delivery. Defaults to global
+     * `fetch`. Override for tests or to wire a queue-backed sender.
+     */
+    pushFetcher?: typeof fetch
   }
 }
 

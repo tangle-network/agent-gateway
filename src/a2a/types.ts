@@ -4,12 +4,14 @@
  * Subset shipped by this gateway:
  *   - Discovery: AgentCard via `.well-known/agent.json`
  *   - Messaging: `message/send`, `message/stream`
- *   - Task control: `tasks/get`, `tasks/cancel`
- *   - Capabilities: streaming = true; pushNotifications + stateTransitionHistory = false
+ *   - Task control: `tasks/get`, `tasks/cancel`, `tasks/resubscribe`
+ *   - Push: `tasks/pushNotificationConfig/{set,get,list,delete}` (gated on `pushStore`)
+ *   - Multi-turn: `input-required` state + follow-up `message/send` with the same `taskId`
+ *   - Capabilities: streaming = true; pushNotifications gated on config; stateTransitionHistory = false
  *   - Parts: text only on input/output (data/file parts rejected with CONTENT_TYPE_NOT_SUPPORTED)
  *
- * Deferred until a real consumer needs them: push notifications, resubscribe,
- * authenticated extended card, data/file parts.
+ * Deferred until a real consumer needs them: authenticated extended card,
+ * data/file parts, OAuth2/mTLS auth schemes.
  */
 
 // ── JSON-RPC 2.0 envelopes ───────────────────────────────────────────────
@@ -48,6 +50,7 @@ export const A2A_ERROR_CODES = {
   UNSUPPORTED_OPERATION: -32004,
   CONTENT_TYPE_NOT_SUPPORTED: -32005,
   INVALID_AGENT_RESPONSE: -32006,
+  AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED: -32007,
 } as const
 
 // ── Message parts ────────────────────────────────────────────────────────
@@ -157,6 +160,14 @@ export interface MessageSendParams {
 
 export interface TaskIdParams {
   id: string
+  metadata?: Record<string, unknown>
+}
+
+export interface TaskPushNotificationConfigGetParams {
+  /** Task id whose configs are being queried. */
+  id: string
+  /** Specific config id to fetch. Required for `set` and `delete`; omitted for `list`. */
+  pushNotificationConfigId?: string
   metadata?: Record<string, unknown>
 }
 

@@ -64,6 +64,23 @@ export type {
 // consumers only import these to BYO a durable TaskStore (D1, postgres, DO)
 // or to declare richer AgentMeta.skills for the Agent Card.
 export { InMemoryTaskStore, type TaskStore } from './a2a/task-store'
+export {
+  type D1DatabaseLike,
+  type D1StmtLike,
+  d1ToSqlAdapter,
+  type SqlAdapter,
+  SqlTaskStore,
+} from './a2a/task-store-sql'
+export {
+  deliverPushNotifications,
+  InMemoryPushNotificationStore,
+  type PushDeliveryResult,
+  type PushNotificationAuthentication,
+  type PushNotificationConfig,
+  type PushNotificationStore,
+  SqlPushNotificationStore,
+  type TaskPushNotificationConfig,
+} from './a2a/push-notifications'
 export type {
   AgentCard,
   AgentCapabilities,
@@ -84,6 +101,7 @@ export type {
   Task,
   TaskArtifactUpdateEvent,
   TaskIdParams,
+  TaskPushNotificationConfigGetParams,
   TaskState,
   TaskStatus,
   TaskStatusUpdateEvent,

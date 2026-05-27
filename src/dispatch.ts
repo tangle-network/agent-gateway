@@ -331,10 +331,52 @@ export async function* dispatchSandboxStream(
   consumerId: string,
   config: GatewayConfig,
   signal?: AbortSignal,
+  sessionId?: string,
 ): AsyncIterable<string> {
+  for await (const event of dispatchSandboxStreamRich(
+    agent,
+    userMessage,
+    consumerId,
+    config,
+    signal,
+    sessionId,
+  )) {
+    if (event.kind === 'text') yield event.delta
+  }
+}
+
+/**
+ * A2A-shaped dispatch event. Distinguishes text deltas from sandbox-signalled
+ * pause-for-input events. The A2A handler uses this richer variant so it can
+ * emit `input-required` status updates; the OpenAI-compat path consumes the
+ * text-only `dispatchSandboxStream` adapter above.
+ */
+export type A2ADispatchEvent =
+  | { kind: 'text'; delta: string }
+  | { kind: 'input-required'; prompt?: string }
+
+/**
+ * Like `dispatchSandboxStream` but yields a discriminated union so callers can
+ * react to `input-required` signals from the sandbox. The sandbox opts in by
+ * emitting `{ type: 'input-required', data: { inputRequired: { prompt? } } }`
+ * (or by setting `data.inputRequired` on any event); sandboxes that don't
+ * emit such events see identical behavior.
+ *
+ * `sessionId` defaults to `consumer:<id>` matching the existing single-turn
+ * path; multi-turn continuations pass an explicit `taskId` so the sandbox can
+ * keep per-task conversation memory.
+ */
+export async function* dispatchSandboxStreamRich(
+  agent: AgentMeta,
+  userMessage: string,
+  consumerId: string,
+  config: GatewayConfig,
+  signal?: AbortSignal,
+  sessionId?: string,
+): AsyncIterable<A2ADispatchEvent> {
   const box = await config.getSandbox(agent)
   const promptStream = box.streamPrompt(userMessage, {
-    sessionId: `consumer:${consumerId}`,
+    sessionId: sessionId ?? `consumer:${consumerId}`,
     systemPrompt: agent.systemPrompt,
   })
   for await (const event of promptStream) {
@@ -344,7 +386,17 @@ export async function* dispatchSandboxStream(
       event.data?.part?.type === 'text' &&
       event.data.delta
     ) {
-      yield redactSystemPromptFromOutput(event.data.delta, agent.systemPrompt)
+      yield {
+        kind: 'text',
+        delta: redactSystemPromptFromOutput(event.data.delta, agent.systemPrompt),
+      }
+      continue
+    }
+    if (event.type === 'input-required' || event.data?.inputRequired) {
+      yield { kind: 'input-required', prompt: event.data?.inputRequired?.prompt }
+      // Terminal for the sandbox stream — sandbox SHOULD stop emitting until
+      // the gateway dispatches a continuation message with the new user input.
+      return
     }
   }
 }

@@ -137,7 +137,8 @@ export function createAgentGateway(config: GatewayConfig) {
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
   const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
-  const a2a = createA2AHandlers({ config, state, taskStore })
+  const pushStore = config.a2a?.pushStore
+  const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
   gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
   gw.post('/:slug', a2a.handleJsonRpc)
 
