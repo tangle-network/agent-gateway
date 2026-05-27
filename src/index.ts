@@ -57,3 +57,36 @@ export type {
   ChatCompletionRequest,
   ChatCompletionChunk,
 } from './types'
+
+// --- A2A protocol surface (Google Agent-to-Agent) ---
+// Types + task-store adapter. Handlers are wired automatically by
+// createAgentGateway when `GatewayConfig.a2a` (or its default) is honored;
+// consumers only import these to BYO a durable TaskStore (D1, postgres, DO)
+// or to declare richer AgentMeta.skills for the Agent Card.
+export { InMemoryTaskStore, type TaskStore } from './a2a/task-store'
+export type {
+  AgentCard,
+  AgentCapabilities,
+  AgentCardAuthentication,
+  AgentProvider,
+  AgentSkill,
+  Artifact,
+  DataPart,
+  FilePart,
+  JSONRPCErrorResponse,
+  JSONRPCRequest,
+  JSONRPCResponse,
+  JSONRPCSuccessResponse,
+  Message,
+  MessageSendParams,
+  Part,
+  StreamingEvent,
+  Task,
+  TaskArtifactUpdateEvent,
+  TaskIdParams,
+  TaskState,
+  TaskStatus,
+  TaskStatusUpdateEvent,
+  TextPart,
+} from './a2a/types'
+export { A2A_ERROR_CODES } from './a2a/types'
