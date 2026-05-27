@@ -55,6 +55,18 @@ export interface AgentMeta {
    * Only meaningful when `harness` is set; ignored otherwise.
    */
   harnessModel?: string
+  /**
+   * Optional human description surfaced in the A2A Agent Card. Defaults to
+   * `"{slug} agent"` when absent.
+   */
+  description?: string
+  /**
+   * Optional A2A skill descriptors. Each entry advertises what the agent
+   * can do so non-Tangle A2A clients can select agents by capability. When
+   * absent, the gateway synthesizes a single default `chat` skill from
+   * `slug` + `description`.
+   */
+  skills?: import('./a2a/types').AgentSkill[]
 }
 
 // --- Payment ---
@@ -218,6 +230,20 @@ export interface GatewayConfig {
    * ConsoleObserver / CompositeObserver implementations.
    */
   observer?: import('./observer').GatewayObserver
+
+  /**
+   * A2A protocol configuration. When set, the gateway exposes the A2A
+   * surface alongside its OpenAI-compatible endpoints:
+   *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
+   *   POST /:slug                          — JSON-RPC 2.0 endpoint
+   *     methods: message/send, message/stream, tasks/get, tasks/cancel
+   * Auth + rate-limit + injection-filter + authorization all share the
+   * same pipeline as the OpenAI-compat path. `taskStore` defaults to
+   * `InMemoryTaskStore`; swap in D1/postgres/DO for durable deployments.
+   */
+  a2a?: {
+    taskStore?: import('./a2a/task-store').TaskStore
+  }
 }
 
 // --- Chat completion types (OpenAI-compatible) ---
