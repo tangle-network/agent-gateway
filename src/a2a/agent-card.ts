@@ -43,7 +43,7 @@ export function buildAgentCard(
     provider: { organization: 'Tangle', url: 'https://tangle.tools' },
     capabilities: {
       streaming: true,
-      pushNotifications: false,
+      pushNotifications: !!config.a2a?.pushStore,
       stateTransitionHistory: false,
     },
     authentication: { schemes },
