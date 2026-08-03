@@ -1,5 +1,25 @@
-import type { X402Config, MppConfig, ApiKeyInfo } from './types'
+import type { X402Config, MppConfig, ApiKeyInfo, GatewayConfig } from './types'
 import type { NonceStore } from './nonce-store'
+
+/** Pure capability checks shared by discovery and every request protocol. */
+export function isApiKeyAuthEnabled(
+  config: Pick<GatewayConfig, 'verifyApiKey' | 'x402'>,
+): boolean {
+  return config.verifyApiKey !== undefined || config.x402.demoMode === true
+}
+
+/** MPP is enabled only when a real verifier or explicit demo mode exists. */
+export function isMppAuthEnabled(
+  config: Pick<GatewayConfig, 'mpp' | 'x402'>,
+): boolean {
+  const method = config.mpp?.method ?? 'blueprintevm'
+  return Boolean(
+    config.mpp &&
+      (config.mpp.verifySigner !== undefined ||
+        (method === 'blueprintevm' && config.x402.verifySigner !== undefined) ||
+        config.x402.demoMode === true),
+  )
+}
 
 /**
  * Verify x402 SpendAuth signature (EIP-712).
@@ -32,20 +52,22 @@ export async function verifyX402(
     // Reject zero-amount payments
     if (amount <= 0n) return null
 
-    // Reject replayed nonces
     const nonceKey = `${raw.commitment}:${nonce.toString()}`
-    if (nonceStore) {
-      if (await nonceStore.hasSeen(nonceKey)) return null
-      // Mark seen with TTL matching the expiry window (max 1 hour)
-      const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
-      await nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
-    }
+    if (nonceStore && await nonceStore.hasSeen(nonceKey)) return null
 
     if (config.verifySigner) {
       const verified = await config.verifySigner(raw)
       if (!verified) return null
     } else if (!config.demoMode) {
       return null
+    }
+
+    // Check and mark only after the signature is accepted. Otherwise an
+    // invalid request can burn a valid payer nonce and deny the real request.
+    if (nonceStore) {
+      // Mark seen with TTL matching the expiry window (max 1 hour)
+      const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
+      await nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
     }
 
     return raw.commitment
@@ -57,43 +79,88 @@ export async function verifyX402(
 /**
  * Verify MPP (Machine Payments Protocol) Authorization: Payment header.
  *
- * MPP uses `Authorization: Payment <method> <credential>` format where
- * the credential is a base64url-encoded JSON wrapping the same EIP-3009
- * payment payload that x402 uses. This means existing x402 wallets work
- * unchanged over the MPP wire format.
+ * MPP uses `Authorization: Payment <method> <credential>` format. The
+ * credential is method-specific; `MppConfig.verifySigner` owns verification
+ * and returns the consumer identity. The built-in `blueprintevm` path can
+ * reuse the x402 verifier for credentials with the compatible payload shape.
  *
  * Returns the signer address if valid, null otherwise.
- * In demo mode, accepts any well-formed Payment header.
+ * In demo mode, accepts any well-formed Payment header with an identity.
  */
 export async function verifyMpp(
   authHeader: string,
-  _config: MppConfig,
+  config: MppConfig,
   x402Config: X402Config,
+  nonceStore?: NonceStore,
 ): Promise<string | null> {
   // MPP format: "Payment <method> <base64url-credential>"
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
   if (!match) return null
 
-  const [, , credentialB64] = match
+  const [, method, credentialB64] = match
+  if (config.method && method !== config.method) return null
 
   try {
-    // Decode base64url credential → JSON with the same EIP-3009 payload
+    if (!/^[A-Za-z0-9_-]+$/.test(credentialB64)) return null
     const decoded = Buffer.from(credentialB64, 'base64url').toString('utf-8')
-    const credential = JSON.parse(decoded)
+    let payload: Record<string, unknown> = {}
+    try {
+      const credential = JSON.parse(decoded) as unknown
+      if (credential && typeof credential === 'object' && !Array.isArray(credential)) {
+        const nested = (credential as Record<string, unknown>).payload
+        payload =
+          nested && typeof nested === 'object' && !Array.isArray(nested)
+            ? (nested as Record<string, unknown>)
+            : (credential as Record<string, unknown>)
+      }
+    } catch {
+      // Method-specific verifiers may accept a non-JSON credential format.
+    }
 
-    // The credential payload wraps the same fields x402 uses
-    const payload = credential.payload ?? credential
-    if (!payload.commitment && !payload.from) return null
+    const nonceKey =
+      nonceStore && payload.nonce !== undefined
+        ? `mpp:${method}:${String(payload.commitment ?? payload.from ?? 'unknown')}:${String(payload.nonce)}`
+        : null
+    if (nonceKey && await nonceStore!.hasSeen(nonceKey)) return null
 
-    // Validate operator match (same as x402)
+    let consumerId: string | null = null
+    if (config.verifySigner) {
+      consumerId = await config.verifySigner(payload, { method, credential: decoded })
+    } else if (method === 'blueprintevm' && x402Config.verifySigner && payload.commitment) {
+      const verified = await x402Config.verifySigner(payload)
+      consumerId = verified ? String(payload.commitment) : null
+    } else if (x402Config.demoMode) {
+      const identity = payload.commitment ?? payload.from
+      if (typeof identity !== 'string' || identity.length === 0) return null
+      consumerId = identity
+    } else {
+      return null
+    }
+    if (!consumerId) return null
+
+    // Validate common EVM fields when present. Method-specific verifiers own
+    // the complete credential contract for non-EVM methods.
     const operator = payload.operator ?? payload.to
-    if (operator && operator.toLowerCase() !== x402Config.operatorAddress.toLowerCase()) return null
+    if (operator !== undefined) {
+      if (typeof operator !== 'string' || operator.toLowerCase() !== x402Config.operatorAddress.toLowerCase()) {
+        return null
+      }
+    }
+    if (payload.amount !== undefined && BigInt(String(payload.amount)) <= 0n) return null
+    if (payload.nonce !== undefined) BigInt(String(payload.nonce))
+    if (payload.expiry !== undefined && BigInt(String(payload.expiry)) < BigInt(Math.floor(Date.now() / 1000))) {
+      return null
+    }
 
-    // Validate bigint fields if present
-    if (payload.amount) BigInt(payload.amount)
-    if (payload.nonce) BigInt(payload.nonce)
+    if (nonceStore && payload.nonce !== undefined) {
+      const expiry = payload.expiry === undefined
+        ? Math.floor(Date.now() / 1000) + 3600
+        : Number(payload.expiry)
+      const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
+      await nonceStore.markSeen(nonceKey!, Math.max(ttl, 60))
+    }
 
-    return payload.commitment ?? payload.from ?? null
+    return consumerId
   } catch {
     return null
   }

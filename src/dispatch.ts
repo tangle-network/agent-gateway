@@ -21,7 +21,13 @@ import type {
   GatewayConfig,
   PaymentMethod,
 } from './types'
-import { defaultVerifyApiKey, verifyMpp, verifyX402 } from './verify'
+import {
+  defaultVerifyApiKey,
+  isApiKeyAuthEnabled,
+  isMppAuthEnabled,
+  verifyMpp,
+  verifyX402,
+} from './verify'
 
 /** Single bundle of long-lived gateway state shared across all handlers in one createAgentGateway call. */
 export interface GatewayState {
@@ -68,7 +74,7 @@ export async function authenticateAndGuard(
   await state.obs?.onRequestStart?.(ctx)
 
   const agent = await config.resolveAgent(slug)
-  if (!agent) {
+  if (!agent || !agent.enabled) {
     return c.json({ error: { message: 'Agent not found', type: 'not_found' } }, 404)
   }
   if (!messages?.length) {
@@ -109,11 +115,11 @@ export async function authenticateAndGuard(
     }
     consumerId = signer
     paymentMethod = 'x402'
-  } else if (config.mpp && authHeader.toLowerCase().startsWith('payment ')) {
-    const signer = await verifyMpp(authHeader, config.mpp, config.x402)
+  } else if (isMppAuthEnabled(config) && authHeader.toLowerCase().startsWith('payment ')) {
+    const signer = await verifyMpp(authHeader, config.mpp!, config.x402, state.nonceStore)
     if (!signer) {
-      const realm = config.mpp.realm
-      const method = config.mpp.method ?? 'blueprintevm'
+      const realm = config.mpp!.realm
+      const method = config.mpp!.method ?? 'blueprintevm'
       await state.obs?.onAuthFailure?.(ctx, {
         method: 'mpp',
         code: 'invalid_mpp_credential',
@@ -139,7 +145,18 @@ export async function authenticateAndGuard(
     consumerId = signer
     paymentMethod = 'mpp'
   } else if (authHeader.startsWith('Bearer ')) {
-    const verify = config.verifyApiKey ?? defaultVerifyApiKey
+    const verify = config.verifyApiKey ?? (config.x402.demoMode ? defaultVerifyApiKey : null)
+    if (!verify || !isApiKeyAuthEnabled(config)) {
+      await state.obs?.onAuthFailure?.(ctx, {
+        method: 'apikey',
+        code: 'api_keys_not_configured',
+        httpStatus: 401,
+      })
+      return c.json(
+        { error: { message: 'API key authentication is not configured', type: 'authentication_error' } },
+        { status: 401, headers: { 'X-Request-Id': requestId } },
+      )
+    }
     const key = await verify(authHeader)
     if (!key) {
       await state.obs?.onAuthFailure?.(ctx, {
@@ -179,13 +196,13 @@ export async function authenticateAndGuard(
       httpStatus: 402,
     })
     const methods: string[] = ['x402']
-    if (config.mpp) methods.push('mpp')
-    methods.push('api_key')
+    if (isMppAuthEnabled(config)) methods.push('mpp')
+    if (isApiKeyAuthEnabled(config)) methods.push('api_key')
     const headers: Record<string, string> = {
       'X-Payment-Required': methods.join(', '),
       'X-Request-Id': requestId,
     }
-    if (config.mpp) {
+    if (isMppAuthEnabled(config) && config.mpp) {
       headers['WWW-Authenticate'] =
         `Payment realm="${config.mpp.realm}", method="${config.mpp.method ?? 'blueprintevm'}"`
     }
@@ -201,14 +218,18 @@ export async function authenticateAndGuard(
             credits_address: config.x402.creditsAddress,
             estimated_amount_per_request: '20000',
           },
-          ...(config.mpp
+          ...(isMppAuthEnabled(config) && config.mpp
             ? { mpp: { realm: config.mpp.realm, method: config.mpp.method ?? 'blueprintevm' } }
             : {}),
-          api_key: {
-            purchase_url: config.baseUrl
-              ? `${config.baseUrl}/agents/${slug}/api-keys`
-              : undefined,
-          },
+          ...(isApiKeyAuthEnabled(config)
+            ? {
+                api_key: {
+                  purchase_url: config.baseUrl
+                    ? `${config.baseUrl}/agents/${slug}/api-keys`
+                    : undefined,
+                },
+              }
+            : {}),
         },
       },
       { status: 402, headers },

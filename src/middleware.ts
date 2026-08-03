@@ -14,6 +14,7 @@ import { MemoryNonceStore } from './nonce-store'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import type { ChatCompletionChunk, ChatCompletionRequest, GatewayConfig } from './types'
+import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
 
 /**
  * Create a Hono router that serves the agent gateway.
@@ -51,7 +52,7 @@ export function createAgentGateway(config: GatewayConfig) {
   gw.get('/:slug/chat/completions', async (c) => {
     const slug = c.req.param('slug')
     const agent = await config.resolveAgent(slug)
-    if (!agent) return c.json({ error: 'Agent not found or not published' }, 404)
+    if (!agent || !agent.enabled) return c.json({ error: 'Agent not found or not published' }, 404)
 
     const paymentMethods: Array<Record<string, unknown>> = [
       {
@@ -61,14 +62,14 @@ export function createAgentGateway(config: GatewayConfig) {
         credits_contract: config.x402.creditsAddress,
       },
     ]
-    if (config.mpp) {
+    if (isMppAuthEnabled(config)) {
       paymentMethods.push({
         type: 'mpp',
-        realm: config.mpp.realm,
-        method: config.mpp.method ?? 'blueprintevm',
+        realm: config.mpp!.realm,
+        method: config.mpp!.method ?? 'blueprintevm',
       })
     }
-    paymentMethods.push({ type: 'api_key', prefix: 'sk_agent_' })
+    if (isApiKeyAuthEnabled(config)) paymentMethods.push({ type: 'api_key', prefix: 'sk_agent_' })
 
     return c.json({
       slug: agent.slug,
@@ -231,4 +232,3 @@ function streamChatCompletions(
     },
   })
 }
-

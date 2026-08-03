@@ -183,6 +183,57 @@ describe('GET /:slug/chat/completions (discovery)', () => {
     expect(body.hosting.mode).toBe('sovereign')
     expect(body.hosting.endpoint).toBe('https://remote.op/sandbox/42')
   })
+
+  it('does not advertise or accept demo API keys on a production-configured gateway', async () => {
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+    })
+    const discovery = await app.request('/v1/agents/test-agent/chat/completions')
+    const discoveryBody = await discovery.json() as { payment_methods: Array<{ type: string }> }
+    expect(discoveryBody.payment_methods.map((method) => method.type)).not.toContain('api_key')
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk_agent_fake' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(response.status).toBe(401)
+  })
+
+  it('does not advertise an MPP method without a compatible verifier', async () => {
+    const { app } = buildHarness({
+      mpp: { realm: 'agents.tangle.tools', method: 'stripe' },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+    })
+    const discovery = await app.request('/v1/agents/test-agent/chat/completions')
+    const body = await discovery.json() as { payment_methods: Array<{ type: string }> }
+    expect(body.payment_methods.map((method) => method.type)).not.toContain('mpp')
+  })
+
+  it('does not serve an agent whose resolver marks it disabled', async () => {
+    const { app } = buildHarness({
+      resolveAgent: async () => makeAgent({ enabled: false }),
+    })
+    const discovery = await app.request('/v1/agents/test-agent/chat/completions')
+    expect(discovery.status).toBe(404)
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': buildSpendAuth() },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(response.status).toBe(404)
+  })
 })
 
 describe('POST /:slug/chat/completions — auth paths', () => {

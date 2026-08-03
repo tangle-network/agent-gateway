@@ -93,6 +93,18 @@ export interface MppConfig {
   realm: string
   /** MPP method name (default: "blueprintevm") */
   method?: string
+  /**
+   * Production verifier for the method-specific credential. Return the
+   * authenticated consumer id, or null when the credential is invalid.
+   * The callback receives the decoded JSON payload when one exists plus the
+   * original decoded credential so non-JSON methods can verify their own form.
+   * Omit only when x402.demoMode is explicitly enabled for local testing, or
+   * when x402.verifySigner handles an x402-compatible MPP credential.
+   */
+  verifySigner?: (
+    payload: Record<string, unknown>,
+    context: { method: string; credential: string },
+  ) => Promise<string | null>
 }
 
 export interface PaymentResult {
@@ -194,12 +206,13 @@ export interface GatewayConfig {
   /** x402 payment configuration */
   x402: X402Config
 
-  /** MPP (Machine Payments Protocol) configuration. If provided, gateway accepts Authorization: Payment headers. */
+  /** MPP (Machine Payments Protocol) configuration. It is advertised only when a production verifier or explicit demo mode is available. */
   mpp?: MppConfig
 
   /**
    * Verify an API key. Return key info if valid, null if invalid.
-   * Default: accepts any `sk_agent_*` key (demo mode).
+   * In explicit x402 demo mode, the built-in verifier accepts `sk_agent_*` keys.
+   * Production gateways must provide this callback.
    */
   verifyApiKey?: (authHeader: string) => Promise<ApiKeyInfo | null>
 

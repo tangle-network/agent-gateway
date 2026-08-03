@@ -1,5 +1,11 @@
 export { createAgentGateway } from './middleware'
-export { verifyX402, verifyMpp, defaultVerifyApiKey } from './verify'
+export {
+  verifyX402,
+  verifyMpp,
+  defaultVerifyApiKey,
+  isApiKeyAuthEnabled,
+  isMppAuthEnabled,
+} from './verify'
 export {
   filterConsumerMessages,
   filterConsumerMessagesStrict,

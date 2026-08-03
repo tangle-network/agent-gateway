@@ -89,6 +89,23 @@ describe('verifyX402', () => {
     expect(calls[0].commitment).toBe('0xCommitmentAlice')
   })
 
+  it('does not burn a nonce when signature verification rejects — regression: invalid traffic must not deny a valid payment', async () => {
+    const nonceStore = new MemoryNonceStore()
+    const payload = buildSpendAuth({ nonce: '100' })
+    const rejectedConfig: X402Config = {
+      ...baseConfig,
+      demoMode: false,
+      verifySigner: async () => false,
+    }
+    expect(await verifyX402(payload, rejectedConfig, nonceStore)).toBeNull()
+
+    const acceptedConfig: X402Config = {
+      ...rejectedConfig,
+      verifySigner: async () => true,
+    }
+    expect(await verifyX402(payload, acceptedConfig, nonceStore)).toBe('0xCommitmentAlice')
+  })
+
   it('calls config.verifySigner and accepts on true', async () => {
     const config: X402Config = {
       ...baseConfig,
@@ -111,6 +128,49 @@ describe('verifyMpp', () => {
   it('parses a valid Payment header and returns the signer', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress, amount: '1000', nonce: '5' })
     expect(await verifyMpp(header, mppConfig, baseConfig)).toBe('0xAlice')
+  })
+
+  it('requires and calls a production MPP verifier, then rejects nonce replay', async () => {
+    const header = buildCredential({
+      commitment: '0xAlice',
+      operator: operatorAddress,
+      amount: '1000',
+      nonce: '6',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+    })
+    const seen: Array<{ method: string; credential: string }> = []
+    const config: MppConfig = {
+      ...mppConfig,
+      verifySigner: async (_payload, context) => {
+        seen.push(context)
+        return 'mpp:alice'
+      },
+    }
+    const productionX402: X402Config = { ...baseConfig, demoMode: false }
+    const nonceStore = new MemoryNonceStore()
+
+    expect(await verifyMpp(header, config, productionX402, nonceStore)).toBe('mpp:alice')
+    expect(await verifyMpp(header, config, productionX402, nonceStore)).toBeNull()
+    expect(seen).toHaveLength(1)
+    expect(seen[0].method).toBe('blueprintevm')
+    expect(seen[0].credential).toContain('commitment')
+  })
+
+  it('rejects MPP in production when no method verifier is configured', async () => {
+    const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress })
+    const productionX402: X402Config = { ...baseConfig, demoMode: false }
+    expect(await verifyMpp(header, mppConfig, productionX402)).toBeNull()
+  })
+
+  it('does not reuse the x402 verifier for a different MPP method', async () => {
+    const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress })
+      .replace('Payment blueprintevm ', 'Payment stripe ')
+    const productionX402: X402Config = {
+      ...baseConfig,
+      demoMode: false,
+      verifySigner: async () => true,
+    }
+    expect(await verifyMpp(header, { ...mppConfig, method: 'stripe' }, productionX402)).toBeNull()
   })
 
   it('falls back to the `from` field when no `commitment` present — regression: EIP-3009 wallets expose `from` only', async () => {
