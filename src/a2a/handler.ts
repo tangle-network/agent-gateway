@@ -95,7 +95,7 @@ export function createA2AHandlers(deps: A2AHandlerDeps) {
     const slug = c.req.param('slug')
     if (!slug) return c.json({ error: 'slug required' }, 400)
     const agent = await deps.config.resolveAgent(slug)
-    if (!agent) {
+    if (!agent || !agent.enabled) {
       return c.json({ error: 'Agent not found or not published' }, 404)
     }
     const url = new URL(c.req.url)
@@ -795,4 +795,3 @@ async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void>
     )
   }
 }
-

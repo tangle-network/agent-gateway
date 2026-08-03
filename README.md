@@ -1,6 +1,7 @@
 # @tangle-network/agent-gateway
 
-Hono middleware that turns any Tangle agent app into a paid API. Wrap your chat endpoint to accept API keys, x402 SpendAuth, or MPP credentials — with scope enforcement, per-key rate limits, nonce replay protection, prompt-injection detection, and publish routes for the marketplace.
+Hono middleware that turns any Tangle agent app into a paid API.
+It exposes one shared request pipeline for API keys, x402 SpendAuth, and MPP credentials, with scope enforcement, per-key rate limits, nonce replay protection, prompt-injection detection, and publish routes for the marketplace.
 
 ## Install
 
@@ -11,16 +12,36 @@ npm install @tangle-network/agent-gateway
 ## Usage
 
 ```ts
-import { createAgentGateway } from '@tangle-network/agent-gateway'
+import {
+  createAgentGateway,
+  verifyApiKeyFromStore,
+} from '@tangle-network/agent-gateway'
 import { Hono } from 'hono'
 
 const app = new Hono()
-app.use('/chat/*', createAgentGateway({
-  apiKeyStore: myKeyStore,
-  x402: { verifierUrl: 'https://router.tangle.tools/x402/verify' },
-  rateLimits: { perKey: { rpm: 60 } },
+app.route('/v1/agents', createAgentGateway({
+  resolveAgent: loadPublishedAgent,
+  getSandbox: openAgentSandbox,
+  recordUsage: recordUsageEvent,
+  x402: {
+    operatorAddress: '0x…',
+    chainId: 3799,
+    verifySigner: verifySpendAuthSignature,
+  },
+  verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
+
+`x402.verifySigner` is required for production.
+Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
+
+MPP is method-specific.
+Configure `mpp.verifySigner` for production MPP credentials; it receives the decoded JSON payload when available plus the original decoded credential, and returns the authenticated consumer ID or `null`.
+The default `blueprintevm` method may reuse `x402.verifySigner` when its credential has the compatible x402 payload shape.
+Other methods are not accepted until they have their own verifier.
+
+The same authentication, authorization, rate-limit, filtering, sandbox, settlement, and usage-recording pipeline is used by the OpenAI-compatible and A2A endpoints.
+Wire protocol handlers only translate their request and response shapes.
 
 ## A2A protocol
 
