@@ -49,6 +49,21 @@ describe('verifyX402', () => {
     expect(await verifyX402(buildSpendAuth({ amount: '0' }), baseConfig)).toBeNull()
   })
 
+  it('rejects a request-specific underpayment before calling the production verifier', async () => {
+    let calls = 0
+    const config: X402Config = {
+      ...baseConfig,
+      demoMode: false,
+      verifySigner: async () => {
+        calls += 1
+        return true
+      },
+    }
+
+    expect(await verifyX402(buildSpendAuth({ amount: '19999' }), config, undefined, 20000n)).toBeNull()
+    expect(calls).toBe(0)
+  })
+
   it('rejects expired payments — regression: forever-valid sigs enable drained-wallet attacks', async () => {
     const expired = buildSpendAuth({ expiry: String(Math.floor(Date.now() / 1000) - 10) })
     expect(await verifyX402(expired, baseConfig)).toBeNull()
@@ -154,6 +169,27 @@ describe('verifyMpp', () => {
     expect(seen).toHaveLength(1)
     expect(seen[0].method).toBe('blueprintevm')
     expect(seen[0].credential).toContain('commitment')
+  })
+
+  it('rejects an underfunded blueprintevm credential before its verifier can reserve funds', async () => {
+    let calls = 0
+    const header = buildCredential({
+      commitment: '0xAlice',
+      operator: operatorAddress,
+      amount: '19999',
+      nonce: '8',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+    })
+    const config: MppConfig = {
+      ...mppConfig,
+      verifySigner: async () => {
+        calls += 1
+        return 'mpp:alice'
+      },
+    }
+
+    expect(await verifyMpp(header, config, { ...baseConfig, demoMode: false }, undefined, 20000n)).toBeNull()
+    expect(calls).toBe(0)
   })
 
   it('rejects MPP in production when no method verifier is configured', async () => {

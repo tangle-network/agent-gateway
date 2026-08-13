@@ -1,6 +1,6 @@
 {
   "name": "@tangle-network/agent-gateway",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "packageManager": "pnpm@10.28.0",
   "repository": {
     "type": "git",

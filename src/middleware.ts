@@ -7,6 +7,7 @@ import {
   type GatewayState,
   authenticateAndGuard,
   dispatchSandboxStream,
+  estimateBillableInputTokens,
   estimateTokens,
   settleAndRecord,
 } from './dispatch'
@@ -35,6 +36,28 @@ export function createAgentGateway(config: GatewayConfig) {
         'For tests, set x402.demoMode: true explicitly.',
     )
   }
+  const maxOutputTokens = config.maxOutputTokens ?? 4096
+  const defaultOutputTokens = config.defaultOutputTokens ?? 1024
+  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    throw new Error('createAgentGateway: maxOutputTokens must be a positive integer')
+  }
+  if (
+    !Number.isInteger(defaultOutputTokens) ||
+    defaultOutputTokens <= 0 ||
+    defaultOutputTokens > maxOutputTokens
+  ) {
+    throw new Error(
+      'createAgentGateway: defaultOutputTokens must be a positive integer no greater than maxOutputTokens',
+    )
+  }
+  if (
+    config.x402.currencyDecimals !== undefined &&
+    (!Number.isInteger(config.x402.currencyDecimals) ||
+      config.x402.currencyDecimals < 0 ||
+      config.x402.currencyDecimals > 18)
+  ) {
+    throw new Error('createAgentGateway: x402.currencyDecimals must be an integer between 0 and 18')
+  }
   const gw = new Hono()
   const rateLimitStore: RateLimitStore = config.rateLimitStore ?? new MemoryRateLimitStore()
   const state: GatewayState = {
@@ -43,6 +66,8 @@ export function createAgentGateway(config: GatewayConfig) {
     globalRateLimit: config.rateLimit ?? { limit: 60, windowSeconds: 60 },
     requiredScope: config.requiredScope ?? 'chat',
     maxLen: config.maxMessageLength ?? 8000,
+    maxOutputTokens,
+    defaultOutputTokens,
     obs: config.observer,
   }
   const obs: GatewayObserver | undefined = state.obs
@@ -125,7 +150,14 @@ export function createAgentGateway(config: GatewayConfig) {
       )
     }
 
-    const guard = await authenticateAndGuard(c, slug, body.messages, config, state)
+    const guard = await authenticateAndGuard(
+      c,
+      slug,
+      body.messages,
+      config,
+      state,
+      body.max_tokens,
+    )
     if (guard instanceof Response) return guard
     const authz = guard
 
@@ -158,9 +190,17 @@ function streamChatCompletions(
   config: GatewayConfig,
   obs: GatewayObserver | undefined,
 ): Response {
-  const { agent, consumerId, paymentMethod, requestId, userMessage, rateLimitRemaining } = authz
-  const inputTokens = estimateTokens(userMessage)
-  let outputTokens = 0
+  const {
+    agent,
+    consumerId,
+    paymentMethod,
+    requestId,
+    userMessage,
+    rateLimitRemaining,
+    maxOutputTokens,
+  } = authz
+  const inputTokens = estimateBillableInputTokens(agent, userMessage)
+  let outputText = ''
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -171,7 +211,7 @@ function streamChatCompletions(
     async start(controller) {
       const encoder = new TextEncoder()
       const sendChunk = (delta: string) => {
-        outputTokens += estimateTokens(delta)
+        outputText += delta
         const chunk: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -183,7 +223,15 @@ function streamChatCompletions(
       }
 
       try {
-        for await (const delta of dispatchSandboxStream(agent, userMessage, consumerId, config)) {
+        for await (const delta of dispatchSandboxStream(
+          agent,
+          userMessage,
+          consumerId,
+          config,
+          undefined,
+          undefined,
+          maxOutputTokens,
+        )) {
           sendChunk(delta)
         }
 
@@ -197,7 +245,14 @@ function streamChatCompletions(
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
 
-        await settleAndRecord(agent, authz, inputTokens, outputTokens, config, obs)
+        await settleAndRecord(
+          agent,
+          authz,
+          inputTokens,
+          estimateTokens(outputText),
+          config,
+          obs,
+        )
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err)
         // Never expose stack traces / absolute paths from sandbox internals.

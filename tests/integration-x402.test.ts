@@ -48,6 +48,7 @@ const CHAIN_ID = 3799
 const OPERATOR_PRIVATE_KEY = generatePrivateKey()
 const OPERATOR_ADDRESS = privateKeyToAccount(OPERATOR_PRIVATE_KEY).address
 const CREDITS_ADDRESS: Hex = '0x00000000000000000000000000000000DeaDBeef'
+const FUNDED_REQUEST_AMOUNT = 100_000n
 
 const domain = {
   name: 'ShieldedCredits',
@@ -251,7 +252,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
   it('happy path: consumer signs → gateway verifies signer address → sandbox streams → settlement fires', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n,
     })
 
@@ -304,7 +305,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       primaryType: 'SpendAuth',
       message: {
         operator: otherOperator, // not our operator
-        amount: 20000n,
+        amount: FUNDED_REQUEST_AMOUNT,
         nonce: 1n,
         expiry: BigInt(Math.floor(Date.now() / 1000) + 600),
       },
@@ -314,7 +315,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       commitment: account.address,
       signature: tampered,
       operator: otherOperator,
-      amount: '20000',
+      amount: FUNDED_REQUEST_AMOUNT.toString(),
       nonce: '1',
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }
@@ -345,7 +346,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       primaryType: 'SpendAuth',
       message: {
         operator: OPERATOR_ADDRESS,
-        amount: 20000n,
+        amount: FUNDED_REQUEST_AMOUNT,
         nonce: 2n,
         expiry: BigInt(Math.floor(Date.now() / 1000) + 600),
       },
@@ -356,7 +357,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       commitment: '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       signature,
       operator: OPERATOR_ADDRESS,
-      amount: '20000',
+      amount: FUNDED_REQUEST_AMOUNT.toString(),
       nonce: '2',
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }
@@ -379,7 +380,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
   it('replay of the same signed SpendAuth is rejected across requests — regression: double-spend of one signed payment', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 99n,
     })
     const payloadStr = JSON.stringify(spendAuth)
@@ -411,7 +412,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
   it('expired SpendAuth is rejected — regression: forever-valid sigs enable drain attacks', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 5n,
       expirySeconds: -10, // expired 10 seconds ago
     })
@@ -435,7 +436,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     // Alice's wallet
     const aliceAuth = await signSpendAuth({
       consumerPrivateKey: alice.consumerPrivateKey,
-      amount: 10000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n,
     })
 
@@ -444,7 +445,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const bobAddr = privateKeyToAccount(bobKey).address
     const bobAuth = await signSpendAuth({
       consumerPrivateKey: bobKey,
-      amount: 10000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n, // same nonce, different commitment
     })
 

@@ -20,16 +20,17 @@ import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
+const fundedRequestAmount = '100000'
 
 /** Sandbox that emits a fixed reply, captures the prompt + opts for assertion */
 class StubSandbox implements SandboxBox {
   receivedPrompt: string | null = null
-  receivedOpts: { sessionId?: string; systemPrompt?: string } | undefined
+  receivedOpts: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number } | undefined
   constructor(private chunks: string[]) {}
 
   async *streamPrompt(
     message: string,
-    opts?: { sessionId?: string; systemPrompt?: string },
+    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number },
   ): AsyncIterable<SandboxStreamEvent> {
     this.receivedPrompt = message
     this.receivedOpts = opts
@@ -137,7 +138,7 @@ function buildSpendAuth(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     commitment: '0xCommitmentAlice',
     signature: '0xSignatureBytes',
-    amount: '20000',
+    amount: fundedRequestAmount,
     nonce: String(Math.floor(Math.random() * 1e9)),
     operator: operatorAddress,
     expiry: String(now + 600),
@@ -249,6 +250,84 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const body = await res.json() as { error: { payment_methods: string[]; x402: Record<string, unknown> } }
     expect(body.error.payment_methods).toContain('x402')
     expect(body.error.x402.operator).toBe(operatorAddress)
+    expect(body.error.x402.required_amount).toBe('21020')
+    expect(body.error.x402.max_output_tokens).toBe(1024)
+  })
+
+  it('rejects an underfunded payment before the production verifier can reserve funds', async () => {
+    let verifierCalls = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => {
+          verifierCalls += 1
+          return true
+        },
+      },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ amount: '21019' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(402)
+    expect(verifierCalls).toBe(0)
+  })
+
+  it('enforces the paid max_tokens limit on the actual sandbox stream', async () => {
+    const { app, sandbox, usage } = buildHarness({}, ['abcdefgh', 'ijklmnop'])
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ amount: '580' }),
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 2,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const streamed = await readSse(res)
+    expect(streamed.combinedText).toBe('abcdefgh')
+    expect(sandbox.receivedOpts?.maxOutputTokens).toBe(2)
+    expect(usage[0]?.outputTokens).toBe(2)
+  })
+
+  it('rejects max_tokens above the configured ceiling before verification', async () => {
+    let verifierCalls = 0
+    const { app } = buildHarness({
+      maxOutputTokens: 8,
+      defaultOutputTokens: 4,
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => {
+          verifierCalls += 1
+          return true
+        },
+      },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth(),
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 9,
+      }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(verifierCalls).toBe(0)
   })
 
   it('returns 402 with invalid_spend_auth on bad X-Payment-Signature — regression: silent bypass of failed sig', async () => {
@@ -568,6 +647,63 @@ describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
     })
     expect(getSandboxCalls).toBe(0)
+  })
+
+  it('does not reserve x402 funds until every request check allows the call', async () => {
+    let paymentAuthorizations = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => true,
+        authorizePayment: async () => {
+          paymentAuthorizations += 1
+          return true
+        },
+      },
+      authorizeConsumer: async () => ({ allow: false, reason: 'no', code: 'denied' }),
+    })
+
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '5004' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(403)
+    expect(paymentAuthorizations).toBe(0)
+  })
+
+  it('reserves one x402 payment immediately before allowed sandbox work', async () => {
+    let paymentAuthorizations = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => true,
+        authorizePayment: async () => {
+          paymentAuthorizations += 1
+          return true
+        },
+      },
+      authorizeConsumer: async () => ({ allow: true }),
+    })
+
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '5005' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(200)
+    await readSse(res)
+    expect(paymentAuthorizations).toBe(1)
   })
 })
 

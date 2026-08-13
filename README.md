@@ -26,14 +26,23 @@ app.route('/v1/agents', createAgentGateway({
   x402: {
     operatorAddress: '0x…',
     chainId: 3799,
+    currencyDecimals: 6,
     verifySigner: verifySpendAuthSignature,
+    authorizePayment: reserveSpendAuthorization,
   },
+  defaultOutputTokens: 1024,
+  maxOutputTokens: 4096,
   verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
 
 `x402.verifySigner` is required for production.
 Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
+Keep `verifySigner` free of side effects.
+Use `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
+Before it calls the verifier, the gateway requires the signed amount to cover filtered input plus the requested output limit.
+The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
+An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 
 MPP is method-specific.
 Configure `mpp.verifySigner` for production MPP credentials; it receives the decoded JSON payload when available plus the original decoded credential, and returns the authenticated consumer ID or `null`.

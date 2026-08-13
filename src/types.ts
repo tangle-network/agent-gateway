@@ -84,8 +84,30 @@ export interface X402Config {
   rpcUrl?: string
   /** Demo mode: skip signature verification (default: false). NEVER enable in production. */
   demoMode?: boolean
-  /** Production signer verification. Called with the raw SpendAuth payload. Return true if signature is valid. */
+  /**
+   * Production signature verification. This callback must not reserve, claim,
+   * or mutate payment state.
+   */
   verifySigner?: (payload: Record<string, unknown>) => Promise<boolean>
+  /**
+   * Reserve or claim the verified payment after all request checks pass and
+   * immediately before sandbox work starts. Return false to reject the call.
+   */
+  authorizePayment?: (
+    payload: Record<string, unknown>,
+    context: {
+      requestId: string
+      agentId: string
+      requiredAmount: bigint
+      maxOutputTokens: number
+    },
+  ) => Promise<boolean>
+  /**
+   * Number of base-unit decimals used by the payment token. Defaults to 6.
+   * The gateway uses this value to reject a payment that cannot cover the
+   * request's maximum token charge before it calls `verifySigner`.
+   */
+  currencyDecimals?: number
 }
 
 export interface MppConfig {
@@ -178,7 +200,10 @@ export interface SandboxStreamEvent {
 }
 
 export interface SandboxBox {
-  streamPrompt(message: string, opts?: { sessionId?: string; systemPrompt?: string }): AsyncIterable<SandboxStreamEvent>
+  streamPrompt(
+    message: string,
+    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number },
+  ): AsyncIterable<SandboxStreamEvent>
 }
 
 // --- Gateway config ---
@@ -229,6 +254,12 @@ export interface GatewayConfig {
 
   /** Max message length in chars (default: 8000) */
   maxMessageLength?: number
+
+  /** Maximum output token request the gateway accepts. Defaults to 4096. */
+  maxOutputTokens?: number
+
+  /** Output token limit used when a request omits `max_tokens`. Defaults to 1024. */
+  defaultOutputTokens?: number
 
   /** Required scope for chat endpoint (default: "chat"). API keys must include this scope. */
   requiredScope?: string

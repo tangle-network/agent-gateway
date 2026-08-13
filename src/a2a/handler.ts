@@ -18,6 +18,7 @@ import {
   type GatewayState,
   authenticateAndGuard,
   dispatchSandboxStreamRich,
+  estimateBillableInputTokens,
   estimateTokens,
   settleAndRecord,
 } from '../dispatch'
@@ -169,7 +170,6 @@ async function handleMessageSend(
   const { authz, task } = guard
 
   let responseText = ''
-  let outputTokens = 0
   let inputRequiredPrompt: string | undefined
   let inputRequiredSeen = false
   try {
@@ -180,10 +180,10 @@ async function handleMessageSend(
       deps.config,
       undefined,
       task.id,
+      authz.maxOutputTokens,
     )) {
       if (event.kind === 'text') {
         responseText += event.delta
-        outputTokens += estimateTokens(event.delta)
       } else {
         inputRequiredSeen = true
         inputRequiredPrompt = event.prompt
@@ -208,8 +208,8 @@ async function handleMessageSend(
   await settleAndRecord(
     authz.agent,
     authz,
-    estimateTokens(authz.userMessage),
-    outputTokens,
+    estimateBillableInputTokens(authz.agent, authz.userMessage),
+    estimateTokens(responseText),
     deps.config,
     deps.state.obs,
   )
@@ -250,8 +250,7 @@ async function handleMessageStream(
   const { authz, task } = guard
 
   const controller = cancels.register(task.id)
-  const inputTokens = estimateTokens(authz.userMessage)
-  let outputTokens = 0
+  const inputTokens = estimateBillableInputTokens(authz.agent, authz.userMessage)
   let responseText = ''
 
   const stream = new ReadableStream({
@@ -282,10 +281,10 @@ async function handleMessageStream(
           deps.config,
           controller.signal,
           task.id,
+          authz.maxOutputTokens,
         )) {
           if (event.kind === 'text') {
             responseText += event.delta
-            outputTokens += estimateTokens(event.delta)
             const artifactEvent: TaskArtifactUpdateEvent = {
               kind: 'artifact-update',
               taskId: task.id,
@@ -326,7 +325,7 @@ async function handleMessageStream(
           authz.agent,
           authz,
           inputTokens,
-          outputTokens,
+          estimateTokens(responseText),
           deps.config,
           deps.state.obs,
         )

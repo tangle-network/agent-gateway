@@ -140,7 +140,7 @@ function buildSpendAuth(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     commitment: '0xAlice',
     signature: '0xsig',
-    amount: '20000',
+    amount: '100000',
     nonce: String(Math.floor(Math.random() * 1e9)),
     operator: operatorAddress,
     expiry: String(now + 600),

@@ -36,6 +36,8 @@ export interface GatewayState {
   globalRateLimit: { limit: number; windowSeconds: number }
   requiredScope: string
   maxLen: number
+  maxOutputTokens: number
+  defaultOutputTokens: number
   obs?: GatewayObserver
 }
 
@@ -49,6 +51,44 @@ export interface AuthorizedRequest {
   rateLimitRemaining: number | undefined
   requestId: string
   startMs: number
+  maxOutputTokens: number
+}
+
+function decimalFraction(value: number): { numerator: bigint; denominator: bigint } {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error('agent pricePerTokenUsd must be a finite positive number')
+  }
+  const [mantissa, exponentText] = value.toString().toLowerCase().split('e')
+  const exponent = exponentText ? Number(exponentText) : 0
+  const [whole, fraction = ''] = mantissa.split('.')
+  let numerator = BigInt(`${whole}${fraction}`)
+  let scale = fraction.length - exponent
+  if (scale < 0) {
+    numerator *= 10n ** BigInt(-scale)
+    scale = 0
+  }
+  return { numerator, denominator: 10n ** BigInt(scale) }
+}
+
+/** Exact base-unit reservation required to cover the request's token ceiling. */
+export function requiredX402Amount(
+  pricePerTokenUsd: number,
+  inputTokens: number,
+  maxOutputTokens: number,
+  currencyDecimals = 6,
+): bigint {
+  if (!Number.isSafeInteger(inputTokens) || inputTokens < 0) {
+    throw new Error('input token estimate must be a non-negative safe integer')
+  }
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    throw new Error('max output tokens must be a positive safe integer')
+  }
+  if (!Number.isInteger(currencyDecimals) || currencyDecimals < 0 || currencyDecimals > 18) {
+    throw new Error('x402 currencyDecimals must be an integer between 0 and 18')
+  }
+  const { numerator, denominator } = decimalFraction(pricePerTokenUsd)
+  const scaled = BigInt(inputTokens + maxOutputTokens) * numerator * 10n ** BigInt(currencyDecimals)
+  return (scaled + denominator - 1n) / denominator
 }
 
 /**
@@ -67,6 +107,7 @@ export async function authenticateAndGuard(
   messages: ChatMessage[],
   config: GatewayConfig,
   state: GatewayState,
+  requestedMaxOutputTokens?: number,
 ): Promise<AuthorizedRequest | Response> {
   const startMs = Date.now()
   const requestId = generateRequestId()
@@ -84,15 +125,78 @@ export async function authenticateAndGuard(
     )
   }
 
+  const maxOutputTokens = requestedMaxOutputTokens ?? state.defaultOutputTokens
+  if (
+    !Number.isInteger(maxOutputTokens) ||
+    maxOutputTokens <= 0 ||
+    maxOutputTokens > state.maxOutputTokens
+  ) {
+    return c.json(
+      {
+        error: {
+          message: `max_tokens must be an integer between 1 and ${state.maxOutputTokens}`,
+          type: 'invalid_request',
+          code: 'invalid_max_tokens',
+        },
+      },
+      400,
+    )
+  }
+
+  // Price the exact filtered input that reaches the sandbox. This must happen
+  // before x402 verification because a production verifier can reserve funds.
+  const { messages: filtered, injectionWarnings } = filterConsumerMessagesStrict(
+    messages,
+    state.maxLen,
+  )
+  const userMessage = filtered
+    .filter((m) => m.role === 'user')
+    .map((m) => m.content)
+    .join('\n\n')
+  if (!userMessage) {
+    return c.json(
+      { error: { message: 'No user message provided', type: 'invalid_request' } },
+      400,
+    )
+  }
+
+  let requiredPaymentAmount: bigint
+  try {
+    requiredPaymentAmount = requiredX402Amount(
+      agent.pricePerTokenUsd,
+      maximumBillableInputTokens(agent, userMessage),
+      maxOutputTokens,
+      config.x402.currencyDecimals,
+    )
+  } catch {
+    return c.json(
+      {
+        error: {
+          message: 'Agent payment configuration is invalid',
+          type: 'server_error',
+          code: 'invalid_payment_configuration',
+        },
+      },
+      503,
+    )
+  }
+
   // Payment / auth.
   const spendAuthHeader = c.req.header('X-Payment-Signature')
   const authHeader = c.req.header('Authorization') ?? ''
   let consumerId: string | null = null
   let paymentMethod: PaymentMethod = 'none'
   let keyInfo: ApiKeyInfo | null = null
+  let x402Payload: Record<string, unknown> | null = null
 
   if (spendAuthHeader) {
-    const signer = await verifyX402(spendAuthHeader, config.x402, state.nonceStore)
+    const signer = await verifyX402(
+      spendAuthHeader,
+      config.x402,
+      state.nonceStore,
+      requiredPaymentAmount,
+      false,
+    )
     if (!signer) {
       await state.obs?.onAuthFailure?.(ctx, {
         method: 'x402',
@@ -105,6 +209,8 @@ export async function authenticateAndGuard(
             message: 'Invalid X-Payment-Signature',
             type: 'authentication_error',
             code: 'invalid_spend_auth',
+            required_amount: requiredPaymentAmount.toString(),
+            currency_decimals: config.x402.currencyDecimals ?? 6,
           },
         },
         {
@@ -113,10 +219,17 @@ export async function authenticateAndGuard(
         },
       )
     }
+    x402Payload = JSON.parse(spendAuthHeader) as Record<string, unknown>
     consumerId = signer
     paymentMethod = 'x402'
   } else if (isMppAuthEnabled(config) && authHeader.toLowerCase().startsWith('payment ')) {
-    const signer = await verifyMpp(authHeader, config.mpp!, config.x402, state.nonceStore)
+    const signer = await verifyMpp(
+      authHeader,
+      config.mpp!,
+      config.x402,
+      state.nonceStore,
+      requiredPaymentAmount,
+    )
     if (!signer) {
       const realm = config.mpp!.realm
       const method = config.mpp!.method ?? 'blueprintevm'
@@ -216,7 +329,9 @@ export async function authenticateAndGuard(
             operator: config.x402.operatorAddress,
             chain_id: config.x402.chainId,
             credits_address: config.x402.creditsAddress,
-            estimated_amount_per_request: '20000',
+            required_amount: requiredPaymentAmount.toString(),
+            currency_decimals: config.x402.currencyDecimals ?? 6,
+            max_output_tokens: maxOutputTokens,
           },
           ...(isMppAuthEnabled(config) && config.mpp
             ? { mpp: { realm: config.mpp.realm, method: config.mpp.method ?? 'blueprintevm' } }
@@ -270,11 +385,8 @@ export async function authenticateAndGuard(
     )
   }
 
-  // Filter consumer messages — strip consumer-side system, length-cap, injection scan.
-  const { messages: filtered, injectionWarnings } = filterConsumerMessagesStrict(
-    messages,
-    state.maxLen,
-  )
+  // Reject or report injection only after authentication so observer events
+  // retain the authenticated consumer identity.
   if (injectionWarnings.length > 0) {
     await state.obs?.onInjectionDetected?.(ctx, {
       consumerId: consumerId,
@@ -292,17 +404,6 @@ export async function authenticateAndGuard(
         { status: 400, headers: { 'X-Request-Id': requestId } },
       )
     }
-  }
-
-  const userMessage = filtered
-    .filter((m) => m.role === 'user')
-    .map((m) => m.content)
-    .join('\n\n')
-  if (!userMessage) {
-    return c.json(
-      { error: { message: 'No user message provided', type: 'invalid_request' } },
-      400,
-    )
   }
 
   if (config.authorizeConsumer) {
@@ -326,6 +427,48 @@ export async function authenticateAndGuard(
     }
   }
 
+  if (paymentMethod === 'x402' && x402Payload) {
+    try {
+      if (config.x402.authorizePayment) {
+        const authorized = await config.x402.authorizePayment(x402Payload, {
+          requestId,
+          agentId: agent.id,
+          requiredAmount: requiredPaymentAmount,
+          maxOutputTokens,
+        })
+        if (!authorized) throw new Error('payment authorization was rejected')
+      }
+
+      const nonce = BigInt(String(x402Payload.nonce))
+      const expiry = BigInt(String(x402Payload.expiry))
+      const nonceKey = `${String(x402Payload.commitment)}:${nonce.toString()}`
+      if (!config.x402.authorizePayment && await state.nonceStore.hasSeen(nonceKey)) {
+        throw new Error('payment nonce was already consumed')
+      }
+      const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
+      await state.nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
+    } catch {
+      await state.obs?.onAuthFailure?.(ctx, {
+        method: 'x402',
+        code: 'payment_authorization_failed',
+        httpStatus: 402,
+      })
+      return c.json(
+        {
+          error: {
+            message: 'Payment authorization failed',
+            type: 'payment_required',
+            code: 'payment_authorization_failed',
+          },
+        },
+        {
+          status: 402,
+          headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': requestId },
+        },
+      )
+    }
+  }
+
   return {
     agent,
     consumerId,
@@ -335,6 +478,7 @@ export async function authenticateAndGuard(
     rateLimitRemaining: rl.remaining,
     requestId,
     startMs,
+    maxOutputTokens,
   }
 }
 
@@ -353,6 +497,7 @@ export async function* dispatchSandboxStream(
   config: GatewayConfig,
   signal?: AbortSignal,
   sessionId?: string,
+  maxOutputTokens?: number,
 ): AsyncIterable<string> {
   for await (const event of dispatchSandboxStreamRich(
     agent,
@@ -361,6 +506,7 @@ export async function* dispatchSandboxStream(
     config,
     signal,
     sessionId,
+    maxOutputTokens,
   )) {
     if (event.kind === 'text') yield event.delta
   }
@@ -394,11 +540,19 @@ export async function* dispatchSandboxStreamRich(
   config: GatewayConfig,
   signal?: AbortSignal,
   sessionId?: string,
+  maxOutputTokens?: number,
 ): AsyncIterable<A2ADispatchEvent> {
   const box = await config.getSandbox(agent)
+  const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
+  if (!Number.isSafeInteger(outputLimit) || outputLimit <= 0) {
+    throw new Error('max output tokens must be a positive safe integer')
+  }
+  let outputCharacters = 0
+  const maxOutputCharacters = outputLimit * 4
   const promptStream = box.streamPrompt(userMessage, {
     sessionId: sessionId ?? `consumer:${consumerId}`,
     systemPrompt: agent.systemPrompt,
+    maxOutputTokens: outputLimit,
   })
   for await (const event of promptStream) {
     if (signal?.aborted) return
@@ -407,10 +561,15 @@ export async function* dispatchSandboxStreamRich(
       event.data?.part?.type === 'text' &&
       event.data.delta
     ) {
+      const remainingCharacters = maxOutputCharacters - outputCharacters
+      if (remainingCharacters <= 0) return
+      const boundedDelta = event.data.delta.slice(0, remainingCharacters)
+      outputCharacters += boundedDelta.length
       yield {
         kind: 'text',
-        delta: redactSystemPromptFromOutput(event.data.delta, agent.systemPrompt),
+        delta: redactSystemPromptFromOutput(boundedDelta, agent.systemPrompt),
       }
+      if (boundedDelta.length < event.data.delta.length) return
       continue
     }
     if (event.type === 'input-required' || event.data?.inputRequired) {
@@ -483,4 +642,15 @@ export async function settleAndRecord(
 /** Token estimate matching the existing chat-completions handler (4 chars ≈ 1 token). */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)
+}
+
+/** Include the host-owned system prompt because the provider bills it too. */
+export function estimateBillableInputTokens(agent: AgentMeta, userMessage: string): number {
+  return estimateTokens(userMessage) + estimateTokens(agent.systemPrompt ?? '')
+}
+
+/** A tokenizer cannot emit more tokens than the UTF-8 bytes it consumes. */
+export function maximumBillableInputTokens(agent: AgentMeta, userMessage: string): number {
+  const encoder = new TextEncoder()
+  return encoder.encode(userMessage).byteLength + encoder.encode(agent.systemPrompt ?? '').byteLength
 }
