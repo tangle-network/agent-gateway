@@ -232,14 +232,6 @@ export function createAgentGateway(config: GatewayConfig) {
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
   const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
-  if (
-    config.a2a?.taskStore &&
-    (!taskStore.createIfAbsent || !taskStore.compareAndSet)
-  ) {
-    throw new Error(
-      'createAgentGateway: custom A2A taskStore must implement atomic createIfAbsent and compareAndSet',
-    )
-  }
   const pushStore = config.a2a?.pushStore
   const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
   gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
@@ -281,6 +273,11 @@ function streamChatCompletions(
   let outputText = ''
   let usage: import('./types').SandboxUsageReceipt | undefined
   let workObserved = false
+  const requestSignal = c.req.raw.signal
+  const abortController = new AbortController()
+  const abortFromRequest = () => abortController.abort()
+  if (requestSignal.aborted) abortFromRequest()
+  else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -291,6 +288,7 @@ function streamChatCompletions(
     async start(controller) {
       const encoder = new TextEncoder()
       const sendChunk = (delta: string) => {
+        if (controller.desiredSize === null) return
         outputText += delta
         const chunk: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
@@ -308,13 +306,14 @@ function streamChatCompletions(
           userMessage,
           consumerId,
           config,
-          undefined,
+          abortController.signal,
           undefined,
           maxOutputTokens,
           async () => {
             await beginPaymentExecution(authz, config)
             if (authz.paymentOperation) workObserved = true
           },
+          authz.paymentOperation !== undefined,
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)
@@ -341,8 +340,10 @@ function streamChatCompletions(
           model: agent.slug,
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        if (controller.desiredSize !== null) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        }
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err)
         // Never expose stack traces / absolute paths from sandbox internals.
@@ -366,14 +367,20 @@ function streamChatCompletions(
             releaseError instanceof Error ? releaseError.message : String(releaseError),
           )
         }
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
-          ),
-        )
+        if (!abortController.signal.aborted && controller.desiredSize !== null) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
+            ),
+          )
+        }
       } finally {
-        controller.close()
+        requestSignal.removeEventListener('abort', abortFromRequest)
+        if (controller.desiredSize !== null) controller.close()
       }
+    },
+    cancel() {
+      abortController.abort()
     },
   })
 

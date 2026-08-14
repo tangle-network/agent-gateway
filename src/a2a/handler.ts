@@ -235,6 +235,7 @@ async function executeMessageSend(
         await beginPaymentExecution(authz, deps.config)
         if (authz.paymentOperation) workObserved = true
       },
+      authz.paymentOperation !== undefined,
     )) {
       if (event.kind === 'text') {
         responseText += event.delta
@@ -412,6 +413,7 @@ async function handleMessageStream(
             await beginPaymentExecution(authz, deps.config)
             if (authz.paymentOperation) workObserved = true
           },
+          authz.paymentOperation !== undefined,
         )) {
           if (event.kind === 'text') {
             responseText += event.delta

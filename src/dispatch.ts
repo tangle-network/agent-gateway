@@ -723,6 +723,7 @@ export async function* dispatchSandboxStreamRich(
   sessionId?: string,
   maxOutputTokens?: number,
   onExecutionStart?: () => Promise<void>,
+  requiresReceipt = config.x402.paymentOperations !== undefined,
 ): AsyncIterable<A2ADispatchEvent> {
   const box = await config.getSandbox(agent)
   const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
@@ -764,79 +765,80 @@ export async function* dispatchSandboxStreamRich(
     signal,
   })
   const iterator = promptStream[Symbol.asyncIterator]()
-  while (true) {
-    const next = await readSandboxEvent(iterator, signal)
-    if (next === ABORTED_SANDBOX_READ) {
-      closeSandboxIterator(iterator)
-      return
-    }
-    if (next.done) break
-    const event = next.value
-    if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
-    if (event.data?.reasoning?.tokens !== undefined) {
-      observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
-      yield { kind: 'activity' }
-    }
-    if (event.data?.tool) {
-      observedToolCalls += 1
-      observedToolTokens +=
-        nonNegativeSafeInteger(event.data.tool.inputTokens ?? 0, 'tool input tokens') +
-        nonNegativeSafeInteger(event.data.tool.outputTokens ?? 0, 'tool output tokens')
-      yield { kind: 'activity' }
-    }
-    enforceUsageBudget(withObservedUsage(
-      usageParts,
-      observedReasoningTokens,
-      observedToolTokens,
-      observedToolCalls,
-    ), executionBudget)
-    if (
-      event.type === 'message.part.updated' &&
-      event.data?.part?.type === 'text' &&
-      event.data.delta
-    ) {
-      const remainingBytes = maxOutputBytes - outputBytes
-      if (remainingBytes <= 0) throw new Error('sandbox exceeded max output tokens')
-      const bounded = truncateUtf8(event.data.delta, remainingBytes, encoder)
-      if (bounded.truncated) {
+  try {
+    while (true) {
+      const next = await readSandboxEvent(iterator, signal)
+      if (next === ABORTED_SANDBOX_READ) return
+      if (next.done) break
+      const event = next.value
+      if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
+      if (event.data?.reasoning?.tokens !== undefined) {
+        observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
         yield { kind: 'activity' }
-        throw new Error('sandbox exceeded max output tokens')
       }
-      outputBytes += bounded.bytes
-      legacyOutputText += bounded.text
-      yield { kind: 'activity' }
-      yield { kind: 'text', delta: redactSystemPromptFromOutput(bounded.text, agent.systemPrompt) }
-      continue
-    }
-    if (event.type === 'input-required' || event.data?.inputRequired) {
-      const usage = completeUsage(
+      if (event.data?.tool) {
+        observedToolCalls += 1
+        observedToolTokens +=
+          nonNegativeSafeInteger(event.data.tool.inputTokens ?? 0, 'tool input tokens') +
+          nonNegativeSafeInteger(event.data.tool.outputTokens ?? 0, 'tool output tokens')
+        yield { kind: 'activity' }
+      }
+      enforceUsageBudget(withObservedUsage(
         usageParts,
         observedReasoningTokens,
         observedToolTokens,
         observedToolCalls,
-        userMessage,
-        legacyOutputText,
-        executionBudget,
-        config.x402.paymentOperations !== undefined,
-      )
-      yield { kind: 'input-required', prompt: event.data?.inputRequired?.prompt }
-      // Terminal for the sandbox stream — sandbox SHOULD stop emitting until
-      // the gateway dispatches a continuation message with the new user input.
-      yield { kind: 'usage', usage }
-      return
+      ), executionBudget)
+      if (
+        event.type === 'message.part.updated' &&
+        event.data?.part?.type === 'text' &&
+        event.data.delta
+      ) {
+        const remainingBytes = maxOutputBytes - outputBytes
+        if (remainingBytes <= 0) throw new Error('sandbox exceeded max output tokens')
+        const bounded = truncateUtf8(event.data.delta, remainingBytes, encoder)
+        if (bounded.truncated) {
+          yield { kind: 'activity' }
+          throw new Error('sandbox exceeded max output tokens')
+        }
+        outputBytes += bounded.bytes
+        legacyOutputText += bounded.text
+        yield { kind: 'activity' }
+        yield { kind: 'text', delta: redactSystemPromptFromOutput(bounded.text, agent.systemPrompt) }
+        continue
+      }
+      if (event.type === 'input-required' || event.data?.inputRequired) {
+        const usage = completeUsage(
+          usageParts,
+          observedReasoningTokens,
+          observedToolTokens,
+          observedToolCalls,
+          userMessage,
+          legacyOutputText,
+          executionBudget,
+          requiresReceipt,
+        )
+        yield { kind: 'input-required', prompt: event.data?.inputRequired?.prompt }
+        // Terminal for the sandbox stream — sandbox SHOULD stop emitting until
+        // the gateway dispatches a continuation message with the new user input.
+        yield { kind: 'usage', usage }
+        return
+      }
     }
+    const usage = completeUsage(
+      usageParts,
+      observedReasoningTokens,
+      observedToolTokens,
+      observedToolCalls,
+      userMessage,
+      legacyOutputText,
+      executionBudget,
+      requiresReceipt,
+    )
+    yield { kind: 'usage', usage }
+  } finally {
+    closeSandboxIterator(iterator)
   }
-  const usage = completeUsage(
-    usageParts,
-    observedReasoningTokens,
-    observedToolTokens,
-    observedToolCalls,
-    userMessage,
-    legacyOutputText,
-    executionBudget,
-    config.x402.paymentOperations !== undefined,
-  )
-  yield { kind: 'usage', usage }
 }
 
 const ABORTED_SANDBOX_READ = Symbol('aborted-sandbox-read')
@@ -913,9 +915,6 @@ export async function settleAndRecord(
     startMs: authz.startMs,
   }
   try {
-    // Record attribution before settlement. Marketplace adapters use this
-    // row to map the request to its agent and consumer before deducting funds.
-    await config.recordUsage(usageEvent)
     if (authz.paymentOperation && config.x402.paymentOperations) {
       const amount = actualX402Amount(
         agent.pricePerTokenUsd,
@@ -930,15 +929,23 @@ export async function settleAndRecord(
         authz.paymentOperation,
         { amount, totalCostUsd: totalCost, usage },
       )
-    } else if (config.settlePayment) {
-      await config.settlePayment(
-        {
-          method: authz.paymentMethod,
-          consumerId: authz.consumerId,
-          requestId: authz.requestId,
-        },
-        totalCost,
-      )
+      // Durable settlement happens first. If attribution storage is
+      // unavailable, recovery must never refund delivered work.
+      await config.recordUsage(usageEvent)
+    } else {
+      // Legacy adapters retain attribution-before-charge because their
+      // settlement callback may resolve that usage row.
+      await config.recordUsage(usageEvent)
+      if (config.settlePayment) {
+        await config.settlePayment(
+          {
+            method: authz.paymentMethod,
+            consumerId: authz.consumerId,
+            requestId: authz.requestId,
+          },
+          totalCost,
+        )
+      }
     }
     await obs?.onRequestComplete?.(ctx, usageEvent)
   } catch (err) {

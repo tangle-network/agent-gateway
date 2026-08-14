@@ -49,7 +49,9 @@ Before it calls the verifier, the gateway requires the signed amount to cover fi
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
-Version 2 payment operations reject missing receipts; legacy adapters use visible-token estimates only.
+Requests with a version 2 payment operation reject missing receipts; API-key and MPP requests keep the legacy visible-token estimate path.
+Older custom A2A task stores remain source-compatible through a process-safe fallback.
+Use an atomic task store for multi-worker production deployments.
 
 MPP is method-specific.
 Configure `mpp.verifySigner` for production MPP credentials; it receives the decoded JSON payload when available plus the original decoded credential, and returns the authenticated consumer ID or `null`.

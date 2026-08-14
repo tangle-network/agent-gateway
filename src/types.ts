@@ -191,10 +191,14 @@ export interface GatewayUsageEvent {
   paymentMethod: PaymentMethod
   inputTokens: number
   outputTokens: number
-  reasoningTokens: number
-  toolTokens: number
-  toolCallCount: number
-  providerCostUsd: number
+  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  reasoningTokens?: number
+  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  toolTokens?: number
+  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  toolCallCount?: number
+  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  providerCostUsd?: number
   totalCostUsd: number
   ownerEarnedUsd: number
   platformFeeUsd: number

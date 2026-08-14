@@ -429,6 +429,41 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(body).not.toContain('data: [DONE]')
   })
 
+  it('aborts and closes the sandbox iterator when an HTTP reader cancels', async () => {
+    let sandboxSignal: AbortSignal | undefined
+    let finishCleanup!: () => void
+    const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve })
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt(_message: string, opts?: { signal?: AbortSignal }) {
+          sandboxSignal = opts?.signal
+          try {
+            yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'partial' } }
+            await new Promise<void>((resolve) => {
+              opts?.signal?.addEventListener('abort', () => resolve(), { once: true })
+            })
+          } finally {
+            finishCleanup()
+          }
+        },
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_cancel',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const reader = response.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    await cleanup
+
+    expect(sandboxSignal?.aborted).toBe(true)
+  })
+
   it('records attribution before settlement so adapters can resolve the charge', async () => {
     const order: string[] = []
     const { app } = buildHarness({
@@ -469,6 +504,58 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(streamed.done).toBe(true)
     expect(usage[0]?.outputTokens).toBe(2)
     expect(settlements).toHaveLength(1)
+  })
+
+  it('requires complete receipts only for requests with durable payment ownership', async () => {
+    const operations = new MemoryPaymentOperations()
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'legacy' } }
+        },
+      }),
+      verifyApiKey: async () => ({ consumerId: 'api-consumer', keyId: 'api-key', scopes: ['chat'] }),
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:consumer',
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const apiKeyResponse = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_legacy',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const mppCredential = Buffer.from(JSON.stringify({})).toString('base64url')
+    const mppResponse = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${mppCredential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const [apiKeyStream, mppStream] = await Promise.all([
+      readSse(apiKeyResponse),
+      readSse(mppResponse),
+    ])
+    expect(apiKeyResponse.status).toBe(200)
+    expect(mppResponse.status).toBe(200)
+    expect(apiKeyStream.combinedText).toBe('legacy')
+    expect(mppStream.combinedText).toBe('legacy')
+    expect(apiKeyStream.done).toBe(true)
+    expect(mppStream.done).toBe(true)
   })
 
   it('threads a unique requestId per concurrent request — regression: two same-consumer requests get distinct ids', async () => {
@@ -831,7 +918,7 @@ describe('createAgentGateway — production-config guard', () => {
     })).toThrow(/paymentProtocolVersion must be explicit/)
   })
 
-  it('refuses a custom A2A task store without atomic transitions', () => {
+  it('keeps older custom A2A task stores source-compatible', () => {
     expect(() => createAgentGateway({
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
@@ -844,7 +931,7 @@ describe('createAgentGateway — production-config guard', () => {
           delete: async () => undefined,
         },
       },
-    })).toThrow(/atomic createIfAbsent and compareAndSet/)
+    })).not.toThrow()
   })
 })
 

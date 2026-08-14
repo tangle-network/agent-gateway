@@ -60,6 +60,55 @@ function context(requiredAmount = 500n): PaymentAuthorizationContext {
 }
 
 describe('version 2 payment operations', () => {
+  it('settles durable work before a usage-store failure can trigger recovery', async () => {
+    const order: string[] = []
+    let operationId: string | undefined
+    const operations = new MemoryPaymentOperations({
+      onSettle: async (operation) => {
+        order.push('settle')
+        operationId = operation.operationId
+      },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'sandbox.usage', data: { usage: settledUsage() } }
+        },
+      }),
+      recordUsage: async () => {
+        order.push('record')
+        throw new Error('usage database unavailable')
+      },
+      x402: {
+        operatorAddress: '0x1',
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const response = await app.request('/v1/agents/payment-tests/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': JSON.stringify({
+          ...payload('1000000000', '20'),
+          operator: '0x1',
+        }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await response.text()
+
+    expect(order).toEqual(['settle', 'record'])
+    expect(operationId).toBeDefined()
+    expect(operations.get(operationId!)?.state).toBe('settled')
+  })
+
   it('has one atomic owner and refunds the unused reservation', async () => {
     const operations = new MemoryPaymentOperations()
     const results = await Promise.allSettled([
