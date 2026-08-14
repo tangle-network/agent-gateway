@@ -251,6 +251,11 @@ export function createAgentGateway(config: GatewayConfig) {
 // when an old binary ignores the version 2 operation contract.
 Object.assign(createAgentGateway, { paymentProtocolVersion: 2 as const })
 
+/** Public package-boundary version marker for durable payment operations. */
+export namespace createAgentGateway {
+  export const paymentProtocolVersion = 2 as const
+}
+
 /**
  * Drain the sandbox stream into an OpenAI-shaped SSE response, settle the
  * payment, fire observer hooks. Identical pre-refactor behavior, just lifted
