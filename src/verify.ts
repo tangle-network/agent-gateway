@@ -3,17 +3,42 @@ import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-stor
 
 /** Return the canonical opaque nonce key used by the final payment claim. */
 export function mppReplayNonceKey(authHeader: string): string | undefined {
+  const decoded = decodeMppCredential(authHeader)
+  return decoded ? canonicalMppNonceKey(decoded.method, decoded.payload) : undefined
+}
+
+/** Return the decoded MPP payload for a durable payment claim. */
+export function mppPaymentPayload(authHeader: string): Record<string, unknown> | undefined {
+  return decodeMppCredential(authHeader)?.payload
+}
+
+interface DecodedMppCredential {
+  method: string
+  credential: string
+  payload: Record<string, unknown>
+}
+
+function decodeMppCredential(authHeader: string): DecodedMppCredential | undefined {
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
   if (!match) return undefined
-  const [, method, credentialB64] = match
+  const [, rawMethod, credentialB64] = match
+  if (!/^[A-Za-z0-9_-]+$/.test(credentialB64)) return undefined
   try {
     const decoded = Buffer.from(credentialB64, 'base64url').toString('utf-8')
-    const credential = JSON.parse(decoded) as Record<string, unknown>
-    const nested = credential.payload
-    const payload = nested && typeof nested === 'object' && !Array.isArray(nested)
-      ? nested as Record<string, unknown>
-      : credential
-    return canonicalMppNonceKey(method, payload)
+    let payload: Record<string, unknown> = {}
+    try {
+      const credential = JSON.parse(decoded) as unknown
+      if (credential && typeof credential === 'object' && !Array.isArray(credential)) {
+        const record = credential as Record<string, unknown>
+        const nested = record.payload
+        payload = nested && typeof nested === 'object' && !Array.isArray(nested)
+          ? nested as Record<string, unknown>
+          : record
+      }
+    } catch {
+      // Method-specific verifiers may accept a non-JSON credential format.
+    }
+    return { method: rawMethod.toLowerCase(), credential: decoded, payload }
   } catch {
     return undefined
   }
@@ -42,7 +67,7 @@ export function isApiKeyAuthEnabled(
 export function isMppAuthEnabled(
   config: Pick<GatewayConfig, 'mpp' | 'x402'>,
 ): boolean {
-  const method = config.mpp?.method ?? 'blueprintevm'
+  const method = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
   return Boolean(
     config.mpp &&
       (config.mpp.verifySigner !== undefined ||
@@ -84,7 +109,7 @@ export async function verifyX402(
     // Reject payments that cannot cover the request's maximum charge. The
     // check runs before the host verifier because that callback can reserve or
     // settle funds as part of its production verification path.
-    if (amount < minimumAmount || minimumAmount <= 0n) return null
+    if (amount <= 0n || minimumAmount < 0n || amount < minimumAmount) return null
 
     const nonceKey = `${String(raw.commitment).toLowerCase()}:${nonce.toString()}`
     if (nonceStore && await nonceStore.hasSeen(nonceKey)) return null
@@ -136,25 +161,14 @@ export async function verifyMpp(
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
   if (!match) return null
 
-  const [, method, credentialB64] = match
-  if (config.method && method !== config.method) return null
+  const [, rawMethod] = match
+  const method = rawMethod.toLowerCase()
+  if (config.method && method !== config.method.toLowerCase()) return null
 
   try {
-    if (!/^[A-Za-z0-9_-]+$/.test(credentialB64)) return null
-    const decoded = Buffer.from(credentialB64, 'base64url').toString('utf-8')
-    let payload: Record<string, unknown> = {}
-    try {
-      const credential = JSON.parse(decoded) as unknown
-      if (credential && typeof credential === 'object' && !Array.isArray(credential)) {
-        const nested = (credential as Record<string, unknown>).payload
-        payload =
-          nested && typeof nested === 'object' && !Array.isArray(nested)
-            ? (nested as Record<string, unknown>)
-            : (credential as Record<string, unknown>)
-      }
-    } catch {
-      // Method-specific verifiers may accept a non-JSON credential format.
-    }
+    const decodedCredential = decodeMppCredential(authHeader)
+    if (!decodedCredential) return null
+    const { credential: decoded, payload } = decodedCredential
 
     // Validate common EVM fields before a production verifier can reserve or
     // settle funds. BlueprinTEVM carries x402-equivalent token amounts and

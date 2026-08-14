@@ -93,8 +93,8 @@ export class MemoryPaymentOperations implements PaymentOperations {
   private readonly now: () => number
 
   constructor(private readonly options: MemoryPaymentOperationsOptions = {}) {
-    if (options.onClaim && !options.onReclaim) {
-      throw new Error('onReclaim is required when onClaim can reserve external funds')
+    if ((options.onClaim || options.onSettle || options.onRelease) && !options.onReclaim) {
+      throw new Error('onReclaim is required when payment callbacks can lose acknowledgement')
     }
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000))
   }

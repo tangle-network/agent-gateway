@@ -29,6 +29,7 @@ import {
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
+  mppPaymentPayload,
   mppReplayNonceKey,
   verifyMpp,
   verifyX402,
@@ -313,6 +314,7 @@ export async function authenticateAndGuard(
     }
     consumerId = signer
     paymentMethod = 'mpp'
+    x402Payload = mppPaymentPayload(authHeader) ?? null
     paymentNonceKey = mppReplayNonceKey(authHeader)
   } else if (authHeader.startsWith('Bearer ')) {
     const verify = config.verifyApiKey ?? (config.x402.demoMode ? defaultVerifyApiKey : null)
@@ -571,9 +573,47 @@ export async function claimPayment(
       }
     }
     authz.paymentOperation = operation
-  } else if (authz.paymentMethod === 'mpp' && authz.paymentNonceKey) {
-    const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
-    if (!claimed) throw new Error('payment nonce was already consumed')
+  } else if (authz.paymentMethod === 'mpp') {
+    const durablePayload = durableMppPaymentPayload(authz.paymentPayload)
+    if (durablePayload && config.x402.paymentOperations) {
+      const context = {
+        requestId: authz.requestId,
+        agentId: authz.agent.id,
+        requiredAmount: authz.requiredPaymentAmount,
+        maxOutputTokens: authz.maxOutputTokens,
+        executionBudget: authz.executionBudget,
+      }
+      const operation = await config.x402.paymentOperations.claimPayment(durablePayload, context)
+      if (operation.protocolVersion !== 2) throw new Error('payment operation protocol version mismatch')
+      if (operation.acquiredByRequestId !== context.requestId) {
+        throw new Error('payment operation was already claimed')
+      }
+      authz.paymentPayload = durablePayload
+      authz.paymentOperation = operation
+      authz.paymentOperationAcquired = true
+      if (authz.paymentNonceKey) {
+        const claimed = await claimPaymentNonce(
+          state.nonceStore,
+          authz.paymentNonceKey,
+          durablePayload,
+          `${operation.operationId}:${context.requestId}`,
+        )
+        if (!claimed) {
+          try {
+            await config.x402.paymentOperations.releasePayment(operation, 'shared payment nonce was already owned')
+          } catch (releaseError) {
+            console.error(
+              `[agent-gateway] payment release failed for ${authz.requestId}:`,
+              releaseError instanceof Error ? releaseError.message : String(releaseError),
+            )
+          }
+          throw new Error('payment nonce was already consumed')
+        }
+      }
+    } else if (authz.paymentNonceKey) {
+      const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
+      if (!claimed) throw new Error('payment nonce was already consumed')
+    }
   }
 
   try {
@@ -661,6 +701,31 @@ async function claimPaymentNonce(
   return claimStoredNonce(nonceStore, nonceKey, ttl, ownerId)
 }
 
+function durableMppPaymentPayload(
+  payload: Record<string, unknown> | null,
+): Record<string, unknown> | undefined {
+  if (!payload) return undefined
+  const commitment = payload.commitment ?? payload.from
+  const amount = payload.amount ?? payload.value
+  const nonce = payload.nonce
+  if (typeof commitment !== 'string' || commitment.length === 0) return undefined
+  if (amount === undefined || nonce === undefined) return undefined
+  const amountText = String(amount)
+  const nonceText = String(nonce)
+  if (!/^\d+$/.test(amountText) || !/^\d+$/.test(nonceText)) return undefined
+  const expiryText = payload.expiry === undefined
+    ? String(Math.floor(Date.now() / 1000) + 3600)
+    : String(payload.expiry)
+  if (!/^\d+$/.test(expiryText)) return undefined
+  return {
+    ...payload,
+    commitment,
+    amount: amountText,
+    nonce: nonceText,
+    expiry: expiryText,
+  }
+}
+
 /**
  * Yield the inner sandbox's response as text deltas, applying the
  * system-prompt redaction filter on each delta so leakage of the agent's
@@ -724,8 +789,11 @@ export async function* dispatchSandboxStreamRich(
   maxOutputTokens?: number,
   onExecutionStart?: () => Promise<void>,
   requiresReceipt = config.x402.paymentOperations !== undefined,
+  onSandboxStart?: () => void,
 ): AsyncIterable<A2ADispatchEvent> {
+  if (signal?.aborted) return
   const box = await config.getSandbox(agent)
+  if (signal?.aborted) return
   const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
   if (!Number.isSafeInteger(outputLimit) || outputLimit <= 0) {
     throw new Error('max output tokens must be a positive safe integer')
@@ -764,6 +832,7 @@ export async function* dispatchSandboxStreamRich(
     executionBudget,
     signal,
   })
+  onSandboxStart?.()
   const iterator = promptStream[Symbol.asyncIterator]()
   try {
     while (true) {
@@ -837,7 +906,7 @@ export async function* dispatchSandboxStreamRich(
     )
     yield { kind: 'usage', usage }
   } finally {
-    closeSandboxIterator(iterator)
+    await closeSandboxIterator(iterator)
   }
 }
 
@@ -850,7 +919,10 @@ async function readSandboxEvent(
   if (!signal) return iterator.next()
   if (signal.aborted) return ABORTED_SANDBOX_READ
   return new Promise((resolve, reject) => {
-    const onAbort = () => resolve(ABORTED_SANDBOX_READ)
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(ABORTED_SANDBOX_READ)
+    }
     signal.addEventListener('abort', onAbort, { once: true })
     iterator.next().then(
       (result) => {
@@ -865,12 +937,27 @@ async function readSandboxEvent(
   })
 }
 
-function closeSandboxIterator(iterator: AsyncIterator<SandboxStreamEvent>): void {
+const SANDBOX_CLEANUP_TIMEOUT_MS = 50
+
+async function closeSandboxIterator(iterator: AsyncIterator<SandboxStreamEvent>): Promise<void> {
+  let closing: PromiseLike<unknown> | undefined
   try {
-    const closing = iterator.return?.()
-    if (closing) void Promise.resolve(closing).catch(() => undefined)
+    const result = iterator.return?.()
+    if (result) closing = Promise.resolve(result)
   } catch {
-    // The request is already canceled. Adapter cleanup must not delay it.
+    return
+  }
+  if (!closing) return
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      Promise.resolve(closing).catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, SANDBOX_CLEANUP_TIMEOUT_MS)
+      }),
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
   }
 }
 

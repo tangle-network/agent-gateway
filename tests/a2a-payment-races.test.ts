@@ -268,6 +268,7 @@ describe('A2A payment ownership races', () => {
     let settlements = 0
     const operations = new MemoryPaymentOperations({
       onSettle: async () => { settlements += 1 },
+      onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
       resolveAgent: async () => agent,
@@ -350,6 +351,7 @@ describe('A2A payment ownership races', () => {
     let settlements = 0
     const operations = new MemoryPaymentOperations({
       onSettle: async () => { settlements += 1 },
+      onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
       resolveAgent: async () => agent,

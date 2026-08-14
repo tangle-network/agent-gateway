@@ -311,9 +311,11 @@ function streamChatCompletions(
           maxOutputTokens,
           async () => {
             await beginPaymentExecution(authz, config)
-            if (authz.paymentOperation) workObserved = true
           },
           authz.paymentOperation !== undefined,
+          () => {
+            if (authz.paymentOperation) workObserved = true
+          },
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)

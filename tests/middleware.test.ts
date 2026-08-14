@@ -16,7 +16,7 @@ import type {
   GatewayUsageEvent,
   ApiKeyInfo,
 } from '../src/types'
-import { MemoryNonceStore } from '../src/nonce-store'
+import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import { MemoryPaymentOperations } from '../src/payment-operations'
 
@@ -464,6 +464,54 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(sandboxSignal?.aborted).toBe(true)
   })
 
+  it('releases a durable payment when cancellation wins after authorization but before sandbox start', async () => {
+    const controller = new AbortController()
+    const operations = new MemoryPaymentOperations()
+    const originalBegin = operations.beginPaymentExecution.bind(operations)
+    operations.beginPaymentExecution = async (operation) => {
+      const executing = await originalBegin(operation)
+      controller.abort()
+      return executing
+    }
+    let sandboxCalls = 0
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxCalls += 1
+          yield { type: 'sandbox.usage', data: { usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            reasoningTokens: 0,
+            toolTokens: 0,
+            toolCallCount: 0,
+            providerCostUsd: 0,
+            budgetEnforced: true,
+          } } }
+        },
+      }),
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9003' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await response.text()
+
+    expect(sandboxCalls).toBe(0)
+    expect(operations.get('x402:0xcommitmentalice:9003')?.state).toBe('released')
+  })
+
   it('records attribution before settlement so adapters can resolve the charge', async () => {
     const order: string[] = []
     const { app } = buildHarness({
@@ -504,6 +552,57 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(streamed.done).toBe(true)
     expect(usage[0]?.outputTokens).toBe(2)
     expect(settlements).toHaveLength(1)
+  })
+
+  it('durably claims an x402-compatible MPP receipt and rejects its replay', async () => {
+    const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
+    const nonceStore: NonceStore = {
+      hasSeen: async () => false,
+      claim: async () => true,
+      markSeen: async () => undefined,
+    }
+    const credential = Buffer.from(JSON.stringify({
+      payload: {
+        commitment: '0xCommitmentAlice',
+        signature: '0xSignatureBytes',
+        operator: operatorAddress,
+        amount: fundedRequestAmount,
+        nonce: '901',
+        expiry: String(Math.floor(Date.now() / 1000) + 600),
+      },
+    })).toString('base64url')
+    const { app } = buildHarness({
+      nonceStore,
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'blueprintevm',
+        verifySigner: async () => 'mpp:consumer',
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const request = () => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment blueprintevm ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const first = await request()
+    await first.text()
+    const second = await request()
+    await second.text()
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(402)
+    expect(operations.get('x402:0xcommitmentalice:901')?.state).toBe('settled')
   })
 
   it('requires complete receipts only for requests with durable payment ownership', async () => {

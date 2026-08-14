@@ -321,8 +321,14 @@ describe('final payment boundary protocol guards', () => {
     let runs = 0
     let settlements = 0
     const stores = [
-      new MemoryPaymentOperations({ onSettle: async () => { settlements += 1 } }),
-      new MemoryPaymentOperations({ onSettle: async () => { settlements += 1 } }),
+      new MemoryPaymentOperations({
+        onSettle: async () => { settlements += 1 },
+        onReclaim: async () => undefined,
+      }),
+      new MemoryPaymentOperations({
+        onSettle: async () => { settlements += 1 },
+        onReclaim: async () => undefined,
+      }),
     ]
     const apps = stores.map((operations) => {
       const app = new Hono()
@@ -376,6 +382,7 @@ describe('final payment boundary protocol guards', () => {
     const operations = new MemoryPaymentOperations({
       onSettle: async () => { settlements += 1 },
       onRelease: async () => { releases += 1 },
+      onReclaim: async () => undefined,
     })
     let operationPromise: ReturnType<typeof operations.claimPayment> | undefined
     let authorizations = 0

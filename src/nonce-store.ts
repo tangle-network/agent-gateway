@@ -121,19 +121,21 @@ export class KvNonceStore implements NonceStore {
   }
 
   async claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean> {
-    if (ownerId === undefined) {
+    if (!this.kv.putIfAbsent) {
+      if (ownerId !== undefined) {
+        throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
+      }
       if (await this.hasSeen(nonce)) return false
       await this.markSeen(nonce, ttlSeconds)
       return true
     }
-    if (!this.kv.putIfAbsent) {
-      throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
-    }
     const ttl = Math.max(ttlSeconds, 60)
     const key = this.key(nonce)
     const value = ownerId ?? '1'
-    const existing = await this.kv.get(key)
-    if (existing !== null) return ownerId !== undefined && existing === ownerId
+    if (ownerId !== undefined) {
+      const existing = await this.kv.get(key)
+      if (existing !== null) return existing === ownerId
+    }
     const inserted = await this.kv.putIfAbsent(key, value, { expirationTtl: ttl })
     if (inserted || ownerId === undefined) return inserted
     // Another isolate may have won between get and putIfAbsent. Re-read so a

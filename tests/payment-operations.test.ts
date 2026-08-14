@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
 import {
   dispatchSandboxStreamRich,
@@ -68,6 +68,7 @@ describe('version 2 payment operations', () => {
         order.push('settle')
         operationId = operation.operationId
       },
+      onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
       resolveAgent: async () => agent,
@@ -221,6 +222,13 @@ describe('version 2 payment operations', () => {
     })).toThrow('onReclaim is required')
   })
 
+  it.each([
+    ['settlement', { onSettle: async () => undefined }],
+    ['release', { onRelease: async () => undefined }],
+  ])('requires recovery for an external %s acknowledgement', (_name, options) => {
+    expect(() => new MemoryPaymentOperations(options)).toThrow('onReclaim is required')
+  })
+
   it('runs one settlement side effect for concurrent retries', async () => {
     let effects = 0
     const operations = new MemoryPaymentOperations({
@@ -228,6 +236,7 @@ describe('version 2 payment operations', () => {
         effects += 1
         await new Promise((resolve) => setTimeout(resolve, 1))
       },
+      onReclaim: async () => undefined,
     })
     const owner = await operations.claimPayment(payload('1000', '13'), context())
     const input = {
@@ -363,14 +372,10 @@ describe('version 2 payment operations', () => {
     expect(recovered[1].state).toBe('released')
   })
 
-  it('does not close a release when recovery has no refund proof', async () => {
-    const operations = new MemoryPaymentOperations({
+  it('rejects a release callback without a recovery proof', () => {
+    expect(() => new MemoryPaymentOperations({
       onRelease: async () => { throw new Error('acknowledgement lost') },
-    })
-    const owner = await operations.claimPayment(payload('1000', '14'), context())
-    await expect(operations.releasePayment(owner, 'sandbox failed')).rejects.toThrow()
-    await expect(operations.reclaimPayment(owner.operationId)).rejects.toThrow('recovery is not configured')
-    expect(operations.get(owner.operationId)?.state).toBe('releasing')
+    })).toThrow('onReclaim is required')
   })
 
   it('reclaims a claim that crashed after durable ownership but before completion', async () => {
@@ -491,7 +496,10 @@ describe('bounded request pricing and sandbox receipts', () => {
 
   it('bounds output before delivery and retains payment ownership after an over-limit stream', async () => {
     let releases = 0
-    const operations = new MemoryPaymentOperations({ onRelease: async () => { releases += 1 } })
+    const operations = new MemoryPaymentOperations({
+      onRelease: async () => { releases += 1 },
+      onReclaim: async () => undefined,
+    })
     const box: SandboxBox = {
       async *streamPrompt() {
         yield {
@@ -670,6 +678,122 @@ describe('bounded request pricing and sandbox receipts', () => {
     release()
     await events.next()
     await events.next()
+  })
+
+  it('waits for bounded iterator cleanup after cancellation', async () => {
+    let signalNext!: () => void
+    const nextStarted = new Promise<void>((resolve) => { signalNext = resolve })
+    let signalCleanup!: () => void
+    const cleanupStarted = new Promise<void>((resolve) => { signalCleanup = resolve })
+    let finishCleanup!: () => void
+    const cleanupFinished = new Promise<IteratorResult<SandboxStreamEvent>>((resolve) => {
+      finishCleanup = () => resolve({ done: true, value: undefined })
+    })
+    const iterator: AsyncIterator<SandboxStreamEvent> = {
+      next: async () => {
+        signalNext()
+        return new Promise<IteratorResult<SandboxStreamEvent>>(() => undefined)
+      },
+      return: async () => {
+        signalCleanup()
+        return cleanupFinished
+      },
+    }
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        streamPrompt: () => ({ [Symbol.asyncIterator]: () => iterator }),
+      }),
+      recordUsage: async () => undefined,
+      x402: { operatorAddress: '0x1', chainId: 1, demoMode: true },
+    }
+    const controller = new AbortController()
+    let completed = false
+    const running = (async () => {
+      for await (const _event of dispatchSandboxStreamRich(
+        agent,
+        'hi',
+        'consumer',
+        config,
+        controller.signal,
+        undefined,
+        4,
+      )) {
+        // The iterator never emits an event before cancellation.
+      }
+      completed = true
+    })()
+
+    await nextStarted
+    controller.abort()
+    await cleanupStarted
+    await Promise.resolve()
+    expect(completed).toBe(false)
+
+    finishCleanup()
+    await running
+    expect(completed).toBe(true)
+  })
+
+  it('bounds cleanup when an iterator ignores cancellation', async () => {
+    vi.useFakeTimers()
+    try {
+      let signalNext!: () => void
+      const nextStarted = new Promise<void>((resolve) => { signalNext = resolve })
+      let signalCleanup!: () => void
+      const cleanupStarted = new Promise<void>((resolve) => { signalCleanup = resolve })
+      let cleanupCalls = 0
+      const iterator: AsyncIterator<SandboxStreamEvent> = {
+        next: async () => {
+          signalNext()
+          return new Promise<IteratorResult<SandboxStreamEvent>>(() => undefined)
+        },
+        return: async () => {
+          cleanupCalls += 1
+          signalCleanup()
+          return new Promise<IteratorResult<SandboxStreamEvent>>(() => undefined)
+        },
+      }
+      const config: GatewayConfig = {
+        resolveAgent: async () => agent,
+        getSandbox: async () => ({
+          streamPrompt: () => ({ [Symbol.asyncIterator]: () => iterator }),
+        }),
+        recordUsage: async () => undefined,
+        x402: { operatorAddress: '0x1', chainId: 1, demoMode: true },
+      }
+      const controller = new AbortController()
+      let completed = false
+      const running = (async () => {
+        for await (const _event of dispatchSandboxStreamRich(
+          agent,
+          'hi',
+          'consumer',
+          config,
+          controller.signal,
+          undefined,
+          4,
+        )) {
+          // The iterator never emits an event before cancellation.
+        }
+        completed = true
+      })()
+
+      await nextStarted
+      controller.abort()
+      await cleanupStarted
+      expect(cleanupCalls).toBe(1)
+      expect(completed).toBe(false)
+
+      vi.advanceTimersByTime(49)
+      await Promise.resolve()
+      expect(completed).toBe(false)
+      vi.advanceTimersByTime(1)
+      await running
+      expect(completed).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

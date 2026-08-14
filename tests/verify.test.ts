@@ -64,6 +64,10 @@ describe('verifyX402', () => {
     expect(calls).toBe(0)
   })
 
+  it('accepts a positive authorization when the requested agent price is zero', async () => {
+    expect(await verifyX402(buildSpendAuth({ amount: '1' }), baseConfig, undefined, 0n)).toBe('0xCommitmentAlice')
+  })
+
   it('rejects expired payments — regression: forever-valid sigs enable drained-wallet attacks', async () => {
     const expired = buildSpendAuth({ expiry: String(Math.floor(Date.now() / 1000) - 10) })
     expect(await verifyX402(expired, baseConfig)).toBeNull()
@@ -254,6 +258,31 @@ describe('verifyMpp', () => {
 
     expect(await verifyMpp(header, config, { ...baseConfig, demoMode: false }, undefined, 20000n)).toBeNull()
     expect(calls).toBe(0)
+  })
+
+  it('normalizes MPP method casing before applying the configured payment ceiling', async () => {
+    const underfunded = buildCredential({
+      commitment: '0xAlice',
+      operator: operatorAddress,
+      amount: '19999',
+      nonce: '9',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+    }).replace('Payment blueprintevm ', 'Payment BLUEPRINTEVM ')
+
+    expect(await verifyMpp(
+      underfunded,
+      { realm: 'agents.tangle.tools' },
+      baseConfig,
+      undefined,
+      20000n,
+    )).toBeNull()
+    expect(await verifyMpp(
+      underfunded,
+      mppConfig,
+      baseConfig,
+      undefined,
+      1n,
+    )).toBe('0xAlice')
   })
 
   it('rejects MPP in production when no method verifier is configured', async () => {

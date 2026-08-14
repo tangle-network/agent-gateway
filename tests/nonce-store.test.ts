@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { MemoryNonceStore, nonceTtlSeconds } from '../src/nonce-store'
+import { KvNonceStore, MemoryNonceStore, nonceTtlSeconds, type KVNamespace } from '../src/nonce-store'
 
 describe('nonceTtlSeconds', () => {
   it('covers the complete signed validity window', () => {
@@ -63,5 +63,36 @@ describe('MemoryNonceStore', () => {
     for (let i = 0; i < 100; i++) {
       expect(await store.hasSeen(`n${i}`)).toBe(false)
     }
+  })
+})
+
+describe('KvNonceStore', () => {
+  it('allows only one mixed legacy and version 2 claim', async () => {
+    const values = new Map<string, string>()
+    const kv: KVNamespace = {
+      async get(key) {
+        return values.get(key) ?? null
+      },
+      async put(key, value) {
+        values.set(key, value)
+      },
+      async putIfAbsent(key, value) {
+        if (values.has(key)) return false
+        values.set(key, value)
+        return true
+      },
+      async delete(key) {
+        values.delete(key)
+      },
+    }
+    const store = new KvNonceStore(kv)
+
+    const results = await Promise.all([
+      store.claim('mixed-version', 60),
+      store.claim('mixed-version', 60, 'operation-1'),
+    ])
+
+    expect(results.filter(Boolean)).toHaveLength(1)
+    expect(await store.claim('mixed-version', 60, 'operation-2')).toBe(false)
   })
 })
