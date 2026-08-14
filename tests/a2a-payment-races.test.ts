@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
-import { MemoryPaymentOperations } from '../src/payment-operations'
+import { MemoryPaymentOperations, type PaymentOperation } from '../src/payment-operations'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
@@ -126,6 +126,82 @@ describe('A2A payment ownership races', () => {
     expect(body.error?.code).toBe(-32602)
     expect(runs).toBe(0)
     expect((await taskStore.get('task-payment-cancel'))?.status.state).toBe('canceled')
+  })
+
+  it('releases payment when cancellation interrupts execution before sandbox start', async () => {
+    const taskStore = new InMemoryTaskStore()
+    let executionStarted!: () => void
+    const executionReady = new Promise<void>((resolve) => { executionStarted = resolve })
+    let releaseExecution!: () => void
+    const executionReleased = new Promise<void>((resolve) => { releaseExecution = resolve })
+    let sandboxStarted = false
+
+    class BlockingExecutionOperations extends MemoryPaymentOperations {
+      override async beginPaymentExecution(operation: PaymentOperation): Promise<PaymentOperation> {
+        const executing = await super.beginPaymentExecution(operation)
+        executionStarted()
+        await executionReleased
+        return executing
+      }
+    }
+
+    const operations = new BlockingExecutionOperations()
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        streamPrompt() {
+          sandboxStarted = true
+          return (async function* () {
+            yield { type: 'sandbox.usage', data: { usage: usage() } }
+          })()
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('82') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-before-sandbox') },
+      }),
+    })
+    await executionReady
+
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-before-sandbox' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseExecution()
+
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(sandboxStarted).toBe(false)
+    expect(operations.get(`x402:${commitment}:82`)?.state).toBe('released')
   })
 
   it('allows only one concurrent continuation to claim and settle a task', async () => {
@@ -330,6 +406,7 @@ describe('A2A payment ownership races', () => {
     const cancellationReady = new Promise<void>((resolve) => { cancellationStored = resolve })
     let releaseCancellation!: () => void
     const cancellationReleased = new Promise<void>((resolve) => { releaseCancellation = resolve })
+    let cancellationBlocked = false
     const taskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
@@ -337,7 +414,8 @@ describe('A2A payment ownership races', () => {
       delete: (id) => innerStore.delete(id),
       async compareAndSet(expected, next) {
         const transitioned = await innerStore.compareAndSet(expected, next)
-        if (transitioned && next.status.state === 'canceled') {
+        if (transitioned && next.status.state === 'canceled' && !cancellationBlocked) {
+          cancellationBlocked = true
           cancellationStored()
           await cancellationReleased
         }
@@ -547,5 +625,129 @@ describe('A2A payment ownership races', () => {
     expect(operations.get(`x402:${commitment}:77`)?.state).toBe('retained')
     const canceled = await taskStore.get('task-cancel')
     expect(canceled?.status.state).toBe('canceled')
+  })
+
+  it('keeps a canceled task recoverable when settlement acknowledgement is lost', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let finalizationSeen!: () => void
+    const finalizationReady = new Promise<void>((resolve) => { finalizationSeen = resolve })
+    let releaseFinalization!: () => void
+    const finalizationReleased = new Promise<void>((resolve) => { releaseFinalization = resolve })
+    let firstFinalization = true
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        if (firstFinalization && next.metadata?.gatewayFinalizing) {
+          firstFinalization = false
+          finalizationSeen()
+          await finalizationReleased
+        }
+        return innerStore.compareAndSet(expected, next)
+      },
+    }
+    let settlementAttempts = 0
+    let recoveryAttempts = 0
+    let records = 0
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => {
+        settlementAttempts += 1
+        throw new Error('settlement acknowledgement lost')
+      },
+      onReclaim: async () => { recoveryAttempts += 1 },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => { records += 1 },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('83') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-canceled-settlement-recovery') },
+      }),
+    })
+    await finalizationReady
+
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-canceled-settlement-recovery' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseFinalization()
+
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(settlementAttempts).toBe(1)
+    expect(operations.get(`x402:${commitment}:83`)?.state).toBe('settling')
+
+    const retained = await taskStore.get('task-canceled-settlement-recovery')
+    const marker = retained?.metadata?.gatewayFinalizing as {
+      lease: { id: string; expiresAt: number }
+      recoveryAttempts?: number
+    }
+    expect(retained?.status.state).toBe('canceled')
+    expect(marker.lease.expiresAt).toBeGreaterThan(Date.now())
+    expect(marker.recoveryAttempts).toBe(1)
+
+    await taskStore.put({
+      ...retained!,
+      metadata: {
+        ...retained!.metadata,
+        gatewayFinalizing: {
+          ...marker,
+          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+    const recovered = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/get',
+        params: { id: 'task-canceled-settlement-recovery' },
+      }),
+    })
+    const recoveredBody = await recovered.json() as {
+      result?: { status?: { state?: string } }
+    }
+    expect(recoveredBody.result?.status?.state).toBe('canceled')
+    expect((await taskStore.get('task-canceled-settlement-recovery'))?.metadata?.gatewayFinalizing).toBeUndefined()
+    expect(operations.get(`x402:${commitment}:83`)?.state).toBe('settled')
+    expect(recoveryAttempts).toBe(1)
+    expect(records).toBe(1)
   })
 })

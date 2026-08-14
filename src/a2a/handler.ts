@@ -76,6 +76,8 @@ interface SerializedPaymentOperation {
   state: PaymentOperation['state']
 }
 
+type FinalizationState = 'completed' | 'input-required' | 'canceled'
+
 interface FinalizationRecord {
   version: 1
   lease: { id: string; expiresAt: number }
@@ -90,6 +92,7 @@ interface FinalizationRecord {
   artifact: Artifact | null
   inputRequired: boolean
   inputRequiredPrompt?: string
+  finalState?: FinalizationState
   maxOutputTokens: number
   executionBudget: SandboxExecutionBudget
   recoveryAttempts?: number
@@ -279,9 +282,11 @@ async function executeMessageSend(
       authz.maxOutputTokens,
       async () => {
         await beginPaymentExecution(authz, deps.config)
-        if (authz.paymentOperation) workObserved = true
       },
       authz.paymentOperation !== undefined,
+      () => {
+        workObserved = true
+      },
     )) {
       if (event.kind === 'text') {
         responseText += event.delta
@@ -481,9 +486,11 @@ async function handleMessageStream(
           authz.maxOutputTokens,
           async () => {
             await beginPaymentExecution(authz, deps.config)
-            if (authz.paymentOperation) workObserved = true
           },
           authz.paymentOperation !== undefined,
+          () => {
+            workObserved = true
+          },
         )) {
           if (event.kind === 'text') {
             responseText += event.delta
@@ -1190,21 +1197,74 @@ async function completeCanceledTask(
   deps: A2AHandlerDeps,
 ): Promise<Task> {
   if (usage) {
+    const current = await deps.taskStore.get(task.id) ?? task
+    const finalization = buildFinalizationRecord(
+      authz,
+      usage,
+      responseText
+        ? responseTextToArtifact(responseText, `${task.id}-artifact-0`)
+        : current.artifacts?.[0] ?? null,
+      false,
+      undefined,
+      'canceled',
+    )
+    let finalizingTask: Task | undefined
+    let candidate = current
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (isTaskFinalizing(candidate)) return candidate
+      if (isTerminal(candidate.status.state) && candidate.status.state !== 'canceled') return candidate
+      // Store the lease before settlement can move the payment to settling.
+      const next = withFinalizationRecord(candidate, finalization)
+      if (await compareAndSetTask(deps.taskStore, candidate, next)) {
+        finalizingTask = next
+        break
+      }
+      const latest = await deps.taskStore.get(task.id)
+      if (!latest) break
+      if (isTerminal(latest.status.state) && latest.status.state !== 'canceled') return latest
+      candidate = latest
+    }
+    if (!finalizingTask) {
+      throw new Error(`A2A task '${task.id}' changed before cancellation settlement`)
+    }
+
     try {
       await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
     } catch (settlementError) {
+      const retained = await retainFinalizationForRecovery(
+        deps.taskStore,
+        task.id,
+        finalization.lease.id,
+        asError(settlementError),
+      )
+      const recoveryTask = retained ?? finalizingTask
       console.error(
         `[a2a] canceled task settlement retained for ${authz.requestId}:`,
         settlementError instanceof Error ? settlementError.message : String(settlementError),
       )
+      await maybeDeliverPush(recoveryTask, deps)
+      return recoveryTask
     }
-  } else {
-    await releaseOrRetainPayment(authz, deps, 'a2a task canceled', workObserved)
+
+    const canceled = withStatus(
+      clearFinalizationMarker(finalizingTask),
+      'canceled',
+      undefined,
+      responseText
+        ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
+        : finalizingTask.artifacts,
+    )
+    if (!await compareAndSetTask(deps.taskStore, finalizingTask, canceled)) {
+      return await deps.taskStore.get(task.id) ?? canceled
+    }
+    await maybeDeliverPush(canceled, deps)
+    return canceled
   }
+  await releaseOrRetainPayment(authz, deps, 'a2a task canceled', workObserved)
   const currentTask = await deps.taskStore.get(task.id)
   const canceledBase = currentTask?.status.state === 'canceled'
     ? currentTask
-    : withStatus(task, 'canceled')
+    : withStatus(currentTask ?? task, 'canceled')
   const canceled: Task = responseText
     ? {
         ...canceledBase,
@@ -1309,6 +1369,7 @@ function buildFinalizationRecord(
   artifact: Artifact | null,
   inputRequired: boolean,
   inputRequiredPrompt: string | undefined,
+  finalState: FinalizationState = inputRequired ? 'input-required' : 'completed',
 ): FinalizationRecord {
   const operation = authz.paymentOperation
   return {
@@ -1325,6 +1386,7 @@ function buildFinalizationRecord(
     artifact,
     inputRequired,
     ...(inputRequiredPrompt ? { inputRequiredPrompt } : {}),
+    finalState,
     maxOutputTokens: authz.maxOutputTokens,
     executionBudget: authz.executionBudget,
   }
@@ -1490,7 +1552,22 @@ async function recoverFinalizationIfNeeded(
 
 function finalizationResultTask(task: Task, record: FinalizationRecord): Task {
   const cleanTask = clearFinalizationMarker(task)
-  if (record.inputRequired) {
+  const finalState = record.finalState ?? (
+    task.status.state === 'canceled'
+      ? 'canceled'
+      : record.inputRequired
+        ? 'input-required'
+        : 'completed'
+  )
+  if (finalState === 'canceled') {
+    return withStatus(
+      cleanTask,
+      'canceled',
+      undefined,
+      record.artifact ? [record.artifact] : cleanTask.artifacts,
+    )
+  }
+  if (finalState === 'input-required') {
     return withStatus(
       cleanTask,
       'input-required',

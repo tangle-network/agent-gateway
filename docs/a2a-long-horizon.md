@@ -24,6 +24,8 @@ Before payment settlement, the gateway stores a recovery record in task metadata
 The record contains the payment operation, usage receipt, output artifact, and a five-minute lease.
 After a restart, the first task read after lease expiry resumes settlement with the same operation.
 If settlement acknowledgement fails, the gateway keeps the operation and retries after the lease expires.
+Cancellation stores the recovery record before it completes the canceled task.
+The canceled task therefore keeps a retryable lease when settlement acknowledgement fails.
 If the record is malformed or has no recoverable operation, the gateway expires the task as failed.
 
 Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
