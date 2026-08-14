@@ -16,6 +16,21 @@ export interface NonceStore {
   markSeen(nonce: string, ttlSeconds: number): Promise<void>
 }
 
+/**
+ * Return the seconds for which a signed nonce must remain stored.
+ *
+ * The signed expiry is the replay boundary. A fixed one-hour cap would allow
+ * a still-valid authorization to replay after the nonce entry expires.
+ */
+export function nonceTtlSeconds(
+  expiry: bigint,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): number | undefined {
+  const remaining = expiry - BigInt(nowSeconds)
+  if (remaining <= 0n || remaining > BigInt(Number.MAX_SAFE_INTEGER)) return undefined
+  return Math.max(Number(remaining), 60)
+}
+
 // ---------------------------------------------------------------------------
 // In-memory implementation — single-worker, ephemeral
 // ---------------------------------------------------------------------------

@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { MemoryNonceStore } from '../src/nonce-store'
+import { MemoryNonceStore, nonceTtlSeconds } from '../src/nonce-store'
+
+describe('nonceTtlSeconds', () => {
+  it('covers the complete signed validity window', () => {
+    expect(nonceTtlSeconds(101n, 100)).toBe(60)
+    expect(nonceTtlSeconds(7_300n, 100)).toBe(7_200)
+    expect(nonceTtlSeconds(100n, 100)).toBeUndefined()
+    expect(nonceTtlSeconds(BigInt(Number.MAX_SAFE_INTEGER) + 101n, 100)).toBeUndefined()
+  })
+})
 
 describe('MemoryNonceStore', () => {
   afterEach(() => vi.useRealTimers())

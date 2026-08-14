@@ -1,5 +1,5 @@
 import type { X402Config, MppConfig, ApiKeyInfo, GatewayConfig } from './types'
-import { claimStoredNonce, type NonceStore } from './nonce-store'
+import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
 
 /** Return the canonical opaque nonce key used by the final payment claim. */
 export function mppReplayNonceKey(authHeader: string): string | undefined {
@@ -101,9 +101,9 @@ export async function verifyX402(
     // Check and mark only after the signature is accepted. Otherwise an
     // invalid request can burn a valid payer nonce and deny the real request.
     if (nonceStore && markNonce) {
-      // Mark seen with TTL matching the expiry window (max 1 hour)
-      const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
-      const claimed = await claimStoredNonce(nonceStore, nonceKey, Math.max(ttl, 60))
+      const ttl = nonceTtlSeconds(expiry)
+      if (ttl === undefined) return null
+      const claimed = await claimStoredNonce(nonceStore, nonceKey, ttl)
       if (!claimed) return null
     }
 
@@ -199,10 +199,11 @@ export async function verifyMpp(
 
     if (nonceStore && payload.nonce !== undefined && markNonce) {
       const expiry = payload.expiry === undefined
-        ? Math.floor(Date.now() / 1000) + 3600
-        : Number(payload.expiry)
-      const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
-      const claimed = await claimStoredNonce(nonceStore, nonceKey!, Math.max(ttl, 60))
+        ? BigInt(Math.floor(Date.now() / 1000) + 3600)
+        : BigInt(String(payload.expiry))
+      const ttl = nonceTtlSeconds(expiry)
+      if (ttl === undefined) return null
+      const claimed = await claimStoredNonce(nonceStore, nonceKey!, ttl)
       if (!claimed) return null
     }
 

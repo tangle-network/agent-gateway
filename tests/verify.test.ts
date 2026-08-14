@@ -80,6 +80,39 @@ describe('verifyX402', () => {
     expect(second).toBeNull()
   })
 
+  it('rejects replay for the full signed lifetime beyond one hour', async () => {
+    const nonceStore = new MemoryNonceStore()
+    const payload = buildSpendAuth({
+      nonce: '102',
+      expiry: String(Math.floor(Date.now() / 1000) + 7_200),
+    })
+
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBe('0xCommitmentAlice')
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
+  })
+
+  it('retains a nonce until its signed expiry, beyond the old one-hour cap', async () => {
+    const ttls: number[] = []
+    const nonceStore: NonceStore = {
+      hasSeen: async () => false,
+      claim: async (_nonce, ttlSeconds) => {
+        ttls.push(ttlSeconds)
+        return true
+      },
+      markSeen: async () => undefined,
+    }
+    const now = Math.floor(Date.now() / 1000)
+    const result = await verifyX402(
+      buildSpendAuth({ nonce: '102', expiry: String(now + 7200) }),
+      baseConfig,
+      nonceStore,
+    )
+
+    expect(result).toBe('0xCommitmentAlice')
+    expect(ttls[0]).toBeGreaterThan(3600)
+    expect(ttls[0]).toBeLessThanOrEqual(7200)
+  })
+
   it('keeps version 1 custom nonce stores source-compatible', async () => {
     const seen = new Set<string>()
     const nonceStore: NonceStore = {
