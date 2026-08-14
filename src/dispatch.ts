@@ -13,7 +13,7 @@ import type { Context } from 'hono'
 import { filterConsumerMessagesStrict, redactSystemPromptFromOutput } from './filter'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { type RateLimitStore, checkRateLimit } from './rate-limit'
-import { claimStoredNonce, type NonceStore } from './nonce-store'
+import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
 import type { PaymentOperation } from './payment-operations'
 import type {
   AgentMeta,
@@ -608,6 +608,15 @@ export async function releasePayment(
   await config.x402.paymentOperations.releasePayment(authz.paymentOperation, reason)
 }
 
+/** Mark a durable reservation active immediately before sandbox execution. */
+export async function beginPaymentExecution(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  if (!authz.paymentOperation || authz.paymentOperationAcquired !== true || !config.x402.paymentOperations) return
+  authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
+}
+
 /**
  * Release only when no sandbox work was observed. Once output or a receipt
  * exists, retain the owner for settlement or background recovery.
@@ -619,6 +628,9 @@ export async function releasePaymentAfterFailure(
   workObserved: boolean,
 ): Promise<void> {
   if (workObserved) {
+    if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
+      authz.paymentOperation = await config.x402.paymentOperations.retainPayment(authz.paymentOperation, reason)
+    }
     console.error(
       `[agent-gateway] retaining payment ownership after sandbox work for ${authz.requestId}: ${reason}`,
     )
@@ -641,10 +653,12 @@ async function claimPaymentNonce(
   payload: Record<string, unknown>,
   ownerId?: string,
 ): Promise<boolean> {
-  const expiry = Number(payload.expiry ?? Math.floor(Date.now() / 1000) + 3600)
-  const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
-  if (!Number.isFinite(ttl) || ttl <= 0) return false
-  return claimStoredNonce(nonceStore, nonceKey, Math.max(ttl, 60), ownerId)
+  const expiry = payload.expiry === undefined
+    ? BigInt(Math.floor(Date.now() / 1000) + 3600)
+    : BigInt(String(payload.expiry))
+  const ttl = nonceTtlSeconds(expiry)
+  if (ttl === undefined) return false
+  return claimStoredNonce(nonceStore, nonceKey, ttl, ownerId)
 }
 
 /**
@@ -708,6 +722,7 @@ export async function* dispatchSandboxStreamRich(
   signal?: AbortSignal,
   sessionId?: string,
   maxOutputTokens?: number,
+  onExecutionStart?: () => Promise<void>,
 ): AsyncIterable<A2ADispatchEvent> {
   const box = await config.getSandbox(agent)
   const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
@@ -738,6 +753,9 @@ export async function* dispatchSandboxStreamRich(
         (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
         (config.executionBudget?.maxToolTokens ?? outputLimit)) * agent.pricePerTokenUsd,
   }
+  if (signal?.aborted) return
+  await onExecutionStart?.()
+  if (signal?.aborted) return
   const promptStream = box.streamPrompt(userMessage, {
     sessionId: sessionId ?? `consumer:${consumerId}`,
     systemPrompt: agent.systemPrompt,

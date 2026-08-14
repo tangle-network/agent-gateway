@@ -107,6 +107,28 @@ describe('version 2 payment operations', () => {
     expect(recoveredCalls).toBe(1)
   })
 
+  it('does not refund active or retained work after authorization expiry', async () => {
+    let now = 100
+    const operations = new MemoryPaymentOperations({ now: () => now })
+    const owner = await operations.claimPayment(payload('1000', '22', '200'), context())
+    const executing = await operations.beginPaymentExecution(owner)
+    expect(executing.state).toBe('executing')
+    now = 201
+
+    await expect(operations.reclaimPayment(owner.operationId)).rejects.toThrow('executing')
+    const retained = await operations.retainPayment(executing, 'usage receipt pending')
+    expect(retained.state).toBe('retained')
+    expect(retained.retentionReason).toBe('usage receipt pending')
+    await expect(operations.reclaimPayment(owner.operationId)).rejects.toThrow('retained')
+
+    const settled = await operations.settlePayment(retained, {
+      amount: 200n,
+      totalCostUsd: 0.2,
+      usage: settledUsage(),
+    })
+    expect(settled.state).toBe('settled')
+  })
+
   it('recovers a release after a worker crash between state and side effect', async () => {
     let fail = true
     const operations = new MemoryPaymentOperations({
@@ -461,7 +483,7 @@ describe('bounded request pricing and sandbox receipts', () => {
     expect(wire).toContain('sandbox exceeded max output tokens')
     expect(wire).not.toContain('0123456789abcdefghijklmnop')
     expect(releases).toBe(0)
-    expect(operations.get(`x402:${'0x' + 'ab'.repeat(32)}:15`)?.state).toBe('claimed')
+    expect(operations.get(`x402:${'0x' + 'ab'.repeat(32)}:15`)?.state).toBe('retained')
   })
 
   it('retains hidden usage when a final provider receipt omits it', async () => {

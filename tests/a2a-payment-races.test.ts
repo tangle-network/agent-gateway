@@ -243,7 +243,7 @@ describe('A2A payment ownership races', () => {
     expect(body.error).toBeUndefined()
     expect(body.result?.status?.state).toBe('canceled')
     expect((await taskStore.get('task-sync-cancel'))?.status.state).toBe('canceled')
-    expect(operations.get(`x402:${commitment}:75`)?.state).toBe('claimed')
+    expect(operations.get(`x402:${commitment}:75`)?.state).toBe('retained')
   })
 
   it('settles when cancellation wins the final task update', async () => {
@@ -476,7 +476,7 @@ describe('A2A payment ownership races', () => {
     expect(body.error).toBeUndefined()
     expect(body.result?.status?.state).toBe('canceled')
     expect(sandboxSignal?.aborted).toBe(true)
-    expect(operations.get(`x402:${commitment}:79`)?.state).toBe('claimed')
+    expect(operations.get(`x402:${commitment}:79`)?.state).toBe('retained')
   })
 
   it('retains ownership when cancellation follows delivered output without a receipt', async () => {
@@ -542,7 +542,7 @@ describe('A2A payment ownership races', () => {
       // Drain the stream so its recovery path runs.
     }
 
-    expect(operations.get(`x402:${commitment}:77`)?.state).toBe('claimed')
+    expect(operations.get(`x402:${commitment}:77`)?.state).toBe('retained')
     const canceled = await taskStore.get('task-cancel')
     expect(canceled?.status.state).toBe('canceled')
   })

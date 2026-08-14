@@ -41,7 +41,9 @@ Set `x402.demoMode: true` only for local development and tests; that explicit mo
 Keep `verifySigner` free of side effects.
 Use `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
 For production version 2, set `x402.paymentProtocolVersion: 2`, provide `paymentOperations`, and return its operation from `authorizePayment`.
-The operation store owns claim, partial settle, release, and expiry reclaim.
+The operation store owns claim, execution start, receipt retention, partial settle, release, and expiry reclaim.
+An executing or retained operation cannot expire into a refund.
+A retained operation can settle later when recovery obtains its usage receipt.
 Keep version 1 explicitly configured while old and new gateways coexist; shared nonce storage must reject a version 1 claim owned by a version 2 operation.
 Before it calls the verifier, the gateway requires the signed amount to cover filtered input plus the requested output limit.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.

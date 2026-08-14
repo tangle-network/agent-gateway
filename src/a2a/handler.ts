@@ -17,6 +17,7 @@ import {
   type AuthorizedRequest,
   type GatewayState,
   authenticateAndGuard,
+  beginPaymentExecution,
   claimPayment,
   dispatchSandboxStreamRich,
   releasePayment,
@@ -230,6 +231,10 @@ async function executeMessageSend(
       signal,
       task.id,
       authz.maxOutputTokens,
+      async () => {
+        await beginPaymentExecution(authz, deps.config)
+        if (authz.paymentOperation) workObserved = true
+      },
     )) {
       if (event.kind === 'text') {
         responseText += event.delta
@@ -403,6 +408,10 @@ async function handleMessageStream(
           controller.signal,
           task.id,
           authz.maxOutputTokens,
+          async () => {
+            await beginPaymentExecution(authz, deps.config)
+            if (authz.paymentOperation) workObserved = true
+          },
         )) {
           if (event.kind === 'text') {
             responseText += event.delta

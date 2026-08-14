@@ -422,13 +422,12 @@ describe('final payment boundary protocol guards', () => {
     })
     const requests = [request(), request()]
     await sandboxStarted
-    const loser = await Promise.race(requests)
-    expect(loser.status).toBe(402)
-    expect(operations.get(`x402:${commitment}:33`)?.state).toBe('claimed')
+    const responses = await Promise.all(requests)
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
+    expect(operations.get(`x402:${commitment}:33`)?.state).toBe('executing')
     expect(releases).toBe(0)
 
     finishRun()
-    const responses = await Promise.all(requests)
     await Promise.all(responses.map((response) => response.text()))
     expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
     expect(runs).toBe(1)

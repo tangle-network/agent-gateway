@@ -6,6 +6,7 @@ import {
   type AuthorizedRequest,
   type GatewayState,
   authenticateAndGuard,
+  beginPaymentExecution,
   claimPayment,
   dispatchSandboxStreamRich,
   releasePayment,
@@ -310,6 +311,10 @@ function streamChatCompletions(
           undefined,
           undefined,
           maxOutputTokens,
+          async () => {
+            await beginPaymentExecution(authz, config)
+            if (authz.paymentOperation) workObserved = true
+          },
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)

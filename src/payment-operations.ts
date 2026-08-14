@@ -6,6 +6,8 @@ export const PAYMENT_PROTOCOL_VERSION = 2 as const
 export type PaymentOperationState =
   | 'claiming'
   | 'claimed'
+  | 'executing'
+  | 'retained'
   | 'settling'
   | 'settled'
   | 'releasing'
@@ -19,6 +21,8 @@ export interface PaymentOperation {
   operationId: string
   /** Request that atomically created this operation. Idempotent reads retain the original value. */
   acquiredByRequestId: string
+  executionStartedAt?: number
+  retentionReason?: string
   nonceKey: string
   authorizationId: string
   reservedAmount: bigint
@@ -59,6 +63,10 @@ export interface PaymentOperations {
     payload: Record<string, unknown>,
     context: PaymentAuthorizationContext,
   ): Promise<PaymentOperation>
+  /** Prevent expiry reclaim while the sandbox can consume provider resources. */
+  beginPaymentExecution(operation: PaymentOperation): Promise<PaymentOperation>
+  /** Preserve funds after work when the final usage receipt is still missing. */
+  retainPayment(operation: PaymentOperation, reason: string): Promise<PaymentOperation>
   settlePayment(
     operation: PaymentOperation,
     input: PaymentSettlementInput,
@@ -163,7 +171,7 @@ export class MemoryPaymentOperations implements PaymentOperations {
           this.settleFlights.delete(current.operationId)
         }
       }
-    } else if (current.state !== 'claimed') {
+    } else if (current.state !== 'claimed' && current.state !== 'executing' && current.state !== 'retained') {
       throw new Error(`cannot settle payment in state ${current.state}`)
     }
     validateSettlement(current, input)
@@ -185,6 +193,38 @@ export class MemoryPaymentOperations implements PaymentOperations {
     }
   }
 
+  async beginPaymentExecution(operation: PaymentOperation): Promise<PaymentOperation> {
+    const current = this.requireCurrent(operation)
+    if (current.state === 'executing') return current
+    if (current.state !== 'claimed') {
+      throw new Error(`cannot begin payment execution in state ${current.state}`)
+    }
+    const executing = {
+      ...current,
+      state: 'executing' as const,
+      executionStartedAt: this.now(),
+    }
+    this.operations.set(current.operationId, executing)
+    return executing
+  }
+
+  async retainPayment(operation: PaymentOperation, reason: string): Promise<PaymentOperation> {
+    const current = this.requireCurrent(operation)
+    if (current.state === 'retained' || current.state === 'settling' || current.state === 'settled') {
+      return current
+    }
+    if (current.state !== 'claimed' && current.state !== 'executing') {
+      throw new Error(`cannot retain payment in state ${current.state}`)
+    }
+    const retained = {
+      ...current,
+      state: 'retained' as const,
+      retentionReason: reason,
+    }
+    this.operations.set(current.operationId, retained)
+    return retained
+  }
+
   async releasePayment(operation: PaymentOperation, reason: string): Promise<PaymentOperation> {
     const current = this.requireCurrent(operation)
     if (current.state === 'released') return current
@@ -193,7 +233,9 @@ export class MemoryPaymentOperations implements PaymentOperations {
       if (flight) return flight
       return this.reclaimPayment(current.operationId)
     }
-    if (current.state !== 'claimed') throw new Error(`cannot release payment in state ${current.state}`)
+    if (current.state !== 'claimed' && current.state !== 'executing') {
+      throw new Error(`cannot release payment in state ${current.state}`)
+    }
     const releasing = { ...current, state: 'releasing' as const }
     this.operations.set(current.operationId, releasing)
     return this.runRelease(releasing, reason)
@@ -203,6 +245,9 @@ export class MemoryPaymentOperations implements PaymentOperations {
     const current = this.operations.get(operationId)
     if (!current) throw new Error('payment operation was not found')
     if (current.state === 'reclaimed') return current
+    if (current.state === 'executing' || current.state === 'retained') {
+      throw new Error(`cannot reclaim payment in state ${current.state} without a usage receipt`)
+    }
     if (current.state === 'settling') {
       const flight = this.settleFlights.get(operationId)
       if (flight) return flight
