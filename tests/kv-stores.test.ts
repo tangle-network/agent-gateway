@@ -23,6 +23,12 @@ class StubKV implements NonceKV, RlKV {
     this.store.set(key, { value, expiresAt: this.now() + ttl * 1000 })
   }
 
+  async putIfAbsent(key: string, value: string, options?: { expirationTtl?: number }): Promise<boolean> {
+    if (await this.get(key) !== null) return false
+    await this.put(key, value, options)
+    return true
+  }
+
   async delete(key: string): Promise<void> {
     this.store.delete(key)
   }
@@ -78,6 +84,18 @@ describe('KvNonceStore', () => {
     await isolateA.markSeen('shared-nonce', 300)
     // Isolate B sees the same nonce as used — no cross-isolate bypass
     expect(await isolateB.hasSeen('shared-nonce')).toBe(true)
+  })
+
+  it('keeps same-owner claims idempotent when isolates race on the atomic insert', async () => {
+    const sharedKv = new StubKV()
+    const isolateA = new KvNonceStore(sharedKv)
+    const isolateB = new KvNonceStore(sharedKv)
+    const results = await Promise.all([
+      isolateA.claim('shared-operation', 300, 'operation-1'),
+      isolateB.claim('shared-operation', 300, 'operation-1'),
+    ])
+    expect(results).toEqual([true, true])
+    expect(await isolateA.claim('shared-operation', 300, 'operation-2')).toBe(false)
   })
 })
 

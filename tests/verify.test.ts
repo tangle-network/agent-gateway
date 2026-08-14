@@ -171,6 +171,25 @@ describe('verifyMpp', () => {
     expect(seen[0].credential).toContain('commitment')
   })
 
+  it('shares the x402 nonce authority with equivalent BlueprinTEVM credentials', async () => {
+    const nonceStore = new MemoryNonceStore()
+    const payload = {
+      commitment: '0xAlice',
+      signature: '0xSignatureBytes',
+      operator: operatorAddress,
+      amount: '20000',
+      nonce: '01',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+    }
+    expect(await verifyX402(JSON.stringify({ ...payload, nonce: '1' }), baseConfig, nonceStore)).toBe('0xAlice')
+    expect(await verifyMpp(
+      buildCredential({ ...payload, commitment: '0xALICE' }),
+      mppConfig,
+      baseConfig,
+      nonceStore,
+    )).toBeNull()
+  })
+
   it('rejects an underfunded blueprintevm credential before its verifier can reserve funds', async () => {
     let calls = 0
     const header = buildCredential({

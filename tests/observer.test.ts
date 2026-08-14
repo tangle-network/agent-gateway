@@ -111,8 +111,24 @@ describe('ConsoleObserver', () => {
 class StubSandbox implements SandboxBox {
   constructor(private chunks: string[]) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -140,7 +156,7 @@ function buildSpendAuth(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     commitment: '0xAlice',
     signature: '0xsig',
-    amount: '100000',
+    amount: '1000000',
     nonce: String(Math.floor(Math.random() * 1e9)),
     operator: operatorAddress,
     expiry: String(now + 600),

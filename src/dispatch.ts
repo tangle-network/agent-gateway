@@ -14,17 +14,21 @@ import { filterConsumerMessagesStrict, redactSystemPromptFromOutput } from './fi
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { type RateLimitStore, checkRateLimit } from './rate-limit'
 import type { NonceStore } from './nonce-store'
+import type { PaymentOperation } from './payment-operations'
 import type {
   AgentMeta,
   ApiKeyInfo,
   ChatMessage,
   GatewayConfig,
   PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
 } from './types'
 import {
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
+  mppReplayNonceKey,
   verifyMpp,
   verifyX402,
 } from './verify'
@@ -38,6 +42,10 @@ export interface GatewayState {
   maxLen: number
   maxOutputTokens: number
   defaultOutputTokens: number
+  maxReasoningTokens: number
+  maxToolTokens: number
+  maxToolCalls: number
+  maxProviderCostUsd?: number
   obs?: GatewayObserver
 }
 
@@ -52,6 +60,11 @@ export interface AuthorizedRequest {
   requestId: string
   startMs: number
   maxOutputTokens: number
+  executionBudget: SandboxExecutionBudget
+  requiredPaymentAmount: bigint
+  paymentPayload: Record<string, unknown> | null
+  paymentNonceKey?: string
+  paymentOperation?: PaymentOperation
 }
 
 function decimalFraction(value: number): { numerator: bigint; denominator: bigint } {
@@ -76,6 +89,9 @@ export function requiredX402Amount(
   inputTokens: number,
   maxOutputTokens: number,
   currencyDecimals = 6,
+  maxReasoningTokens = 0,
+  maxToolTokens = 0,
+  maxProviderCostUsd = 0,
 ): bigint {
   if (!Number.isSafeInteger(inputTokens) || inputTokens < 0) {
     throw new Error('input token estimate must be a non-negative safe integer')
@@ -86,9 +102,27 @@ export function requiredX402Amount(
   if (!Number.isInteger(currencyDecimals) || currencyDecimals < 0 || currencyDecimals > 18) {
     throw new Error('x402 currencyDecimals must be an integer between 0 and 18')
   }
+  for (const [name, value] of [
+    ['maxReasoningTokens', maxReasoningTokens],
+    ['maxToolTokens', maxToolTokens],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a non-negative safe integer`)
+  }
+  if (!Number.isFinite(maxProviderCostUsd) || maxProviderCostUsd < 0) {
+    throw new Error('maxProviderCostUsd must be finite and non-negative')
+  }
   const { numerator, denominator } = decimalFraction(pricePerTokenUsd)
-  const scaled = BigInt(inputTokens + maxOutputTokens) * numerator * 10n ** BigInt(currencyDecimals)
-  return (scaled + denominator - 1n) / denominator
+  const tokenCount = inputTokens + maxOutputTokens + maxReasoningTokens + maxToolTokens
+  if (!Number.isSafeInteger(tokenCount)) throw new Error('token budget exceeds safe integer range')
+  const tokenScaled = BigInt(tokenCount) *
+    numerator * 10n ** BigInt(currencyDecimals)
+  const tokenAmount = (tokenScaled + denominator - 1n) / denominator
+  const provider = maxProviderCostUsd === 0
+    ? { numerator: 0n, denominator: 1n }
+    : decimalFraction(maxProviderCostUsd)
+  const providerScaled = provider.numerator * 10n ** BigInt(currencyDecimals)
+  const providerAmount = (providerScaled + provider.denominator - 1n) / provider.denominator
+  return tokenAmount > providerAmount ? tokenAmount : providerAmount
 }
 
 /**
@@ -143,8 +177,8 @@ export async function authenticateAndGuard(
     )
   }
 
-  // Price the exact filtered input that reaches the sandbox. This must happen
-  // before x402 verification because a production verifier can reserve funds.
+  // Quote the maximum UTF-8 input plus every hidden provider cost before
+  // verification. The verifier must remain read-only at this point.
   const { messages: filtered, injectionWarnings } = filterConsumerMessagesStrict(
     messages,
     state.maxLen,
@@ -161,12 +195,29 @@ export async function authenticateAndGuard(
   }
 
   let requiredPaymentAmount: bigint
+  const maxInputTokens = maximumBillableInputTokens(agent, userMessage)
+  const maxReasoningTokens = state.maxReasoningTokens
+  const maxToolTokens = state.maxToolTokens
+  const maxToolCalls = state.maxToolCalls
+  const maxProviderCostUsd = state.maxProviderCostUsd ??
+    (maxInputTokens + maxOutputTokens + maxReasoningTokens + maxToolTokens) * agent.pricePerTokenUsd
+  const executionBudget: SandboxExecutionBudget = {
+    maxInputTokens,
+    maxOutputTokens,
+    maxReasoningTokens,
+    maxToolTokens,
+    maxToolCalls,
+    maxProviderCostUsd,
+  }
   try {
     requiredPaymentAmount = requiredX402Amount(
       agent.pricePerTokenUsd,
-      maximumBillableInputTokens(agent, userMessage),
+      maxInputTokens,
       maxOutputTokens,
       config.x402.currencyDecimals,
+      maxReasoningTokens,
+      maxToolTokens,
+      maxProviderCostUsd,
     )
   } catch {
     return c.json(
@@ -188,6 +239,7 @@ export async function authenticateAndGuard(
   let paymentMethod: PaymentMethod = 'none'
   let keyInfo: ApiKeyInfo | null = null
   let x402Payload: Record<string, unknown> | null = null
+  let paymentNonceKey: string | undefined
 
   if (spendAuthHeader) {
     const signer = await verifyX402(
@@ -220,6 +272,7 @@ export async function authenticateAndGuard(
       )
     }
     x402Payload = JSON.parse(spendAuthHeader) as Record<string, unknown>
+    paymentNonceKey = `${String(x402Payload.commitment).toLowerCase()}:${BigInt(String(x402Payload.nonce)).toString()}`
     consumerId = signer
     paymentMethod = 'x402'
   } else if (isMppAuthEnabled(config) && authHeader.toLowerCase().startsWith('payment ')) {
@@ -229,6 +282,7 @@ export async function authenticateAndGuard(
       config.x402,
       state.nonceStore,
       requiredPaymentAmount,
+      false,
     )
     if (!signer) {
       const realm = config.mpp!.realm
@@ -257,6 +311,7 @@ export async function authenticateAndGuard(
     }
     consumerId = signer
     paymentMethod = 'mpp'
+    paymentNonceKey = mppReplayNonceKey(authHeader)
   } else if (authHeader.startsWith('Bearer ')) {
     const verify = config.verifyApiKey ?? (config.x402.demoMode ? defaultVerifyApiKey : null)
     if (!verify || !isApiKeyAuthEnabled(config)) {
@@ -351,12 +406,6 @@ export async function authenticateAndGuard(
     )
   }
 
-  await state.obs?.onPaymentVerified?.(ctx, {
-    method: paymentMethod,
-    consumerId: consumerId,
-    keyId: keyInfo?.keyId,
-  })
-
   // Rate limit.
   const effectiveRateLimit = keyInfo?.rateLimitPerMinute
     ? { limit: keyInfo.rateLimitPerMinute, windowSeconds: 60 }
@@ -427,48 +476,6 @@ export async function authenticateAndGuard(
     }
   }
 
-  if (paymentMethod === 'x402' && x402Payload) {
-    try {
-      if (config.x402.authorizePayment) {
-        const authorized = await config.x402.authorizePayment(x402Payload, {
-          requestId,
-          agentId: agent.id,
-          requiredAmount: requiredPaymentAmount,
-          maxOutputTokens,
-        })
-        if (!authorized) throw new Error('payment authorization was rejected')
-      }
-
-      const nonce = BigInt(String(x402Payload.nonce))
-      const expiry = BigInt(String(x402Payload.expiry))
-      const nonceKey = `${String(x402Payload.commitment)}:${nonce.toString()}`
-      if (!config.x402.authorizePayment && await state.nonceStore.hasSeen(nonceKey)) {
-        throw new Error('payment nonce was already consumed')
-      }
-      const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
-      await state.nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
-    } catch {
-      await state.obs?.onAuthFailure?.(ctx, {
-        method: 'x402',
-        code: 'payment_authorization_failed',
-        httpStatus: 402,
-      })
-      return c.json(
-        {
-          error: {
-            message: 'Payment authorization failed',
-            type: 'payment_required',
-            code: 'payment_authorization_failed',
-          },
-        },
-        {
-          status: 402,
-          headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': requestId },
-        },
-      )
-    }
-  }
-
   return {
     agent,
     consumerId,
@@ -479,7 +486,150 @@ export async function authenticateAndGuard(
     requestId,
     startMs,
     maxOutputTokens,
+    executionBudget,
+    requiredPaymentAmount,
+    paymentPayload: x402Payload,
+    paymentNonceKey,
   }
+}
+
+/** Claim payment ownership after every request guard has accepted the call. */
+export async function claimPayment(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  state: GatewayState,
+): Promise<void> {
+  if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
+    const context = {
+      requestId: authz.requestId,
+      agentId: authz.agent.id,
+      requiredAmount: authz.requiredPaymentAmount,
+      maxOutputTokens: authz.maxOutputTokens,
+      executionBudget: authz.executionBudget,
+    }
+    let operation: PaymentOperation | undefined
+    if (config.x402.authorizePayment) {
+      const result = await config.x402.authorizePayment(authz.paymentPayload, context)
+      if (!result) throw new Error('payment authorization was rejected')
+      if (typeof result !== 'boolean') {
+        operation = result
+        // Retain the durable owner even if a later compatibility check fails.
+        // The caller can then release or reclaim the operation instead of
+        // losing its recovery handle.
+        authz.paymentOperation = operation
+      }
+      else if (config.x402.paymentProtocolVersion === 2) {
+        throw new Error('version 2 payment authorization did not return an operation')
+      } else if (authz.paymentNonceKey) {
+        const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+        if (!claimed) throw new Error('payment nonce was already consumed')
+      }
+    } else if (config.x402.paymentOperations) {
+      operation = await config.x402.paymentOperations.claimPayment(authz.paymentPayload, context)
+    } else if (authz.paymentNonceKey) {
+      const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+      if (!claimed) throw new Error('payment nonce was already consumed')
+    }
+    if (operation && operation.protocolVersion !== 2) {
+      throw new Error('payment operation protocol version mismatch')
+    }
+    if (operation && !config.x402.paymentOperations) {
+      throw new Error('durable payment operations are required to settle a claimed operation')
+    }
+    if (operation && authz.paymentNonceKey) {
+      const claimed = await claimNonce(
+        state.nonceStore,
+        authz.paymentNonceKey,
+        authz.paymentPayload,
+        operation.operationId,
+      )
+      if (!claimed) {
+        try {
+          await config.x402.paymentOperations!.releasePayment(operation, 'shared payment nonce was already owned')
+        } catch (releaseError) {
+          console.error(
+            `[agent-gateway] payment release failed for ${authz.requestId}:`,
+            releaseError instanceof Error ? releaseError.message : String(releaseError),
+          )
+        }
+        throw new Error('payment nonce was already consumed')
+      }
+    }
+    authz.paymentOperation = operation
+  } else if (authz.paymentMethod === 'mpp' && authz.paymentNonceKey) {
+    const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
+    if (!claimed) throw new Error('payment nonce was already consumed')
+  }
+
+  try {
+    await state.obs?.onPaymentVerified?.(
+      {
+        requestId: authz.requestId,
+        agentSlug: authz.agent.slug,
+        startMs: authz.startMs,
+      },
+      {
+        method: authz.paymentMethod,
+        consumerId: authz.consumerId,
+        keyId: authz.keyInfo?.keyId,
+      },
+    )
+  } catch (error) {
+    // Observability must not turn a durable claim into a stranded payment.
+    console.error(
+      '[agent-gateway] payment observer failed for ' + authz.requestId + ':',
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+}
+
+/** Release an owned operation when execution cannot produce a valid receipt. */
+export async function releasePayment(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  reason: string,
+): Promise<void> {
+  if (!authz.paymentOperation || !config.x402.paymentOperations) return
+  await config.x402.paymentOperations.releasePayment(authz.paymentOperation, reason)
+}
+
+/**
+ * Release only when no sandbox work was observed. Once output or a receipt
+ * exists, retain the owner for settlement or background recovery.
+ */
+export async function releasePaymentAfterFailure(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  reason: string,
+  workObserved: boolean,
+): Promise<void> {
+  if (workObserved) {
+    console.error(
+      `[agent-gateway] retaining payment ownership after sandbox work for ${authz.requestId}: ${reason}`,
+    )
+    return
+  }
+  await releasePayment(authz, config, reason)
+}
+
+export async function reclaimPayment(
+  operationId: string,
+  config: GatewayConfig,
+): Promise<PaymentOperation> {
+  if (!config.x402.paymentOperations) throw new Error('durable payment operations are not configured')
+  return config.x402.paymentOperations.reclaimPayment(operationId)
+}
+
+async function claimNonce(
+  nonceStore: NonceStore,
+  nonceKey: string,
+  payload: Record<string, unknown>,
+  ownerId?: string,
+): Promise<boolean> {
+  const expiry = Number(payload.expiry ?? Math.floor(Date.now() / 1000) + 3600)
+  const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
+  if (!Number.isFinite(ttl) || ttl <= 0) return false
+  return nonceStore.claim(nonceKey, Math.max(ttl, 60), ownerId)
 }
 
 /**
@@ -521,6 +671,8 @@ export async function* dispatchSandboxStream(
 export type A2ADispatchEvent =
   | { kind: 'text'; delta: string }
   | { kind: 'input-required'; prompt?: string }
+  | { kind: 'activity' }
+  | { kind: 'usage'; usage: SandboxUsageReceipt }
 
 /**
  * Like `dispatchSandboxStream` but yields a discriminated union so callers can
@@ -547,38 +699,96 @@ export async function* dispatchSandboxStreamRich(
   if (!Number.isSafeInteger(outputLimit) || outputLimit <= 0) {
     throw new Error('max output tokens must be a positive safe integer')
   }
-  let outputCharacters = 0
-  const maxOutputCharacters = outputLimit * 4
+  let outputBytes = 0
+  // Bound untrusted adapters while the final receipt is pending. The receipt
+  // remains authoritative for token count, so over-limit output is never sent.
+  const maxOutputBytes = outputLimit * 4
+  if (!Number.isSafeInteger(maxOutputBytes)) {
+    throw new Error('max output token bound exceeds safe integer range')
+  }
+  const encoder = new TextEncoder()
+  let usageParts: Partial<SandboxUsageReceipt> = {}
+  let observedReasoningTokens = 0
+  let observedToolTokens = 0
+  let observedToolCalls = 0
+  const bufferedTextParts: string[] = []
+  const executionBudget: SandboxExecutionBudget = {
+    maxInputTokens: maximumBillableInputTokens(agent, userMessage),
+    maxOutputTokens: outputLimit,
+    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
+    maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
+    maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
+    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ??
+      (maximumBillableInputTokens(agent, userMessage) + outputLimit +
+        (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
+        (config.executionBudget?.maxToolTokens ?? outputLimit)) * agent.pricePerTokenUsd,
+  }
   const promptStream = box.streamPrompt(userMessage, {
     sessionId: sessionId ?? `consumer:${consumerId}`,
     systemPrompt: agent.systemPrompt,
     maxOutputTokens: outputLimit,
+    executionBudget,
   })
   for await (const event of promptStream) {
     if (signal?.aborted) return
+    if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
+    if (event.data?.reasoning?.tokens !== undefined) {
+      observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
+      yield { kind: 'activity' }
+    }
+    if (event.data?.tool) {
+      observedToolCalls += 1
+      observedToolTokens +=
+        nonNegativeSafeInteger(event.data.tool.inputTokens ?? 0, 'tool input tokens') +
+        nonNegativeSafeInteger(event.data.tool.outputTokens ?? 0, 'tool output tokens')
+      yield { kind: 'activity' }
+    }
+    enforceUsageBudget(withObservedUsage(
+      usageParts,
+      observedReasoningTokens,
+      observedToolTokens,
+      observedToolCalls,
+    ), executionBudget)
     if (
       event.type === 'message.part.updated' &&
       event.data?.part?.type === 'text' &&
       event.data.delta
     ) {
-      const remainingCharacters = maxOutputCharacters - outputCharacters
-      if (remainingCharacters <= 0) return
-      const boundedDelta = event.data.delta.slice(0, remainingCharacters)
-      outputCharacters += boundedDelta.length
-      yield {
-        kind: 'text',
-        delta: redactSystemPromptFromOutput(boundedDelta, agent.systemPrompt),
+      const remainingBytes = maxOutputBytes - outputBytes
+      if (remainingBytes <= 0) throw new Error('sandbox exceeded max output tokens')
+      const bounded = truncateUtf8(event.data.delta, remainingBytes, encoder)
+      const boundedDelta = bounded.text
+      outputBytes += bounded.bytes
+      bufferedTextParts.push(boundedDelta)
+      yield { kind: 'activity' }
+      if (bounded.truncated) {
+        throw new Error('sandbox exceeded max output tokens')
       }
-      if (boundedDelta.length < event.data.delta.length) return
       continue
     }
     if (event.type === 'input-required' || event.data?.inputRequired) {
+      const usage = finalizeUsage(
+        withObservedUsage(usageParts, observedReasoningTokens, observedToolTokens, observedToolCalls),
+        executionBudget,
+      )
+      for (const bufferedText of bufferedTextParts) {
+        yield { kind: 'text', delta: redactSystemPromptFromOutput(bufferedText, agent.systemPrompt) }
+      }
       yield { kind: 'input-required', prompt: event.data?.inputRequired?.prompt }
       // Terminal for the sandbox stream — sandbox SHOULD stop emitting until
       // the gateway dispatches a continuation message with the new user input.
+      yield { kind: 'usage', usage }
       return
     }
   }
+  const usage = finalizeUsage(
+    withObservedUsage(usageParts, observedReasoningTokens, observedToolTokens, observedToolCalls),
+    executionBudget,
+  )
+  for (const bufferedText of bufferedTextParts) {
+    yield { kind: 'text', delta: redactSystemPromptFromOutput(bufferedText, agent.systemPrompt) }
+  }
+  yield { kind: 'usage', usage }
 }
 
 /**
@@ -589,12 +799,14 @@ export async function* dispatchSandboxStreamRich(
 export async function settleAndRecord(
   agent: AgentMeta,
   authz: AuthorizedRequest,
-  inputTokens: number,
-  outputTokens: number,
+  usage: SandboxUsageReceipt,
   config: GatewayConfig,
   obs: GatewayObserver | undefined,
 ): Promise<void> {
-  const totalCost = (inputTokens + outputTokens) * agent.pricePerTokenUsd
+  const tokenCost = (
+    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens
+  ) * agent.pricePerTokenUsd
+  const totalCost = Math.max(tokenCost, usage.providerCostUsd)
   const ownerEarned = totalCost * (1 - agent.platformFeePercent)
   const platformFee = totalCost * agent.platformFeePercent
   const usageEvent = {
@@ -603,23 +815,39 @@ export async function settleAndRecord(
     agentSlug: agent.slug,
     consumerId: authz.consumerId,
     paymentMethod: authz.paymentMethod,
-    inputTokens,
-    outputTokens,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningTokens: usage.reasoningTokens,
+    toolTokens: usage.toolTokens,
+    toolCallCount: usage.toolCallCount,
+    providerCostUsd: usage.providerCostUsd,
     totalCostUsd: totalCost,
     ownerEarnedUsd: ownerEarned,
     platformFeeUsd: platformFee,
     durationMs: Date.now() - authz.startMs,
   }
-  await config.recordUsage(usageEvent)
   const ctx: RequestContext = {
     requestId: authz.requestId,
     agentSlug: agent.slug,
     startMs: authz.startMs,
   }
-  await obs?.onRequestComplete?.(ctx, usageEvent)
-  if (config.settlePayment) {
-    await config
-      .settlePayment(
+  try {
+    if (authz.paymentOperation && config.x402.paymentOperations) {
+      const amount = actualX402Amount(
+        agent.pricePerTokenUsd,
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.reasoningTokens,
+        usage.toolTokens,
+        config.x402.currencyDecimals,
+        usage.providerCostUsd,
+      )
+      authz.paymentOperation = await config.x402.paymentOperations.settlePayment(
+        authz.paymentOperation,
+        { amount, totalCostUsd: totalCost, usage },
+      )
+    } else if (config.settlePayment) {
+      await config.settlePayment(
         {
           method: authz.paymentMethod,
           consumerId: authz.consumerId,
@@ -627,16 +855,161 @@ export async function settleAndRecord(
         },
         totalCost,
       )
-      .catch(async (err) => {
-        const msg = err instanceof Error ? err.message : String(err)
-        console.error(`[agent-gateway] settlement failed for ${authz.consumerId}: ${msg}`)
-        await obs?.onSettlementError?.(ctx, {
-          consumerId: authz.consumerId,
-          method: authz.paymentMethod,
-          errorMessage: msg,
-        })
-      })
+    }
+    await config.recordUsage(usageEvent)
+    await obs?.onRequestComplete?.(ctx, usageEvent)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[agent-gateway] settlement failed for ${authz.consumerId}: ${msg}`)
+    await obs?.onSettlementError?.(ctx, {
+      consumerId: authz.consumerId,
+      method: authz.paymentMethod,
+      errorMessage: msg,
+    })
+    throw err
   }
+}
+
+function mergeUsage(
+  current: Partial<SandboxUsageReceipt>,
+  update: Partial<SandboxUsageReceipt>,
+): Partial<SandboxUsageReceipt> {
+  const merged = { ...current, ...update }
+  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd'] as const) {
+    const value = update[key]
+    if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+      throw new Error(`sandbox usage field ${key} is invalid`)
+    }
+    if (value !== undefined && current[key] !== undefined) {
+      // Usage events are cumulative receipts. Never let a later partial or
+      // final event erase spend observed earlier in the same execution.
+      merged[key] = Math.max(current[key]!, value)
+    }
+  }
+  if (current.budgetEnforced === false || update.budgetEnforced === false) {
+    merged.budgetEnforced = false
+  }
+  return merged
+}
+
+function withObservedUsage(
+  usage: Partial<SandboxUsageReceipt>,
+  reasoningTokens: number,
+  toolTokens: number,
+  toolCallCount: number,
+): Partial<SandboxUsageReceipt> {
+  return {
+    ...usage,
+    ...(usage.reasoningTokens !== undefined || reasoningTokens > 0
+      ? { reasoningTokens: Math.max(usage.reasoningTokens ?? 0, reasoningTokens) }
+      : {}),
+    ...(usage.toolTokens !== undefined || toolTokens > 0
+      ? { toolTokens: Math.max(usage.toolTokens ?? 0, toolTokens) }
+      : {}),
+    ...(usage.toolCallCount !== undefined || toolCallCount > 0
+      ? { toolCallCount: Math.max(usage.toolCallCount ?? 0, toolCallCount) }
+      : {}),
+  }
+}
+
+function nonNegativeSafeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`sandbox ${name} is invalid`)
+  }
+  return value
+}
+
+function enforceUsageBudget(
+  usage: Partial<SandboxUsageReceipt>,
+  budget: SandboxExecutionBudget,
+): void {
+  if (usage.inputTokens !== undefined && usage.inputTokens > budget.maxInputTokens) {
+    throw new Error('sandbox exceeded max input tokens')
+  }
+  if (usage.outputTokens !== undefined && usage.outputTokens > budget.maxOutputTokens) {
+    throw new Error('sandbox exceeded max output tokens')
+  }
+  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > budget.maxReasoningTokens) {
+    throw new Error('sandbox exceeded max reasoning tokens')
+  }
+  if (usage.toolTokens !== undefined && usage.toolTokens > budget.maxToolTokens) {
+    throw new Error('sandbox exceeded max tool tokens')
+  }
+  if (usage.toolCallCount !== undefined && usage.toolCallCount > budget.maxToolCalls) {
+    throw new Error('sandbox exceeded max tool calls')
+  }
+  if (usage.providerCostUsd !== undefined && usage.providerCostUsd > budget.maxProviderCostUsd) {
+    throw new Error('sandbox exceeded max provider cost')
+  }
+}
+
+function finalizeUsage(
+  parts: Partial<SandboxUsageReceipt>,
+  budget: SandboxExecutionBudget,
+): SandboxUsageReceipt {
+  const fields = ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd', 'budgetEnforced'] as const
+  if (fields.some((field) => parts[field] === undefined)) {
+    throw new Error('sandbox did not provide a complete usage receipt')
+  }
+  const usage = parts as SandboxUsageReceipt
+  for (const field of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const) {
+    if (!Number.isSafeInteger(usage[field]) || usage[field] < 0) {
+      throw new Error(`sandbox usage field ${field} is invalid`)
+    }
+  }
+  if (!Number.isFinite(usage.providerCostUsd) || usage.providerCostUsd < 0) {
+    throw new Error('sandbox usage provider cost is invalid')
+  }
+  if (typeof usage.budgetEnforced !== 'boolean') {
+    throw new Error('sandbox usage budget flag is invalid')
+  }
+  if (!Number.isSafeInteger(
+    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens,
+  )) {
+    throw new Error('sandbox usage token total exceeds safe integer range')
+  }
+  enforceUsageBudget(usage, budget)
+  if (!usage.budgetEnforced) throw new Error('sandbox did not enforce the execution budget')
+  return usage
+}
+
+function actualX402Amount(
+  pricePerTokenUsd: number,
+  inputTokens: number,
+  outputTokens: number,
+  reasoningTokens: number,
+  toolTokens: number,
+  currencyDecimals = 6,
+  providerCostUsd = 0,
+): bigint {
+  const { numerator, denominator } = decimalFraction(pricePerTokenUsd)
+  const scaled = BigInt(inputTokens + outputTokens + reasoningTokens + toolTokens) *
+    numerator * 10n ** BigInt(currencyDecimals)
+  const tokenAmount = (scaled + denominator - 1n) / denominator
+  const provider = providerCostUsd === 0
+    ? { numerator: 0n, denominator: 1n }
+    : decimalFraction(providerCostUsd)
+  const providerScaled = provider.numerator * 10n ** BigInt(currencyDecimals)
+  const providerAmount = (providerScaled + provider.denominator - 1n) / provider.denominator
+  return tokenAmount > providerAmount ? tokenAmount : providerAmount
+}
+
+function truncateUtf8(
+  value: string,
+  maxBytes: number,
+  encoder: TextEncoder,
+): { text: string; bytes: number; truncated: boolean } {
+  const bytes = encoder.encode(value).byteLength
+  if (bytes <= maxBytes) return { text: value, bytes, truncated: false }
+  let text = ''
+  let used = 0
+  for (const character of value) {
+    const characterBytes = encoder.encode(character).byteLength
+    if (used + characterBytes > maxBytes) break
+    text += character
+    used += characterBytes
+  }
+  return { text, bytes: used, truncated: true }
 }
 
 /** Token estimate matching the existing chat-completions handler (4 chars ≈ 1 token). */

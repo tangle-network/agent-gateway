@@ -6,9 +6,10 @@ import {
   type AuthorizedRequest,
   type GatewayState,
   authenticateAndGuard,
-  dispatchSandboxStream,
-  estimateBillableInputTokens,
-  estimateTokens,
+  claimPayment,
+  dispatchSandboxStreamRich,
+  releasePayment,
+  releasePaymentAfterFailure,
   settleAndRecord,
 } from './dispatch'
 import { MemoryNonceStore } from './nonce-store'
@@ -38,11 +39,11 @@ export function createAgentGateway(config: GatewayConfig) {
   }
   const maxOutputTokens = config.maxOutputTokens ?? 4096
   const defaultOutputTokens = config.defaultOutputTokens ?? 1024
-  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
     throw new Error('createAgentGateway: maxOutputTokens must be a positive integer')
   }
   if (
-    !Number.isInteger(defaultOutputTokens) ||
+    !Number.isSafeInteger(defaultOutputTokens) ||
     defaultOutputTokens <= 0 ||
     defaultOutputTokens > maxOutputTokens
   ) {
@@ -58,6 +59,32 @@ export function createAgentGateway(config: GatewayConfig) {
   ) {
     throw new Error('createAgentGateway: x402.currencyDecimals must be an integer between 0 and 18')
   }
+  const executionBudget = config.executionBudget
+  for (const [name, value] of [
+    ['maxReasoningTokens', executionBudget?.maxReasoningTokens ?? maxOutputTokens],
+    ['maxToolTokens', executionBudget?.maxToolTokens ?? maxOutputTokens],
+    ['maxToolCalls', executionBudget?.maxToolCalls ?? 8],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`createAgentGateway: executionBudget.${name} must be a non-negative safe integer`)
+    }
+  }
+  if (
+    executionBudget?.maxProviderCostUsd !== undefined &&
+    (!Number.isFinite(executionBudget.maxProviderCostUsd) || executionBudget.maxProviderCostUsd < 0)
+  ) {
+    throw new Error('createAgentGateway: executionBudget.maxProviderCostUsd must be finite and non-negative')
+  }
+  if (config.x402.paymentOperations && config.x402.paymentProtocolVersion === undefined) {
+    throw new Error('createAgentGateway: paymentProtocolVersion must be explicit when durable payment operations are configured')
+  }
+  if (config.x402.paymentProtocolVersion === 2 &&
+      (!config.x402.paymentOperations || config.x402.paymentOperations.protocolVersion !== 2)) {
+    throw new Error('createAgentGateway: payment protocol version 2 requires durable payment operations')
+  }
+  if (config.x402.paymentProtocolVersion === 1 && config.x402.paymentOperations) {
+    throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
+  }
   const gw = new Hono()
   const rateLimitStore: RateLimitStore = config.rateLimitStore ?? new MemoryRateLimitStore()
   const state: GatewayState = {
@@ -68,6 +95,10 @@ export function createAgentGateway(config: GatewayConfig) {
     maxLen: config.maxMessageLength ?? 8000,
     maxOutputTokens,
     defaultOutputTokens,
+    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? maxOutputTokens,
+    maxToolTokens: config.executionBudget?.maxToolTokens ?? maxOutputTokens,
+    maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
+    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd,
     obs: config.observer,
   }
   const obs: GatewayObserver | undefined = state.obs
@@ -160,6 +191,36 @@ export function createAgentGateway(config: GatewayConfig) {
     )
     if (guard instanceof Response) return guard
     const authz = guard
+    try {
+      await claimPayment(authz, config, state)
+    } catch {
+      try {
+        await releasePayment(authz, config, 'payment authorization failed')
+      } catch (releaseError) {
+        console.error(
+          `[agent-gateway] payment release failed for ${authz.requestId}:`,
+          releaseError instanceof Error ? releaseError.message : String(releaseError),
+        )
+      }
+      await obs?.onAuthFailure?.(
+        {
+          requestId: authz.requestId,
+          agentSlug: authz.agent.slug,
+          startMs: authz.startMs,
+        },
+        { method: authz.paymentMethod, code: 'payment_authorization_failed', httpStatus: 402 },
+      )
+      return c.json(
+        {
+          error: {
+            message: 'Payment authorization failed',
+            type: 'payment_required',
+            code: 'payment_authorization_failed',
+          },
+        },
+        { status: 402, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': authz.requestId } },
+      )
+    }
 
     return streamChatCompletions(c, authz, config, obs)
   })
@@ -177,6 +238,10 @@ export function createAgentGateway(config: GatewayConfig) {
 
   return gw
 }
+
+// Consumers that bind the gateway through a package boundary can fail closed
+// when an old binary ignores the version 2 operation contract.
+Object.assign(createAgentGateway, { paymentProtocolVersion: 2 as const })
 
 /**
  * Drain the sandbox stream into an OpenAI-shaped SSE response, settle the
@@ -199,8 +264,9 @@ function streamChatCompletions(
     rateLimitRemaining,
     maxOutputTokens,
   } = authz
-  const inputTokens = estimateBillableInputTokens(agent, userMessage)
   let outputText = ''
+  let usage: import('./types').SandboxUsageReceipt | undefined
+  let workObserved = false
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -223,7 +289,7 @@ function streamChatCompletions(
       }
 
       try {
-        for await (const delta of dispatchSandboxStream(
+        for await (const event of dispatchSandboxStreamRich(
           agent,
           userMessage,
           consumerId,
@@ -232,8 +298,15 @@ function streamChatCompletions(
           undefined,
           maxOutputTokens,
         )) {
-          sendChunk(delta)
+          if (event.kind === 'text') {
+            sendChunk(event.delta)
+            workObserved = true
+          }
+          if (event.kind === 'activity') workObserved = true
+          if (event.kind === 'usage') usage = event.usage
         }
+
+        if (!usage) throw new Error('sandbox did not provide a usage receipt')
 
         const done: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
@@ -248,8 +321,7 @@ function streamChatCompletions(
         await settleAndRecord(
           agent,
           authz,
-          inputTokens,
-          estimateTokens(outputText),
+          usage,
           config,
           obs,
         )
@@ -260,7 +332,22 @@ function streamChatCompletions(
           rawMessage.includes('/') || rawMessage.includes('\\')
             ? 'Internal agent error'
             : rawMessage
-        await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
+        try {
+          await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
+        } catch (observerError) {
+          console.error(
+            `[agent-gateway] stream observer failed for ${requestId}:`,
+            observerError instanceof Error ? observerError.message : String(observerError),
+          )
+        }
+        try {
+          await releasePaymentAfterFailure(authz, config, rawMessage, workObserved || usage !== undefined)
+        } catch (releaseError) {
+          console.error(
+            `[agent-gateway] payment release failed for ${authz.requestId}:`,
+            releaseError instanceof Error ? releaseError.message : String(releaseError),
+          )
+        }
         controller.enqueue(
           encoder.encode(
             `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,

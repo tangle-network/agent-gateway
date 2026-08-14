@@ -53,8 +53,24 @@ class InputRequiringSandbox implements SandboxBox {
     const seq = this.sequences[this.callIdx]
     this.callIdx += 1
     if (!seq) throw new Error(`InputRequiringSandbox: out of canned sequences at call ${this.callIdx}`)
+    let output = ''
     for (const delta of seq.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
     if (seq.pause) {
       yield { type: 'input-required', data: { inputRequired: { prompt: seq.pause.prompt } } }
@@ -65,8 +81,24 @@ class InputRequiringSandbox implements SandboxBox {
 class StubSandbox implements SandboxBox {
   constructor(private chunks: string[]) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }

@@ -10,6 +10,10 @@ import type { Task } from './types'
 export interface TaskStore {
   get(id: string): Promise<Task | undefined>
   put(task: Task): Promise<void>
+  /** Insert only when the task id is absent. Required for explicit A2A ids. */
+  createIfAbsent?(task: Task): Promise<boolean>
+  /** Replace only when the stored task still equals `expected`. */
+  compareAndSet?(expected: Task, next: Task): Promise<boolean>
   delete(id: string): Promise<void>
 }
 
@@ -30,6 +34,21 @@ export class InMemoryTaskStore implements TaskStore {
   async put(task: Task): Promise<void> {
     this.gc()
     this.entries.set(task.id, { task: clone(task), expiresAt: Date.now() + this.ttlMs })
+  }
+
+  async createIfAbsent(task: Task): Promise<boolean> {
+    this.gc()
+    if (this.entries.has(task.id)) return false
+    this.entries.set(task.id, { task: clone(task), expiresAt: Date.now() + this.ttlMs })
+    return true
+  }
+
+  async compareAndSet(expected: Task, next: Task): Promise<boolean> {
+    this.gc()
+    const entry = this.entries.get(expected.id)
+    if (!entry || JSON.stringify(entry.task) !== JSON.stringify(expected)) return false
+    this.entries.set(expected.id, { task: clone(next), expiresAt: Date.now() + this.ttlMs })
+    return true
   }
 
   async delete(id: string): Promise<void> {

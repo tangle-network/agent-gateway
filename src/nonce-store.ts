@@ -6,6 +6,11 @@
 export interface NonceStore {
   /** Check if nonce has been seen. Returns true if already used (reject). */
   hasSeen(nonce: string): Promise<boolean>
+  /**
+   * Atomically claim a nonce. An owner id makes a retry by the same payment
+   * operation idempotent while a legacy claim still fails closed.
+   */
+  claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
   /** Mark nonce as used. TTL = how long to remember it (seconds). */
   markSeen(nonce: string, ttlSeconds: number): Promise<void>
 }
@@ -16,22 +21,33 @@ export interface NonceStore {
 
 /** In-memory nonce store with automatic eviction. Use in tests or single-worker deploys. */
 export class MemoryNonceStore implements NonceStore {
-  private seen = new Map<string, number>() // nonce → expiresAt
+  private seen = new Map<string, { expiresAt: number; ownerId?: string }>()
   private lastEviction = Date.now()
 
   async hasSeen(nonce: string): Promise<boolean> {
     this.evictExpired()
-    const expiresAt = this.seen.get(nonce)
-    if (!expiresAt) return false
-    if (expiresAt < Date.now()) {
+    const entry = this.seen.get(nonce)
+    if (!entry) return false
+    if (entry.expiresAt < Date.now()) {
       this.seen.delete(nonce)
       return false
     }
     return true
   }
 
+  async claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean> {
+    this.evictExpired()
+    const now = Date.now()
+    const entry = this.seen.get(nonce)
+    if (entry !== undefined && entry.expiresAt >= now) {
+      return ownerId !== undefined && entry.ownerId === ownerId
+    }
+    this.seen.set(nonce, { expiresAt: now + ttlSeconds * 1000, ownerId })
+    return true
+  }
+
   async markSeen(nonce: string, ttlSeconds: number): Promise<void> {
-    this.seen.set(nonce, Date.now() + ttlSeconds * 1000)
+    this.seen.set(nonce, { expiresAt: Date.now() + ttlSeconds * 1000 })
     this.evictExpired()
   }
 
@@ -40,8 +56,8 @@ export class MemoryNonceStore implements NonceStore {
     // Evict at most every 60 seconds to avoid O(n) on every request
     if (now - this.lastEviction < 60_000) return
     this.lastEviction = now
-    for (const [nonce, expiresAt] of this.seen) {
-      if (expiresAt < now) this.seen.delete(nonce)
+    for (const [nonce, entry] of this.seen) {
+      if (entry.expiresAt < now) this.seen.delete(nonce)
     }
   }
 }
@@ -58,6 +74,8 @@ export class MemoryNonceStore implements NonceStore {
 export interface KVNamespace {
   get(key: string, options?: { type?: 'text' | 'json' }): Promise<string | null>
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>
+  /** Required for version 2 gateway claims. A plain KV put is not atomic. */
+  putIfAbsent?(key: string, value: string, options?: { expirationTtl?: number }): Promise<boolean>
   delete(key: string): Promise<void>
 }
 
@@ -67,12 +85,8 @@ export interface KVNamespace {
  * Why this exists: MemoryNonceStore works on a single worker instance, but
  * Cloudflare routes requests across multiple isolates. Without shared state,
  * an attacker could retry a replayed nonce against a different isolate and
- * have it accepted. This implementation uses Workers KV with native TTL so
- * the nonce automatically expires at payment-expiry time.
- *
- * TTL precision: KV is eventually consistent (propagation ~60s). For x402
- * with 10-minute expiry windows this is fine — by the time KV propagates,
- * the payment itself would be expired anyway.
+ * have it accepted. Version 2 requires an atomic binding for payment claims.
+ * This store keeps the nonce only for legacy replay protection.
  *
  * Usage:
  *   const nonceStore = new KvNonceStore(env.NONCE_KV, 'x402')
@@ -88,6 +102,22 @@ export class KvNonceStore implements NonceStore {
   async hasSeen(nonce: string): Promise<boolean> {
     const value = await this.kv.get(this.key(nonce))
     return value !== null
+  }
+
+  async claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean> {
+    if (!this.kv.putIfAbsent) {
+      throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
+    }
+    const ttl = Math.max(ttlSeconds, 60)
+    const key = this.key(nonce)
+    const value = ownerId ?? '1'
+    const existing = await this.kv.get(key)
+    if (existing !== null) return ownerId !== undefined && existing === ownerId
+    const inserted = await this.kv.putIfAbsent(key, value, { expirationTtl: ttl })
+    if (inserted || ownerId === undefined) return inserted
+    // Another isolate may have won between get and putIfAbsent. Re-read so a
+    // retry by the same durable operation remains idempotent.
+    return (await this.kv.get(key)) === ownerId
   }
 
   async markSeen(nonce: string, ttlSeconds: number): Promise<void> {

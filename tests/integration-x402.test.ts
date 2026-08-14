@@ -48,7 +48,7 @@ const CHAIN_ID = 3799
 const OPERATOR_PRIVATE_KEY = generatePrivateKey()
 const OPERATOR_ADDRESS = privateKeyToAccount(OPERATOR_PRIVATE_KEY).address
 const CREDITS_ADDRESS: Hex = '0x00000000000000000000000000000000DeaDBeef'
-const FUNDED_REQUEST_AMOUNT = 100_000n
+const FUNDED_REQUEST_AMOUNT = 1_000_000n
 
 const domain = {
   name: 'ShieldedCredits',
@@ -145,8 +145,24 @@ async function verifySignerOnChain(payload: Record<string, unknown>): Promise<bo
 class ReplySandbox implements SandboxBox {
   constructor(private chunks: string[]) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00005,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }

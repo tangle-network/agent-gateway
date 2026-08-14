@@ -1,6 +1,36 @@
 import type { X402Config, MppConfig, ApiKeyInfo, GatewayConfig } from './types'
 import type { NonceStore } from './nonce-store'
 
+/** Return the canonical opaque nonce key used by the final payment claim. */
+export function mppReplayNonceKey(authHeader: string): string | undefined {
+  const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
+  if (!match) return undefined
+  const [, method, credentialB64] = match
+  try {
+    const decoded = Buffer.from(credentialB64, 'base64url').toString('utf-8')
+    const credential = JSON.parse(decoded) as Record<string, unknown>
+    const nested = credential.payload
+    const payload = nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? nested as Record<string, unknown>
+      : credential
+    return canonicalMppNonceKey(method, payload)
+  } catch {
+    return undefined
+  }
+}
+
+function canonicalMppNonceKey(method: string, payload: Record<string, unknown>): string | undefined {
+  if (payload.nonce === undefined) return undefined
+  const nonce = BigInt(String(payload.nonce)).toString()
+  const commitment = payload.commitment
+  // BlueprinTEVM carries the same SpendAuth identity as x402. Keep one
+  // namespace so a credential cannot cross the two HTTP transports.
+  if (method.toLowerCase() === 'blueprintevm' && typeof commitment === 'string' && commitment.length > 0) {
+    return `${commitment.toLowerCase()}:${nonce}`
+  }
+  return `mpp:${method.toLowerCase()}:${String(payload.commitment ?? payload.from ?? 'unknown').toLowerCase()}:${nonce}`
+}
+
 /** Pure capability checks shared by discovery and every request protocol. */
 export function isApiKeyAuthEnabled(
   config: Pick<GatewayConfig, 'verifyApiKey' | 'x402'>,
@@ -56,11 +86,13 @@ export async function verifyX402(
     // settle funds as part of its production verification path.
     if (amount < minimumAmount || minimumAmount <= 0n) return null
 
-    const nonceKey = `${raw.commitment}:${nonce.toString()}`
+    const nonceKey = `${String(raw.commitment).toLowerCase()}:${nonce.toString()}`
     if (nonceStore && await nonceStore.hasSeen(nonceKey)) return null
 
     if (config.verifySigner) {
-      const verified = await config.verifySigner(raw)
+      const verified = await config.verifySigner(raw, {
+        protocolVersion: config.paymentProtocolVersion ?? (config.paymentOperations ? 2 : 1),
+      })
       if (!verified) return null
     } else if (!config.demoMode) {
       return null
@@ -71,7 +103,8 @@ export async function verifyX402(
     if (nonceStore && markNonce) {
       // Mark seen with TTL matching the expiry window (max 1 hour)
       const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
-      await nonceStore.markSeen(nonceKey, Math.max(ttl, 60))
+      const claimed = await nonceStore.claim(nonceKey, Math.max(ttl, 60))
+      if (!claimed) return null
     }
 
     return raw.commitment
@@ -97,6 +130,7 @@ export async function verifyMpp(
   x402Config: X402Config,
   nonceStore?: NonceStore,
   minimumAmount = 1n,
+  markNonce = true,
 ): Promise<string | null> {
   // MPP format: "Payment <method> <base64url-credential>"
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
@@ -143,17 +177,16 @@ export async function verifyMpp(
       return null
     }
 
-    const nonceKey =
-      nonceStore && payload.nonce !== undefined
-        ? `mpp:${method}:${String(payload.commitment ?? payload.from ?? 'unknown')}:${String(payload.nonce)}`
-        : null
+    const nonceKey = nonceStore ? canonicalMppNonceKey(method, payload) ?? null : null
     if (nonceKey && await nonceStore!.hasSeen(nonceKey)) return null
 
     let consumerId: string | null = null
     if (config.verifySigner) {
       consumerId = await config.verifySigner(payload, { method, credential: decoded })
     } else if (method === 'blueprintevm' && x402Config.verifySigner && payload.commitment) {
-      const verified = await x402Config.verifySigner(payload)
+      const verified = await x402Config.verifySigner(payload, {
+        protocolVersion: x402Config.paymentProtocolVersion ?? (x402Config.paymentOperations ? 2 : 1),
+      })
       consumerId = verified ? String(payload.commitment) : null
     } else if (x402Config.demoMode) {
       const identity = payload.commitment ?? payload.from
@@ -164,12 +197,13 @@ export async function verifyMpp(
     }
     if (!consumerId) return null
 
-    if (nonceStore && payload.nonce !== undefined) {
+    if (nonceStore && payload.nonce !== undefined && markNonce) {
       const expiry = payload.expiry === undefined
         ? Math.floor(Date.now() / 1000) + 3600
         : Number(payload.expiry)
       const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
-      await nonceStore.markSeen(nonceKey!, Math.max(ttl, 60))
+      const claimed = await nonceStore.claim(nonceKey!, Math.max(ttl, 60))
+      if (!claimed) return null
     }
 
     return consumerId

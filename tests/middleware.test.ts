@@ -18,27 +18,49 @@ import type {
 } from '../src/types'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
+import { MemoryPaymentOperations } from '../src/payment-operations'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
-const fundedRequestAmount = '100000'
+const fundedRequestAmount = '1000000'
 
 /** Sandbox that emits a fixed reply, captures the prompt + opts for assertion */
 class StubSandbox implements SandboxBox {
   receivedPrompt: string | null = null
-  receivedOpts: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number } | undefined
+  receivedOpts: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number; executionBudget?: unknown } | undefined
   constructor(private chunks: string[]) {}
 
   async *streamPrompt(
     message: string,
-    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number },
+    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number; executionBudget?: unknown },
   ): AsyncIterable<SandboxStreamEvent> {
     this.receivedPrompt = message
     this.receivedOpts = opts
+    let remaining = (opts?.maxOutputTokens ?? 1024) * 4
+    let output = ''
     for (const delta of this.chunks) {
+      const bounded = delta.slice(0, remaining)
+      remaining -= bounded.length
+      output += bounded
+      if (!bounded) break
       yield {
         type: 'message.part.updated',
-        data: { part: { type: 'text' }, delta },
+        data: { part: { type: 'text' }, delta: bounded },
       }
+      if (bounded.length < delta.length) break
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -250,7 +272,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const body = await res.json() as { error: { payment_methods: string[]; x402: Record<string, unknown> } }
     expect(body.error.payment_methods).toContain('x402')
     expect(body.error.x402.operator).toBe(operatorAddress)
-    expect(body.error.x402.required_amount).toBe('21020')
+    expect(body.error.x402.required_amount).toBe('184861')
     expect(body.error.x402.max_output_tokens).toBe(1024)
   })
 
@@ -285,7 +307,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Payment-Signature': buildSpendAuth({ amount: '580' }),
+        'X-Payment-Signature': buildSpendAuth({ amount: '1000000' }),
       },
       body: JSON.stringify({
         messages: [{ role: 'user', content: 'hi' }],
@@ -733,6 +755,20 @@ describe('createAgentGateway — production-config guard', () => {
       recordUsage: async () => { /* unused */ },
       x402: { operatorAddress, chainId: 3799, verifySigner: async () => true },
     })).not.toThrow()
+  })
+
+  it('requires an explicit version when durable payment operations are configured', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+    })).toThrow(/paymentProtocolVersion must be explicit/)
   })
 })
 

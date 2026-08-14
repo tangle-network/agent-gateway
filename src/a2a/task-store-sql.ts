@@ -166,6 +166,32 @@ export class SqlTaskStore implements TaskStore {
     }
   }
 
+  async createIfAbsent(task: Task): Promise<boolean> {
+    const payload = JSON.stringify(task)
+    try {
+      const result = await this.db.exec(
+        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
+        [task.id, task.contextId, task.status.state, payload, Date.now()],
+      )
+      return result.rowsAffected === 1
+    } catch (error) {
+      // SQL dialects report duplicate primary keys as errors. Convert only a
+      // confirmed existing row into the protocol-level "already exists" result.
+      if (await this.get(task.id)) return false
+      throw error
+    }
+  }
+
+  async compareAndSet(expected: Task, next: Task): Promise<boolean> {
+    const expectedPayload = JSON.stringify(expected)
+    const payload = JSON.stringify(next)
+    const result = await this.db.exec(
+      `UPDATE ${this.table} SET context_id = ?, state = ?, payload = ?, updated_at = ? WHERE id = ? AND payload = ?`,
+      [next.contextId, next.status.state, payload, Date.now(), expected.id, expectedPayload],
+    )
+    return result.rowsAffected === 1
+  }
+
   async delete(id: string): Promise<void> {
     await this.db.exec(`DELETE FROM ${this.table} WHERE id = ?`, [id])
   }

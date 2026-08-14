@@ -40,6 +40,9 @@ app.route('/v1/agents', createAgentGateway({
 Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
 Keep `verifySigner` free of side effects.
 Use `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
+For production version 2, set `x402.paymentProtocolVersion: 2`, provide `paymentOperations`, and return its operation from `authorizePayment`.
+The operation store owns claim, partial settle, release, and expiry reclaim.
+Keep version 1 explicitly configured while old and new gateways coexist; shared nonce storage must reject a version 1 claim owned by a version 2 operation.
 Before it calls the verifier, the gateway requires the signed amount to cover filtered input plus the requested output limit.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.

@@ -1,3 +1,9 @@
+import type {
+  PaymentAuthorizationContext,
+  PaymentOperation,
+  PaymentOperations,
+} from './payment-operations'
+
 // --- Agent resolution ---
 
 export interface AgentMeta {
@@ -73,6 +79,15 @@ export interface AgentMeta {
 
 export type PaymentMethod = 'x402' | 'mpp' | 'apikey' | 'none'
 
+export interface SandboxExecutionBudget {
+  maxInputTokens: number
+  maxOutputTokens: number
+  maxReasoningTokens: number
+  maxToolTokens: number
+  maxToolCalls: number
+  maxProviderCostUsd: number
+}
+
 export interface X402Config {
   /** Ethereum operator address for SpendAuth verification */
   operatorAddress: string
@@ -84,24 +99,27 @@ export interface X402Config {
   rpcUrl?: string
   /** Demo mode: skip signature verification (default: false). NEVER enable in production. */
   demoMode?: boolean
+  /** Protocol version for new durable payment operations. Version 1 remains supported for mixed deploys. */
+  paymentProtocolVersion?: 1 | 2
   /**
    * Production signature verification. This callback must not reserve, claim,
    * or mutate payment state.
    */
-  verifySigner?: (payload: Record<string, unknown>) => Promise<boolean>
+  verifySigner?: (
+    payload: Record<string, unknown>,
+    context?: { protocolVersion: 1 | 2; requestId?: string },
+  ) => Promise<boolean>
   /**
-   * Reserve or claim the verified payment after all request checks pass and
-   * immediately before sandbox work starts. Return false to reject the call.
+   * Claim the verified payment after all request checks pass and immediately
+   * before sandbox work starts. Version 2 returns durable operation ownership.
+   * A boolean return is the version 1 mixed-deploy compatibility path.
    */
   authorizePayment?: (
     payload: Record<string, unknown>,
-    context: {
-      requestId: string
-      agentId: string
-      requiredAmount: bigint
-      maxOutputTokens: number
-    },
-  ) => Promise<boolean>
+    context: PaymentAuthorizationContext,
+  ) => Promise<boolean | PaymentOperation>
+  /** Version 2 operation store. It owns claim, settle, release, and reclaim. */
+  paymentOperations?: PaymentOperations
   /**
    * Number of base-unit decimals used by the payment token. Defaults to 6.
    * The gateway uses this value to reject a payment that cannot cover the
@@ -173,6 +191,10 @@ export interface GatewayUsageEvent {
   paymentMethod: PaymentMethod
   inputTokens: number
   outputTokens: number
+  reasoningTokens: number
+  toolTokens: number
+  toolCallCount: number
+  providerCostUsd: number
   totalCostUsd: number
   ownerEarnedUsd: number
   platformFeeUsd: number
@@ -196,13 +218,34 @@ export interface SandboxStreamEvent {
      * the caller (rendered as the input-required message body).
      */
     inputRequired?: { prompt?: string }
+    /** Provider receipt fields. The final event must include every field. */
+    usage?: Partial<SandboxUsageReceipt>
+    /** Tool or reasoning events may carry hidden usage without visible text. */
+    tool?: { name?: string; inputTokens?: number; outputTokens?: number }
+    reasoning?: { tokens?: number }
   }
+}
+
+export interface SandboxUsageReceipt {
+  inputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  toolTokens: number
+  toolCallCount: number
+  providerCostUsd: number
+  /** True only when the provider/adapter enforced every supplied budget. */
+  budgetEnforced: boolean
 }
 
 export interface SandboxBox {
   streamPrompt(
     message: string,
-    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number },
+    opts?: {
+      sessionId?: string
+      systemPrompt?: string
+      maxOutputTokens?: number
+      executionBudget?: SandboxExecutionBudget
+    },
   ): AsyncIterable<SandboxStreamEvent>
 }
 
@@ -260,6 +303,14 @@ export interface GatewayConfig {
 
   /** Output token limit used when a request omits `max_tokens`. Defaults to 1024. */
   defaultOutputTokens?: number
+
+  /** Hidden provider spend limits included in the pre-execution payment quote. */
+  executionBudget?: {
+    maxReasoningTokens?: number
+    maxToolTokens?: number
+    maxToolCalls?: number
+    maxProviderCostUsd?: number
+  }
 
   /** Required scope for chat endpoint (default: "chat"). API keys must include this scope. */
   requiredScope?: string

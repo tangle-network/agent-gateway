@@ -1,11 +1,23 @@
 export { createAgentGateway } from './middleware'
+export { reclaimPayment } from './dispatch'
 export {
   verifyX402,
   verifyMpp,
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
+  mppReplayNonceKey,
 } from './verify'
+export {
+  PAYMENT_PROTOCOL_VERSION,
+  MemoryPaymentOperations,
+  type MemoryPaymentOperationsOptions,
+  type PaymentAuthorizationContext,
+  type PaymentOperation,
+  type PaymentOperationState,
+  type PaymentOperations,
+  type PaymentSettlementInput,
+} from './payment-operations'
 export {
   filterConsumerMessages,
   filterConsumerMessagesStrict,
@@ -56,6 +68,8 @@ export type {
   PaymentResult,
   ApiKeyInfo,
   GatewayUsageEvent,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
   SandboxStreamEvent,
   SandboxBox,
   GatewayConfig,
