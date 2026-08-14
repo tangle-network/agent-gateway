@@ -9,9 +9,8 @@
  * Schema is one table: tasks keyed by id with the full JSON payload, plus a
  * secondary index on `context_id` so `tasks/resubscribe` and conversational
  * lookups by context are O(log n). TTL is enforced at read time the same way
- * `InMemoryTaskStore` does — the gateway is single-writer per task id so a
- * stale row is invisible to callers regardless of when the row is physically
- * deleted.
+ * `InMemoryTaskStore` does — `createIfAbsent` and `compareAndSet` make task
+ * ownership safe when multiple gateway workers share the database.
  *
  * Why not bake in a specific driver? Hono workers run on Cloudflare (D1),
  * Node (pg / sqlite), Bun, Deno. Burning a hard dependency on one client

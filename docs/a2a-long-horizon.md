@@ -15,9 +15,16 @@ All four are gated on configuration — they cost nothing for agents that don't 
 
 By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments.
 Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a `SqlAdapter` shim.
-Custom production task stores should implement both atomic methods, `createIfAbsent` and `compareAndSet`.
-Older stores remain compatible through a read-then-write fallback, which is process-safe only and can run paid work twice across workers.
+Custom production task stores must implement both atomic methods, `createIfAbsent` and `compareAndSet`.
+The gateway rejects a production task store that lacks either method before it serves A2A requests.
+Explicit `x402.demoMode` keeps a read-then-write fallback for local tests only.
 Use `SqlTaskStore` or another atomic adapter for multi-worker production deployments.
+
+Before payment settlement, the gateway stores a recovery record in task metadata.
+The record contains the payment operation, usage receipt, output artifact, and a five-minute lease.
+After a restart, the first task read after lease expiry resumes settlement with the same operation.
+If settlement acknowledgement fails, the gateway keeps the operation and retries after the lease expires.
+If the record is malformed or has no recoverable operation, the gateway expires the task as failed.
 
 Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
 The hook receives the task and request headers so the application can enforce task ownership.

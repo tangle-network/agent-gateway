@@ -10,9 +10,9 @@ import type { Task } from './types'
 export interface TaskStore {
   get(id: string): Promise<Task | undefined>
   put(task: Task): Promise<void>
-  /** Insert only when the task id is absent. Required for explicit A2A ids. */
+  /** Insert only when the task id is absent. Required outside explicit demo mode. */
   createIfAbsent?(task: Task): Promise<boolean>
-  /** Replace only when the stored task still equals `expected`. */
+  /** Replace only when the stored task still equals `expected`. Required for production races. */
   compareAndSet?(expected: Task, next: Task): Promise<boolean>
   delete(id: string): Promise<void>
 }

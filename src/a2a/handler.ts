@@ -24,8 +24,13 @@ import {
   releasePaymentAfterFailure,
   settleAndRecord,
 } from '../dispatch'
-import type { GatewayConfig } from '../types'
-import type { SandboxUsageReceipt } from '../types'
+import type { PaymentOperation } from '../payment-operations'
+import type {
+  GatewayConfig,
+  PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
+} from '../types'
 import { buildAgentCard } from './agent-card'
 import { fail, ok, parseEnvelope } from './jsonrpc'
 import {
@@ -37,6 +42,7 @@ import type { TaskStore } from './task-store'
 import { extractTextFromMessage, responseTextToArtifact } from './translate'
 import {
   A2A_ERROR_CODES,
+  type Artifact,
   type JSONRPCRequest,
   type Message,
   type MessageSendParams,
@@ -53,6 +59,41 @@ export interface A2AHandlerDeps {
   state: GatewayState
   taskStore: TaskStore
   pushStore?: PushNotificationStore
+}
+
+interface SerializedPaymentOperation {
+  protocolVersion: 2
+  operationId: string
+  acquiredByRequestId: string
+  executionStartedAt?: number
+  retentionReason?: string
+  nonceKey: string
+  authorizationId: string
+  reservedAmount: string
+  settledAmount: string
+  refundAmount: string
+  expiresAt: number
+  state: PaymentOperation['state']
+}
+
+interface FinalizationRecord {
+  version: 1
+  lease: { id: string; expiresAt: number }
+  agentSlug: string
+  requestId: string
+  consumerId: string
+  paymentMethod: PaymentMethod
+  startMs: number
+  operationId: string | null
+  paymentOperation: SerializedPaymentOperation | null
+  receipt: SandboxUsageReceipt
+  artifact: Artifact | null
+  inputRequired: boolean
+  inputRequiredPrompt?: string
+  maxOutputTokens: number
+  executionBudget: SandboxExecutionBudget
+  recoveryAttempts?: number
+  recoveryError?: string
 }
 
 /** Terminal task states — fire-once push delivery occurs on these transitions. */
@@ -106,6 +147,10 @@ class CancelRegistry {
 }
 
 export function createA2AHandlers(deps: A2AHandlerDeps) {
+  const runtimeDeps: A2AHandlerDeps = {
+    ...deps,
+    taskStore: normalizeTaskStore(deps.taskStore, deps.config.x402.demoMode === true),
+  }
   const cancels = new CancelRegistry()
 
   // GET /:slug/.well-known/agent.json
@@ -147,23 +192,23 @@ export function createA2AHandlers(deps: A2AHandlerDeps) {
 
     switch (parsed.method) {
       case 'message/send':
-        return handleMessageSend(c, slug, parsed, deps, cancels)
+        return handleMessageSend(c, slug, parsed, runtimeDeps, cancels)
       case 'message/stream':
-        return handleMessageStream(c, slug, parsed, deps, cancels)
+        return handleMessageStream(c, slug, parsed, runtimeDeps, cancels)
       case 'tasks/get':
-        return handleTasksGet(c, parsed, deps)
+        return handleTasksGet(c, parsed, runtimeDeps)
       case 'tasks/cancel':
-        return handleTasksCancel(c, parsed, deps, cancels)
+        return handleTasksCancel(c, parsed, runtimeDeps, cancels)
       case 'tasks/resubscribe':
-        return handleTasksResubscribe(c, parsed, deps)
+        return handleTasksResubscribe(c, parsed, runtimeDeps)
       case 'tasks/pushNotificationConfig/set':
-        return handlePushSet(c, parsed, deps)
+        return handlePushSet(c, parsed, runtimeDeps)
       case 'tasks/pushNotificationConfig/get':
-        return handlePushGet(c, parsed, deps)
+        return handlePushGet(c, parsed, runtimeDeps)
       case 'tasks/pushNotificationConfig/list':
-        return handlePushList(c, parsed, deps)
+        return handlePushList(c, parsed, runtimeDeps)
       case 'tasks/pushNotificationConfig/delete':
-        return handlePushDelete(c, parsed, deps)
+        return handlePushDelete(c, parsed, runtimeDeps)
       default:
         return c.json(
           fail(parsed.id, A2A_ERROR_CODES.METHOD_NOT_FOUND, `unknown method '${parsed.method}'`),
@@ -222,6 +267,7 @@ async function executeMessageSend(
   let workObserved = false
   let inputRequiredPrompt: string | undefined
   let inputRequiredSeen = false
+  let finalizationLeaseId: string | undefined
   try {
     for await (const event of dispatchSandboxStreamRich(
       authz.agent,
@@ -296,7 +342,18 @@ async function executeMessageSend(
   // commercial behavior — the sandbox produced tokens.
   try {
     if (!usage) throw new Error('sandbox did not provide a usage receipt')
-    if (!await claimTaskFinalization(deps.taskStore, workingTask)) {
+    const finalizationArtifact = responseText
+      ? responseTextToArtifact(responseText, `${task.id}-artifact-0`)
+      : task.artifacts?.[0] ?? null
+    const finalization = buildFinalizationRecord(
+      authz,
+      usage,
+      finalizationArtifact,
+      inputRequiredSeen,
+      inputRequiredPrompt,
+    )
+    const finalizingTask = withFinalizationRecord(workingTask, finalization)
+    if (!await compareAndSetTask(deps.taskStore, workingTask, finalizingTask)) {
       const currentTask = await deps.taskStore.get(task.id)
       if (currentTask?.status.state === 'canceled') {
         const canceled = await completeCanceledTask(
@@ -311,7 +368,31 @@ async function executeMessageSend(
       }
       throw new Error('A2A task changed before payment settlement')
     }
+    finalizationLeaseId = finalization.lease.id
     await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
+    const settledBase = clearFinalizationMarker(finalizingTask)
+    const result = inputRequiredSeen
+      ? withStatus(
+          settledBase,
+          'input-required',
+          inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
+          responseText
+            ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
+            : task.artifacts,
+        )
+      : withStatus(settledBase, 'completed', undefined, [
+          responseTextToArtifact(responseText, `${task.id}-artifact-0`),
+        ])
+    if (!await compareAndSetTask(deps.taskStore, finalizingTask, result)) {
+      const currentTask = await deps.taskStore.get(task.id)
+      if (currentTask && (isTerminal(currentTask.status.state) || currentTask.status.state === 'input-required')) {
+        return c.json(ok(req.id, currentTask))
+      }
+      throw new Error('A2A task changed after payment settlement')
+    }
+    if (inputRequiredSeen) return c.json(ok(req.id, result))
+    await maybeDeliverPush(result, deps)
+    return c.json(ok(req.id, result))
   } catch (err) {
     await releaseOrRetainPayment(
       authz,
@@ -319,6 +400,15 @@ async function executeMessageSend(
       err instanceof Error ? err.message : String(err),
       workObserved || usage !== undefined,
     )
+    if (finalizationLeaseId) {
+      await retainFinalizationForRecovery(
+        deps.taskStore,
+        task.id,
+        finalizationLeaseId,
+        asError(err),
+      )
+      return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment settlement failed'))
+    }
     const currentTask = await deps.taskStore.get(task.id)
     const failed = currentTask && isTerminal(currentTask.status.state)
       ? currentTask
@@ -334,27 +424,6 @@ async function executeMessageSend(
     }
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment settlement failed'))
   }
-
-  if (inputRequiredSeen) {
-    const paused = withStatus(
-      workingTask,
-      'input-required',
-      inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
-      responseText
-        ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
-        : task.artifacts,
-    )
-    await deps.taskStore.put(paused)
-    // input-required is non-terminal — do NOT deliver push notifications.
-    return c.json(ok(req.id, paused))
-  }
-
-  const completed = withStatus(workingTask, 'completed', undefined, [
-    responseTextToArtifact(responseText, `${task.id}-artifact-0`),
-  ])
-  await deps.taskStore.put(completed)
-  await maybeDeliverPush(completed, deps)
-  return c.json(ok(req.id, completed))
 }
 
 // ── message/stream (SSE) ──────────────────────────────────────────────────
@@ -395,6 +464,7 @@ async function handleMessageStream(
         : { ...task, status: workingStatus.status }
       let inputRequiredPrompt: string | undefined
       let inputRequiredSeen = false
+      let finalizationLeaseId: string | undefined
       try {
         if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
           throw new Error('A2A task changed before execution started')
@@ -465,10 +535,19 @@ async function handleMessageStream(
 
         // Settle once for whatever the sandbox produced (full or partial).
         if (!usage) throw new Error('sandbox did not provide a usage receipt')
+        const finalizationArtifact = responseTextToArtifact(responseText, `${task.id}-artifact-0`)
+        const finalization = buildFinalizationRecord(
+          authz,
+          usage,
+          finalizationArtifact,
+          inputRequiredSeen,
+          inputRequiredPrompt,
+        )
         // Let the durable task-store CAS decide the cancellation race. Mark
         // the local registry only after that CAS wins, so cancel can replace a
         // still-pending finalization instead of being rejected prematurely.
-        if (!await claimTaskFinalization(deps.taskStore, workingTask)) {
+        const finalizingTask = withFinalizationRecord(workingTask, finalization)
+        if (!await compareAndSetTask(deps.taskStore, workingTask, finalizingTask)) {
           const currentTask = await deps.taskStore.get(task.id)
           if (currentTask?.status.state === 'canceled') {
             const canceled = await completeCanceledTask(
@@ -496,19 +575,32 @@ async function handleMessageStream(
           )
           return
         }
+        finalizationLeaseId = finalization.lease.id
         cancels.beginFinalization(task.id)
         await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
 
         if (inputRequiredSeen) {
           const paused = withStatus(
-            task,
+            clearFinalizationMarker(finalizingTask),
             'input-required',
             inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
             responseText
               ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
               : task.artifacts,
           )
-          await deps.taskStore.put(paused)
+          if (!await compareAndSetTask(deps.taskStore, finalizingTask, paused)) {
+            const currentTask = await deps.taskStore.get(task.id)
+            if (currentTask) {
+              send({
+                kind: 'status-update',
+                taskId: task.id,
+                contextId: task.contextId,
+                status: currentTask.status,
+                final: isTerminal(currentTask.status.state) || currentTask.status.state === 'input-required',
+              })
+            }
+            return
+          }
           send({
             kind: 'status-update',
             taskId: task.id,
@@ -520,7 +612,23 @@ async function handleMessageStream(
           return
         }
 
-        // Final: artifact lastChunk + completed status.
+        // Final: persist the terminal task before emitting terminal events.
+        const completed = withStatus(clearFinalizationMarker(finalizingTask), 'completed', undefined, [
+          responseTextToArtifact(responseText, `${task.id}-artifact-0`),
+        ])
+        if (!await compareAndSetTask(deps.taskStore, finalizingTask, completed)) {
+          const currentTask = await deps.taskStore.get(task.id)
+          if (currentTask) {
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: currentTask.status,
+              final: isTerminal(currentTask.status.state) || currentTask.status.state === 'input-required',
+            })
+          }
+          return
+        }
         send({
           kind: 'artifact-update',
           taskId: task.id,
@@ -533,10 +641,6 @@ async function handleMessageStream(
           append: true,
           lastChunk: true,
         })
-        const completed = withStatus(task, 'completed', undefined, [
-          responseTextToArtifact(responseText, `${task.id}-artifact-0`),
-        ])
-        await deps.taskStore.put(completed)
         send({
           kind: 'status-update',
           taskId: task.id,
@@ -552,6 +656,24 @@ async function handleMessageStream(
           err instanceof Error ? err.message : String(err),
           workObserved || usage !== undefined,
         )
+        if (finalizationLeaseId) {
+          const retained = await retainFinalizationForRecovery(
+            deps.taskStore,
+            task.id,
+            finalizationLeaseId,
+            asError(err),
+          )
+          if (retained) {
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: retained.status,
+              final: false,
+            })
+          }
+          return
+        }
         const currentTask = await deps.taskStore.get(task.id)
         const failed = currentTask && isTerminal(currentTask.status.state)
           ? currentTask
@@ -619,14 +741,19 @@ async function handleTasksGet(
   if (!params || typeof params.id !== 'string') {
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id required'))
   }
-  const task = await deps.taskStore.get(params.id)
-  if (!task) {
+  const storedTask = await deps.taskStore.get(params.id)
+  if (!storedTask) {
     return c.json(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
-  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  const accessError = await authorizeTaskAccess(c, req, storedTask, deps)
   if (accessError) return accessError
+  const task = await recoverFinalizationIfNeeded(
+    storedTask,
+    deps,
+    c.req.param('slug') ?? '',
+  )
   return c.json(ok(req.id, task))
 }
 
@@ -640,14 +767,19 @@ async function handleTasksCancel(
   if (!params || typeof params.id !== 'string') {
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id required'))
   }
-  const task = await deps.taskStore.get(params.id)
-  if (!task) {
+  const storedTask = await deps.taskStore.get(params.id)
+  if (!storedTask) {
     return c.json(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
-  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  const accessError = await authorizeTaskAccess(c, req, storedTask, deps)
   if (accessError) return accessError
+  const task = await recoverFinalizationIfNeeded(
+    storedTask,
+    deps,
+    c.req.param('slug') ?? '',
+  )
   if (isTerminal(task.status.state)) {
     return c.json(
       fail(
@@ -715,14 +847,19 @@ async function handleTasksResubscribe(
   if (!params || typeof params.id !== 'string') {
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id required'))
   }
-  const task = await deps.taskStore.get(params.id)
-  if (!task) {
+  const storedTask = await deps.taskStore.get(params.id)
+  if (!storedTask) {
     return c.json(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
-  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  const accessError = await authorizeTaskAccess(c, req, storedTask, deps)
   if (accessError) return accessError
+  const task = await recoverFinalizationIfNeeded(
+    storedTask,
+    deps,
+    c.req.param('slug') ?? '',
+  )
   const final = isTerminal(task.status.state) || task.status.state === 'input-required'
   const event: TaskStatusUpdateEvent = {
     kind: 'status-update',
@@ -902,10 +1039,11 @@ async function guardMessageRequest(
   // Any other taskId (unknown OR pointing at a terminal/working
   // task) means the caller is starting a fresh task and we mint a new id.
   if (typeof params.message.taskId === 'string') {
-    const existing = await deps.taskStore.get(params.message.taskId)
-    if (existing) {
-      const accessError = await authorizeTaskAccess(c, req, existing, deps)
+    const storedExisting = await deps.taskStore.get(params.message.taskId)
+    if (storedExisting) {
+      const accessError = await authorizeTaskAccess(c, req, storedExisting, deps)
       if (accessError) return accessError
+      const existing = await recoverFinalizationIfNeeded(storedExisting, deps, slug)
       if (existing.status.state !== 'input-required') {
         return c.json(
           fail(
@@ -1021,6 +1159,28 @@ async function releaseOrRetainPayment(
   }
 }
 
+/** Keep an owned finalization record durable when settlement acknowledgement is lost. */
+async function retainFinalizationForRecovery(
+  taskStore: TaskStore,
+  taskId: string,
+  leaseId: string,
+  error: Error,
+): Promise<Task | undefined> {
+  const current = await taskStore.get(taskId)
+  if (!current) return undefined
+  const record = readFinalizationRecord(current)
+  if (!record || record.lease.id !== leaseId) return undefined
+  const retry: FinalizationRecord = {
+    ...record,
+    lease: { id: cryptoRandomId(), expiresAt: Date.now() + FINALIZATION_LEASE_MS },
+    recoveryAttempts: (record.recoveryAttempts ?? 0) + 1,
+    recoveryError: error.message,
+  }
+  const next = withFinalizationRecord(current, retry)
+  if (await compareAndSetTask(taskStore, current, next)) return next
+  return await taskStore.get(taskId)
+}
+
 async function completeCanceledTask(
   authz: AuthorizedRequest,
   task: Task,
@@ -1059,6 +1219,7 @@ async function completeCanceledTask(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 const FINALIZING_METADATA_KEY = 'gatewayFinalizing'
+const FINALIZATION_LEASE_MS = 5 * 60 * 1000
 
 async function authorizeTaskAccess(
   c: Context,
@@ -1102,32 +1263,283 @@ function isHttpsUrl(value: string): boolean {
 }
 
 async function createTask(taskStore: TaskStore, task: Task): Promise<boolean> {
-  if (taskStore.createIfAbsent) return taskStore.createIfAbsent(task)
-  if (await taskStore.get(task.id)) return false
-  await taskStore.put(task)
-  return true
+  if (!taskStore.createIfAbsent) {
+    throw new Error('A2A task store does not provide createIfAbsent')
+  }
+  return taskStore.createIfAbsent(task)
 }
 
 async function compareAndSetTask(taskStore: TaskStore, expected: Task, next: Task): Promise<boolean> {
-  if (taskStore.compareAndSet) return taskStore.compareAndSet(expected, next)
-  // Older adapters remain source-compatible, but their fallback is only
-  // process-safe. Durable adapters must implement compareAndSet.
-  const current = await taskStore.get(expected.id)
-  if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return false
-  await taskStore.put(next)
-  return true
+  if (!taskStore.compareAndSet) {
+    throw new Error('A2A task store does not provide compareAndSet')
+  }
+  return taskStore.compareAndSet(expected, next)
 }
 
-async function claimTaskFinalization(taskStore: TaskStore, task: Task): Promise<boolean> {
-  if (isTaskFinalizing(task)) return false
-  return compareAndSetTask(taskStore, task, {
+function normalizeTaskStore(taskStore: TaskStore, allowUnsafeFallback: boolean): TaskStore {
+  if (typeof taskStore.createIfAbsent === 'function' && typeof taskStore.compareAndSet === 'function') {
+    return taskStore
+  }
+  if (!allowUnsafeFallback) {
+    throw new Error(
+      'A2A production task store must implement createIfAbsent and compareAndSet',
+    )
+  }
+  return {
+    get: (id) => taskStore.get(id),
+    put: (task) => taskStore.put(task),
+    delete: (id) => taskStore.delete(id),
+    async createIfAbsent(task) {
+      if (await taskStore.get(task.id)) return false
+      await taskStore.put(task)
+      return true
+    },
+    async compareAndSet(expected, next) {
+      const current = await taskStore.get(expected.id)
+      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return false
+      await taskStore.put(next)
+      return true
+    },
+  }
+}
+
+function buildFinalizationRecord(
+  authz: AuthorizedRequest,
+  receipt: SandboxUsageReceipt,
+  artifact: Artifact | null,
+  inputRequired: boolean,
+  inputRequiredPrompt: string | undefined,
+): FinalizationRecord {
+  const operation = authz.paymentOperation
+  return {
+    version: 1,
+    lease: { id: cryptoRandomId(), expiresAt: Date.now() + FINALIZATION_LEASE_MS },
+    agentSlug: authz.agent.slug,
+    requestId: authz.requestId,
+    consumerId: authz.consumerId,
+    paymentMethod: authz.paymentMethod,
+    startMs: authz.startMs,
+    operationId: operation?.operationId ?? null,
+    paymentOperation: operation ? serializePaymentOperation(operation) : null,
+    receipt,
+    artifact,
+    inputRequired,
+    ...(inputRequiredPrompt ? { inputRequiredPrompt } : {}),
+    maxOutputTokens: authz.maxOutputTokens,
+    executionBudget: authz.executionBudget,
+  }
+}
+
+function serializePaymentOperation(operation: PaymentOperation): SerializedPaymentOperation {
+  return {
+    protocolVersion: 2,
+    operationId: operation.operationId,
+    acquiredByRequestId: operation.acquiredByRequestId,
+    ...(operation.executionStartedAt !== undefined
+      ? { executionStartedAt: operation.executionStartedAt }
+      : {}),
+    ...(operation.retentionReason ? { retentionReason: operation.retentionReason } : {}),
+    nonceKey: operation.nonceKey,
+    authorizationId: operation.authorizationId,
+    reservedAmount: operation.reservedAmount.toString(),
+    settledAmount: operation.settledAmount.toString(),
+    refundAmount: operation.refundAmount.toString(),
+    expiresAt: operation.expiresAt,
+    state: operation.state,
+  }
+}
+
+function deserializePaymentOperation(value: SerializedPaymentOperation): PaymentOperation {
+  if (value.protocolVersion !== 2) throw new Error('unsupported A2A payment operation version')
+  if (!value.operationId || !value.acquiredByRequestId || !value.nonceKey || !value.authorizationId) {
+    throw new Error('incomplete A2A payment operation recovery record')
+  }
+  return {
+    protocolVersion: 2,
+    operationId: value.operationId,
+    acquiredByRequestId: value.acquiredByRequestId,
+    ...(value.executionStartedAt !== undefined ? { executionStartedAt: value.executionStartedAt } : {}),
+    ...(value.retentionReason ? { retentionReason: value.retentionReason } : {}),
+    nonceKey: value.nonceKey,
+    authorizationId: value.authorizationId,
+    reservedAmount: BigInt(value.reservedAmount),
+    settledAmount: BigInt(value.settledAmount),
+    refundAmount: BigInt(value.refundAmount),
+    expiresAt: value.expiresAt,
+    state: value.state,
+  }
+}
+
+function withFinalizationRecord(task: Task, record: FinalizationRecord): Task {
+  return {
     ...task,
-    metadata: { ...(task.metadata ?? {}), [FINALIZING_METADATA_KEY]: true },
-  })
+    metadata: { ...(task.metadata ?? {}), [FINALIZING_METADATA_KEY]: record },
+  }
+}
+
+function readFinalizationRecord(task: Task): FinalizationRecord | undefined {
+  const raw = task.metadata?.[FINALIZING_METADATA_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const record = raw as Partial<FinalizationRecord>
+  if (
+    record.version !== 1 ||
+    !record.lease ||
+    typeof record.lease.id !== 'string' ||
+    typeof record.lease.expiresAt !== 'number'
+  ) {
+    return undefined
+  }
+  return record as FinalizationRecord
 }
 
 function isTaskFinalizing(task: Task): boolean {
-  return task.metadata?.[FINALIZING_METADATA_KEY] === true
+  const marker = task.metadata?.[FINALIZING_METADATA_KEY]
+  return marker === true || (typeof marker === 'object' && marker !== null)
+}
+
+async function recoverFinalizationIfNeeded(
+  task: Task,
+  deps: A2AHandlerDeps,
+  requestedAgentSlug: string,
+): Promise<Task> {
+  if (!isTaskFinalizing(task)) return task
+  const record = readFinalizationRecord(task)
+  if (!record) {
+    return expireFinalization(
+      task,
+      deps,
+      null,
+      new Error('A2A finalization record is missing'),
+    )
+  }
+  if (record.lease.expiresAt > Date.now()) return task
+
+  const renewed: FinalizationRecord = {
+    ...record,
+    lease: { id: cryptoRandomId(), expiresAt: Date.now() + FINALIZATION_LEASE_MS },
+  }
+  const leasedTask = withFinalizationRecord(task, renewed)
+  if (!await compareAndSetTask(deps.taskStore, task, leasedTask)) {
+    return await deps.taskStore.get(task.id) ?? task
+  }
+
+  try {
+    const agentSlug = renewed.agentSlug || requestedAgentSlug
+    const agent = await deps.config.resolveAgent(agentSlug)
+    if (!agent || !agent.enabled) throw new Error('A2A recovery agent is unavailable')
+
+    let paymentOperation: PaymentOperation | undefined
+    if (renewed.operationId || renewed.paymentOperation) {
+      if (!renewed.operationId || !renewed.paymentOperation) {
+        throw new Error('A2A payment operation recovery record is incomplete')
+      }
+      if (renewed.operationId !== renewed.paymentOperation.operationId) {
+        throw new Error('A2A payment operation recovery id does not match')
+      }
+      if (!deps.config.x402.paymentOperations) {
+        throw new Error('A2A payment operation recovery is not configured')
+      }
+      paymentOperation = deserializePaymentOperation(renewed.paymentOperation)
+    } else if (!deps.config.x402.demoMode) {
+      throw new Error('A2A production recovery requires a durable payment operation')
+    }
+
+    const authz: AuthorizedRequest = {
+      agent,
+      consumerId: renewed.consumerId,
+      paymentMethod: renewed.paymentMethod,
+      keyInfo: null,
+      userMessage: '[recovered A2A task]',
+      rateLimitRemaining: undefined,
+      requestId: renewed.requestId,
+      startMs: renewed.startMs,
+      maxOutputTokens: renewed.maxOutputTokens,
+      executionBudget: renewed.executionBudget,
+      requiredPaymentAmount: 0n,
+      paymentPayload: null,
+      ...(paymentOperation
+        ? { paymentOperation, paymentOperationAcquired: true }
+        : {}),
+    }
+    await settleAndRecord(agent, authz, renewed.receipt, deps.config, deps.state.obs)
+
+    const recovered = finalizationResultTask(leasedTask, renewed)
+    if (!await compareAndSetTask(deps.taskStore, leasedTask, recovered)) {
+      return await deps.taskStore.get(task.id) ?? recovered
+    }
+    await maybeDeliverPush(recovered, deps)
+    return recovered
+  } catch (error) {
+    const recoveryError = error instanceof Error ? error : new Error(String(error))
+    console.error(
+      `[a2a] finalization recovery failed for ${task.id}:`,
+      recoveryError.message,
+    )
+    if (renewed.operationId && renewed.paymentOperation) {
+      const retained = await retainFinalizationForRecovery(
+        deps.taskStore,
+        task.id,
+        renewed.lease.id,
+        recoveryError,
+      )
+      if (retained) return retained
+    }
+    return expireFinalization(leasedTask, deps, renewed, recoveryError)
+  }
+}
+
+function finalizationResultTask(task: Task, record: FinalizationRecord): Task {
+  const cleanTask = clearFinalizationMarker(task)
+  if (record.inputRequired) {
+    return withStatus(
+      cleanTask,
+      'input-required',
+      record.inputRequiredPrompt ? agentMessage(cleanTask, record.inputRequiredPrompt) : undefined,
+      record.artifact ? [record.artifact] : cleanTask.artifacts,
+    )
+  }
+  return withStatus(
+    cleanTask,
+    'completed',
+    undefined,
+    record.artifact ? [record.artifact] : cleanTask.artifacts,
+  )
+}
+
+async function expireFinalization(
+  task: Task,
+  deps: A2AHandlerDeps,
+  record: FinalizationRecord | null,
+  error: Error,
+): Promise<Task> {
+  const cleanTask = clearFinalizationMarker(task)
+  const failed: Task = {
+    ...withStatus(cleanTask, 'failed'),
+    metadata: {
+      ...(cleanTask.metadata ?? {}),
+      gatewayFinalizationRecovery: {
+        operationId: record?.operationId ?? null,
+        error: error.message,
+      },
+    },
+  }
+  if (await compareAndSetTask(deps.taskStore, task, failed)) {
+    await maybeDeliverPush(failed, deps)
+    return failed
+  }
+  return await deps.taskStore.get(task.id) ?? failed
+}
+
+function clearFinalizationMarker(task: Task): Task {
+  if (!task.metadata || !(FINALIZING_METADATA_KEY in task.metadata)) return task
+  const metadata = { ...task.metadata }
+  delete metadata[FINALIZING_METADATA_KEY]
+  return Object.keys(metadata).length > 0
+    ? { ...task, metadata }
+    : (() => {
+        const { metadata: _metadata, ...withoutMetadata } = task
+        return withoutMetadata
+      })()
 }
 
 function isTerminal(state: Task['status']['state']): boolean {
@@ -1137,6 +1549,10 @@ function isTerminal(state: Task['status']['state']): boolean {
     state === 'failed' ||
     state === 'rejected'
   )
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
 }
 
 function nowIso(): string {

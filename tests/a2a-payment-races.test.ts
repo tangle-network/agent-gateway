@@ -258,7 +258,7 @@ describe('A2A payment ownership races', () => {
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
       delete: (id) => innerStore.delete(id),
       async compareAndSet(expected, next) {
-        if (next.metadata?.gatewayFinalizing === true) {
+        if (next.metadata?.gatewayFinalizing) {
           finalizationSeen()
           await finalizationReleased
         }
