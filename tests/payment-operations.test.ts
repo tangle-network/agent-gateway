@@ -147,6 +147,125 @@ describe('version 2 payment operations', () => {
     expect(settled[1].state).toBe('settled')
   })
 
+  it('runs one reclaim side effect for concurrent expiry retries', async () => {
+    let now = 100
+    let entered = 0
+    let release!: () => void
+    const recoveryReady = new Promise<void>((resolve) => { release = resolve })
+    const operations = new MemoryPaymentOperations({
+      now: () => now,
+      onReclaim: async () => {
+        entered += 1
+        await recoveryReady
+      },
+    })
+    const owner = await operations.claimPayment(payload('1000', '16', '200'), context())
+    now = 201
+    const first = operations.reclaimPayment(owner.operationId)
+    while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = operations.reclaimPayment(owner.operationId)
+    release()
+    const recovered = await Promise.all([first, second])
+    expect(entered).toBe(1)
+    expect(recovered[0].state).toBe('reclaimed')
+    expect(recovered[1].state).toBe('reclaimed')
+  })
+
+  it('runs one settlement-recovery side effect for concurrent crash retries', async () => {
+    let entered = 0
+    let release!: () => void
+    const recoveryReady = new Promise<void>((resolve) => { release = resolve })
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { throw new Error('worker crashed during settlement') },
+      onReclaim: async () => {
+        entered += 1
+        await recoveryReady
+      },
+    })
+    const owner = await operations.claimPayment(payload('1000', '17'), context())
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
+    const first = operations.reclaimPayment(owner.operationId)
+    while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = operations.reclaimPayment(owner.operationId)
+    release()
+    const recovered = await Promise.all([first, second])
+    expect(entered).toBe(1)
+    expect(recovered[0].state).toBe('settled')
+    expect(recovered[1].state).toBe('settled')
+  })
+
+  it('runs one settlement-recovery side effect for concurrent settlement retries', async () => {
+    let entered = 0
+    let release!: () => void
+    const recoveryReady = new Promise<void>((resolve) => { release = resolve })
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { throw new Error('worker crashed during settlement') },
+      onReclaim: async () => {
+        entered += 1
+        await recoveryReady
+      },
+    })
+    const owner = await operations.claimPayment(payload('1000', '18'), context())
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
+    const first = operations.settlePayment(owner, input)
+    while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = operations.settlePayment(owner, input)
+    release()
+    const recovered = await Promise.all([first, second])
+    expect(entered).toBe(1)
+    expect(recovered[0].state).toBe('settled')
+    expect(recovered[1].state).toBe('settled')
+  })
+
+  it('does not overlap settlement retry with reclaim recovery', async () => {
+    let entered = 0
+    let release!: () => void
+    const recoveryReady = new Promise<void>((resolve) => { release = resolve })
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { throw new Error('worker crashed during settlement') },
+      onReclaim: async () => {
+        entered += 1
+        await recoveryReady
+      },
+    })
+    const owner = await operations.claimPayment(payload('1000', '19'), context())
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
+    const reclaim = operations.reclaimPayment(owner.operationId)
+    while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const settle = operations.settlePayment(owner, input)
+    release()
+    const recovered = await Promise.all([reclaim, settle])
+    expect(entered).toBe(1)
+    expect(recovered[0].state).toBe('settled')
+    expect(recovered[1].state).toBe('settled')
+  })
+
+  it('does not overlap release retry with reclaim recovery', async () => {
+    let entered = 0
+    let release!: () => void
+    const recoveryReady = new Promise<void>((resolve) => { release = resolve })
+    const operations = new MemoryPaymentOperations({
+      onRelease: async () => { throw new Error('worker crashed during release') },
+      onReclaim: async () => {
+        entered += 1
+        await recoveryReady
+      },
+    })
+    const owner = await operations.claimPayment(payload('1000', '20'), context())
+    await expect(operations.releasePayment(owner, 'sandbox failed')).rejects.toThrow('worker crashed')
+    const reclaim = operations.reclaimPayment(owner.operationId)
+    while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const retry = operations.releasePayment(owner, 'retry release')
+    release()
+    const recovered = await Promise.all([reclaim, retry])
+    expect(entered).toBe(1)
+    expect(recovered[0].state).toBe('released')
+    expect(recovered[1].state).toBe('released')
+  })
+
   it('does not close a release when recovery has no refund proof', async () => {
     const operations = new MemoryPaymentOperations({
       onRelease: async () => { throw new Error('acknowledgement lost') },
@@ -179,6 +298,7 @@ describe('bounded request pricing and sandbox receipts', () => {
   it('quotes conservative UTF-8 input and hidden provider costs', () => {
     expect(maximumBillableInputTokens({ ...agent, systemPrompt: '' }, '😀')).toBe(4)
     expect(requiredX402Amount(0.000001, 4, 2, 6, 3, 5, 0.00002)).toBe(20n)
+    expect(requiredX402Amount(0, 4, 2)).toBe(0n)
   })
 
   it.each([
@@ -417,6 +537,42 @@ describe('bounded request pricing and sandbox receipts', () => {
       return events.find((event) => event.kind === 'usage')
     }
     await expect(run()).rejects.toThrow(/budget|provider|reasoning|tool/)
+  })
+
+  it('delivers text before a later sandbox event arrives', async () => {
+    let release!: () => void
+    const laterEvent = new Promise<void>((resolve) => { release = resolve })
+    const box: SandboxBox = {
+      async *streamPrompt() {
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'first' } }
+        await laterEvent
+        yield {
+          type: 'sandbox.usage',
+          data: { usage: settledUsage() },
+        }
+      },
+    }
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => box,
+      recordUsage: async () => undefined,
+      x402: { operatorAddress: '0x1', chainId: 1, demoMode: true },
+    }
+    const events = dispatchSandboxStreamRich(
+      agent,
+      'hi',
+      'consumer',
+      config,
+      undefined,
+      undefined,
+      4,
+    )[Symbol.asyncIterator]()
+    await events.next()
+    const firstText = await events.next()
+    expect(firstText.value).toEqual({ kind: 'text', delta: 'first' })
+    release()
+    await events.next()
+    await events.next()
   })
 })
 

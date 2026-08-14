@@ -411,6 +411,66 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(settlements[0].requestId).toBe(usage[0].requestId)
   })
 
+  it('does not signal a successful stream before settlement succeeds', async () => {
+    const { app } = buildHarness({
+      settlePayment: async () => { throw new Error('settlement unavailable') },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9001' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const body = await res.text()
+    expect(res.status).toBe(200)
+    expect(body).toContain('settlement unavailable')
+    expect(body).not.toContain('data: [DONE]')
+  })
+
+  it('records attribution before settlement so adapters can resolve the charge', async () => {
+    const order: string[] = []
+    const { app } = buildHarness({
+      recordUsage: async () => { order.push('record') },
+      settlePayment: async () => { order.push('settle') },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9002' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+    expect(order).toEqual(['record', 'settle'])
+  })
+
+  it('keeps legacy sandbox adapters working with visible-token estimates', async () => {
+    const { app, usage, settlements } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'legacy' } }
+        },
+      }),
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_legacy',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const streamed = await readSse(res)
+    expect(res.status).toBe(200)
+    expect(streamed.combinedText).toBe('legacy')
+    expect(streamed.done).toBe(true)
+    expect(usage[0]?.outputTokens).toBe(2)
+    expect(settlements).toHaveLength(1)
+  })
+
   it('threads a unique requestId per concurrent request — regression: two same-consumer requests get distinct ids', async () => {
     const { app, settlements, usage } = buildHarness({}, ['ok'])
     const requests = await Promise.all([
@@ -769,6 +829,22 @@ describe('createAgentGateway — production-config guard', () => {
         paymentOperations: new MemoryPaymentOperations(),
       },
     })).toThrow(/paymentProtocolVersion must be explicit/)
+  })
+
+  it('refuses a custom A2A task store without atomic transitions', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: { operatorAddress, chainId: 3799, demoMode: true },
+      a2a: {
+        taskStore: {
+          get: async () => undefined,
+          put: async () => undefined,
+          delete: async () => undefined,
+        },
+      },
+    })).toThrow(/atomic createIfAbsent and compareAndSet/)
   })
 })
 

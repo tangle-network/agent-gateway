@@ -203,8 +203,10 @@ describe('final payment boundary protocol guards', () => {
     const legacyResponse = await legacyResponsePromise
     await legacyResponse.text()
 
-    expect(modernResponse.status).toBe(200)
-    expect(legacyResponse.status).toBe(402)
-    expect(operations.get(`x402:${commitment}:5`)?.state).toBe('settled')
+    // The legacy gateway claims the shared nonce before its external callback.
+    // The modern gateway must lose without invoking a second payment owner.
+    expect(modernResponse.status).toBe(402)
+    expect(legacyResponse.status).toBe(200)
+    expect(operations.get(`x402:${commitment}:5`)).toBeUndefined()
   })
 })

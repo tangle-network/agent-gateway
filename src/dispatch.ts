@@ -68,8 +68,8 @@ export interface AuthorizedRequest {
 }
 
 function decimalFraction(value: number): { numerator: bigint; denominator: bigint } {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error('agent pricePerTokenUsd must be a finite positive number')
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error('agent pricePerTokenUsd must be a finite non-negative number')
   }
   const [mantissa, exponentText] = value.toString().toLowerCase().split('e')
   const exponent = exponentText ? Number(exponentText) : 0
@@ -509,6 +509,13 @@ export async function claimPayment(
     }
     let operation: PaymentOperation | undefined
     if (config.x402.authorizePayment) {
+      // Version 1 has no durable operation to release if another request wins
+      // the shared nonce while this callback is still running. Claim first so
+      // an external reserve or charge cannot happen for a losing request.
+      const legacyClaimed = config.x402.paymentProtocolVersion !== 2 && authz.paymentNonceKey
+        ? await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+        : undefined
+      if (legacyClaimed === false) throw new Error('payment nonce was already consumed')
       const result = await config.x402.authorizePayment(authz.paymentPayload, context)
       if (!result) throw new Error('payment authorization was rejected')
       if (typeof result !== 'boolean') {
@@ -520,7 +527,7 @@ export async function claimPayment(
       }
       else if (config.x402.paymentProtocolVersion === 2) {
         throw new Error('version 2 payment authorization did not return an operation')
-      } else if (authz.paymentNonceKey) {
+      } else if (authz.paymentNonceKey && legacyClaimed === undefined) {
         const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
         if (!claimed) throw new Error('payment nonce was already consumed')
       }
@@ -711,7 +718,7 @@ export async function* dispatchSandboxStreamRich(
   let observedReasoningTokens = 0
   let observedToolTokens = 0
   let observedToolCalls = 0
-  const bufferedTextParts: string[] = []
+  let legacyOutputText = ''
   const executionBudget: SandboxExecutionBudget = {
     maxInputTokens: maximumBillableInputTokens(agent, userMessage),
     maxOutputTokens: outputLimit,
@@ -757,23 +764,27 @@ export async function* dispatchSandboxStreamRich(
       const remainingBytes = maxOutputBytes - outputBytes
       if (remainingBytes <= 0) throw new Error('sandbox exceeded max output tokens')
       const bounded = truncateUtf8(event.data.delta, remainingBytes, encoder)
-      const boundedDelta = bounded.text
-      outputBytes += bounded.bytes
-      bufferedTextParts.push(boundedDelta)
-      yield { kind: 'activity' }
       if (bounded.truncated) {
+        yield { kind: 'activity' }
         throw new Error('sandbox exceeded max output tokens')
       }
+      outputBytes += bounded.bytes
+      legacyOutputText += bounded.text
+      yield { kind: 'activity' }
+      yield { kind: 'text', delta: redactSystemPromptFromOutput(bounded.text, agent.systemPrompt) }
       continue
     }
     if (event.type === 'input-required' || event.data?.inputRequired) {
-      const usage = finalizeUsage(
-        withObservedUsage(usageParts, observedReasoningTokens, observedToolTokens, observedToolCalls),
+      const usage = completeUsage(
+        usageParts,
+        observedReasoningTokens,
+        observedToolTokens,
+        observedToolCalls,
+        userMessage,
+        legacyOutputText,
         executionBudget,
+        config.x402.paymentOperations !== undefined,
       )
-      for (const bufferedText of bufferedTextParts) {
-        yield { kind: 'text', delta: redactSystemPromptFromOutput(bufferedText, agent.systemPrompt) }
-      }
       yield { kind: 'input-required', prompt: event.data?.inputRequired?.prompt }
       // Terminal for the sandbox stream — sandbox SHOULD stop emitting until
       // the gateway dispatches a continuation message with the new user input.
@@ -781,13 +792,16 @@ export async function* dispatchSandboxStreamRich(
       return
     }
   }
-  const usage = finalizeUsage(
-    withObservedUsage(usageParts, observedReasoningTokens, observedToolTokens, observedToolCalls),
+  const usage = completeUsage(
+    usageParts,
+    observedReasoningTokens,
+    observedToolTokens,
+    observedToolCalls,
+    userMessage,
+    legacyOutputText,
     executionBudget,
+    config.x402.paymentOperations !== undefined,
   )
-  for (const bufferedText of bufferedTextParts) {
-    yield { kind: 'text', delta: redactSystemPromptFromOutput(bufferedText, agent.systemPrompt) }
-  }
   yield { kind: 'usage', usage }
 }
 
@@ -832,6 +846,9 @@ export async function settleAndRecord(
     startMs: authz.startMs,
   }
   try {
+    // Record attribution before settlement. Marketplace adapters use this
+    // row to map the request to its agent and consumer before deducting funds.
+    await config.recordUsage(usageEvent)
     if (authz.paymentOperation && config.x402.paymentOperations) {
       const amount = actualX402Amount(
         agent.pricePerTokenUsd,
@@ -856,7 +873,6 @@ export async function settleAndRecord(
         totalCost,
       )
     }
-    await config.recordUsage(usageEvent)
     await obs?.onRequestComplete?.(ctx, usageEvent)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -971,6 +987,39 @@ function finalizeUsage(
   enforceUsageBudget(usage, budget)
   if (!usage.budgetEnforced) throw new Error('sandbox did not enforce the execution budget')
   return usage
+}
+
+function completeUsage(
+  parts: Partial<SandboxUsageReceipt>,
+  reasoningTokens: number,
+  toolTokens: number,
+  toolCallCount: number,
+  userMessage: string,
+  outputText: string,
+  budget: SandboxExecutionBudget,
+  requiresReceipt: boolean,
+): SandboxUsageReceipt {
+  const observed = withObservedUsage(parts, reasoningTokens, toolTokens, toolCallCount)
+  if (
+    !requiresReceipt &&
+    Object.keys(parts).length === 0 &&
+    reasoningTokens === 0 &&
+    toolTokens === 0 &&
+    toolCallCount === 0
+  ) {
+    // Preserve the pre-receipt SandboxBox contract for legacy API-key
+    // adapters. Durable payment operations must use provider-enforced usage.
+    return {
+      inputTokens: estimateTokens(userMessage),
+      outputTokens: estimateTokens(outputText),
+      reasoningTokens: 0,
+      toolTokens: 0,
+      toolCallCount: 0,
+      providerCostUsd: 0,
+      budgetEnforced: false,
+    }
+  }
+  return finalizeUsage(observed, budget)
 }
 
 function actualX402Amount(

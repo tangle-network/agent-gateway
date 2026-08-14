@@ -248,6 +248,10 @@ export async function deliverPushNotifications(args: {
 
     let result: PushDeliveryResult
     try {
+      const url = new URL(config.url)
+      if (url.protocol !== 'https:' || url.username !== '' || url.password !== '') {
+        throw new Error('push notification URL must use https without credentials')
+      }
       const res = await fetcher(config.url, { method: 'POST', headers, body })
       result = {
         taskId: args.task.id,

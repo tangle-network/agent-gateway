@@ -85,7 +85,7 @@ describe('A2A payment ownership races', () => {
       verifyApiKey: async () => ({ consumerId: 'consumer', keyId: 'key', scopes: ['chat'] }),
       x402: { operatorAddress, chainId: 1, demoMode: true },
       nonceStore: new MemoryNonceStore(),
-      a2a: { taskStore },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(config))
@@ -139,7 +139,7 @@ describe('A2A payment ownership races', () => {
         paymentOperations: operations,
       },
       nonceStore: new MemoryNonceStore(),
-      a2a: { taskStore },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(config))

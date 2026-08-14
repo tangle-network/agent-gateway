@@ -361,6 +361,31 @@ describe('A2A — push notification config RPCs', () => {
     expect(await pushStore.get(task.id, cfg.id)).toBeUndefined()
   })
 
+  it('rejects non-HTTPS push destinations', async () => {
+    const { app } = buildHarness()
+    const sendRes = await postJsonRpc(
+      app,
+      { jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: textMessage('hi') } },
+      apiKeyHeader(),
+    )
+    const task = ((await sendRes.json()) as JSONRPCSuccessResponse<Task>).result
+    const res = await postJsonRpc(
+      app,
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/pushNotificationConfig/set',
+        params: {
+          taskId: task.id,
+          pushNotificationConfig: { id: 'cfg-http', url: 'http://localhost/hook' },
+        },
+      },
+      apiKeyHeader(),
+    )
+    const body = (await res.json()) as JSONRPCErrorResponse
+    expect(body.error.code).toBe(A2A_ERROR_CODES.INVALID_PARAMS)
+  })
+
   it('get returns TASK_NOT_FOUND for an unregistered config', async () => {
     const { app } = buildHarness()
     const res = await postJsonRpc(

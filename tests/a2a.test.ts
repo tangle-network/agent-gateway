@@ -430,6 +430,33 @@ describe('A2A — message/stream', () => {
 // ── tasks/get ─────────────────────────────────────────────────────────────
 
 describe('A2A — tasks/get', () => {
+  it('fails closed for production task access without an authorization hook', async () => {
+    const { app } = buildHarness({
+      x402: { operatorAddress, chainId: 3799, verifySigner: async () => true, demoMode: false },
+    })
+    const sendRes = await postJsonRpc(
+      app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('hi') },
+      },
+      apiKeyHeader(),
+    )
+    const sent = (await sendRes.json()) as JSONRPCSuccessResponse<Task>
+
+    const getRes = await postJsonRpc(
+      app,
+      'test-agent',
+      { jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { id: sent.result.id } },
+      apiKeyHeader(),
+    )
+    const body = (await getRes.json()) as JSONRPCErrorResponse
+    expect(body.error.code).toBe(A2A_ERROR_CODES.TASK_ACCESS_DENIED)
+  })
+
   it('returns the task created by a prior message/send', async () => {
     const { app } = buildHarness()
     const sendRes = await postJsonRpc(

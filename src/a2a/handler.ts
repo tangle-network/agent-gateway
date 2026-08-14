@@ -559,6 +559,8 @@ async function handleTasksGet(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   return c.json(ok(req.id, task))
 }
 
@@ -578,6 +580,8 @@ async function handleTasksCancel(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   if (isTerminal(task.status.state)) {
     return c.json(
       fail(
@@ -651,6 +655,8 @@ async function handleTasksResubscribe(
       fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`),
     )
   }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   const final = isTerminal(task.status.state) || task.status.state === 'input-required'
   const event: TaskStatusUpdateEvent = {
     kind: 'status-update',
@@ -702,6 +708,11 @@ async function handlePushSet(
   if (!task) {
     return c.json(fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.taskId}' not found`))
   }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
+  if (!isHttpsUrl(params.pushNotificationConfig.url)) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'pushNotificationConfig.url must use https'))
+  }
   await deps.pushStore.set(params.taskId, params.pushNotificationConfig)
   const stored = await deps.pushStore.get(params.taskId, params.pushNotificationConfig.id)
   return c.json(ok(req.id, { taskId: params.taskId, pushNotificationConfig: stored }))
@@ -721,6 +732,12 @@ async function handlePushGet(
       fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id and params.pushNotificationConfigId required'),
     )
   }
+  const task = await deps.taskStore.get(params.id)
+  if (!task) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`))
+  }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   const cfg = await deps.pushStore.get(params.id, params.pushNotificationConfigId)
   if (!cfg) {
     return c.json(
@@ -746,6 +763,12 @@ async function handlePushList(
   if (!params || typeof params.id !== 'string') {
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id required'))
   }
+  const task = await deps.taskStore.get(params.id)
+  if (!task) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`))
+  }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   const configs = await deps.pushStore.list(params.id)
   return c.json(ok(req.id, configs.map((cfg) => ({ taskId: params.id, pushNotificationConfig: cfg }))))
 }
@@ -764,6 +787,12 @@ async function handlePushDelete(
       fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'params.id and params.pushNotificationConfigId required'),
     )
   }
+  const task = await deps.taskStore.get(params.id)
+  if (!task) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.id}' not found`))
+  }
+  const accessError = await authorizeTaskAccess(c, req, task, deps)
+  if (accessError) return accessError
   await deps.pushStore.delete(params.id, params.pushNotificationConfigId)
   return c.json(ok(req.id, null))
 }
@@ -923,6 +952,47 @@ async function releaseOrRetainPayment(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 const FINALIZING_METADATA_KEY = 'gatewayFinalizing'
+
+async function authorizeTaskAccess(
+  c: Context,
+  req: JSONRPCRequest,
+  task: Task,
+  deps: A2AHandlerDeps,
+): Promise<Response | undefined> {
+  const authorize = deps.config.a2a?.authorizeTaskAccess
+  if (!authorize && deps.config.x402.demoMode) return undefined
+  if (!authorize) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task access authorization is not configured'),
+      403,
+    )
+  }
+  let allowed = false
+  try {
+    allowed = await authorize(task, {
+      method: req.method,
+      agentSlug: c.req.param('slug') ?? '',
+      authorization: c.req.header('Authorization') ?? '',
+      paymentSignature: c.req.header('X-Payment-Signature') ?? '',
+    })
+  } catch (error) {
+    console.error(
+      `[a2a] task access authorization failed for ${task.id}:`,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+  if (allowed) return undefined
+  return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task access denied'), 403)
+}
+
+function isHttpsUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' && url.username === '' && url.password === ''
+  } catch {
+    return false
+  }
+}
 
 async function createTask(taskStore: TaskStore, task: Task): Promise<boolean> {
   if (taskStore.createIfAbsent) return taskStore.createIfAbsent(task)

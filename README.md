@@ -46,6 +46,8 @@ Keep version 1 explicitly configured while old and new gateways coexist; shared 
 Before it calls the verifier, the gateway requires the signed amount to cover filtered input plus the requested output limit.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
+Sandbox adapters should emit a complete `sandbox.usage` receipt.
+Version 2 payment operations reject missing receipts; legacy adapters use visible-token estimates only.
 
 MPP is method-specific.
 Configure `mpp.verifySigner` for production MPP credentials; it receives the decoded JSON payload when available plus the original decoded credential, and returns the authenticated consumer ID or `null`.
@@ -58,6 +60,9 @@ Wire protocol handlers only translate their request and response shapes.
 ## A2A protocol
 
 The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
+Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
+Custom production task stores must implement atomic `createIfAbsent` and `compareAndSet` methods.
+Push destinations must use HTTPS without URL credentials.
 
 ## Tier
 

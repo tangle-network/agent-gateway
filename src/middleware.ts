@@ -231,6 +231,14 @@ export function createAgentGateway(config: GatewayConfig) {
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
   const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
+  if (
+    config.a2a?.taskStore &&
+    (!taskStore.createIfAbsent || !taskStore.compareAndSet)
+  ) {
+    throw new Error(
+      'createAgentGateway: custom A2A taskStore must implement atomic createIfAbsent and compareAndSet',
+    )
+  }
   const pushStore = config.a2a?.pushStore
   const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
   gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
@@ -308,6 +316,14 @@ function streamChatCompletions(
 
         if (!usage) throw new Error('sandbox did not provide a usage receipt')
 
+        await settleAndRecord(
+          agent,
+          authz,
+          usage,
+          config,
+          obs,
+        )
+
         const done: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -317,14 +333,6 @@ function streamChatCompletions(
         }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-
-        await settleAndRecord(
-          agent,
-          authz,
-          usage,
-          config,
-          obs,
-        )
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err)
         // Never expose stack traces / absolute paths from sandbox internals.

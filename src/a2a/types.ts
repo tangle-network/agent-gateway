@@ -51,6 +51,7 @@ export const A2A_ERROR_CODES = {
   CONTENT_TYPE_NOT_SUPPORTED: -32005,
   INVALID_AGENT_RESPONSE: -32006,
   AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED: -32007,
+  TASK_ACCESS_DENIED: -32008,
 } as const
 
 // ── Message parts ────────────────────────────────────────────────────────

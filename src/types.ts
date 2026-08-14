@@ -218,7 +218,7 @@ export interface SandboxStreamEvent {
      * the caller (rendered as the input-required message body).
      */
     inputRequired?: { prompt?: string }
-    /** Provider receipt fields. The final event must include every field. */
+    /** Provider receipt fields. Version 2 operations require every field. */
     usage?: Partial<SandboxUsageReceipt>
     /** Tool or reasoning events may carry hidden usage without visible text. */
     tool?: { name?: string; inputTokens?: number; outputTokens?: number }
@@ -285,10 +285,10 @@ export interface GatewayConfig {
   verifyApiKey?: (authHeader: string) => Promise<ApiKeyInfo | null>
 
   /**
-   * Settle payment after successful response.
-   * For x402: call ShieldedCredits.claimPayment()
-   * For API key: deduct from spending limit
-   * Default: no-op (demo mode).
+   * Settle a legacy payment after usage attribution is recorded.
+   * Version 2 x402 operations use `x402.paymentOperations` instead.
+   * For API keys, deduct from the spending limit.
+   * Default: no-op in explicit demo mode.
    */
   settlePayment?: (payment: PaymentResult, cost: number) => Promise<void>
 
@@ -344,8 +344,22 @@ export interface GatewayConfig {
    * Auth + rate-limit + injection-filter + authorization all share the
    * same pipeline as the OpenAI-compat path. `taskStore` defaults to
    * `InMemoryTaskStore`; swap in D1/postgres/DO for durable deployments.
-   */
+  */
   a2a?: {
+    /**
+     * Authorize reads, cancellation, resubscription, and push configuration
+     * for an existing task. Production control methods fail closed when this
+     * hook is absent; explicit demo mode permits local tests.
+     */
+    authorizeTaskAccess?: (
+      task: import('./a2a/types').Task,
+      context: {
+        method: string
+        agentSlug: string
+        authorization: string
+        paymentSignature: string
+      },
+    ) => Promise<boolean>
     /**
      * Where tasks live. Defaults to `InMemoryTaskStore`; swap in
      * `SqlTaskStore` (D1, postgres, sqlite, libSQL) for durability across

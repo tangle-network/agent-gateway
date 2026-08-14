@@ -13,7 +13,14 @@ All four are gated on configuration — they cost nothing for agents that don't 
 
 ## Durable tasks (SqlTaskStore)
 
-By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments. Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a 2-method `SqlAdapter` shim.
+By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments.
+Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a `SqlAdapter` shim.
+Custom production task stores must implement both atomic methods, `createIfAbsent` and `compareAndSet`.
+The gateway rejects a custom store without those methods because a read-then-write fallback can run paid work twice across workers.
+
+Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
+The hook receives the task and request headers so the application can enforce task ownership.
+Explicit `x402.demoMode` permits these methods without the hook for local tests only.
 
 ### D1 (Cloudflare Workers)
 
@@ -164,6 +171,7 @@ When `pushStore` is set, the agent card advertises `capabilities.pushNotificatio
 ```
 
 Get / list / delete mirror standard CRUD via the same method namespace.
+Push destinations must use HTTPS and must not include URL credentials.
 
 ### Webhook receiver shape
 

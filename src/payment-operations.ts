@@ -79,6 +79,7 @@ export class MemoryPaymentOperations implements PaymentOperations {
   private readonly operations = new Map<string, PaymentOperation>()
   private readonly settleFlights = new Map<string, Promise<PaymentOperation>>()
   private readonly releaseFlights = new Map<string, Promise<PaymentOperation>>()
+  private readonly reclaimFlights = new Map<string, Promise<PaymentOperation>>()
   private readonly now: () => number
 
   constructor(private readonly options: MemoryPaymentOperationsOptions = {}) {
@@ -145,7 +146,17 @@ export class MemoryPaymentOperations implements PaymentOperations {
       if (current.settledAmount !== input.amount) throw new Error('payment operation has a different pending settlement')
       const flight = this.settleFlights.get(current.operationId)
       if (flight) return flight
-      return this.recoverSettlement(current, input)
+      const reclaimFlight = this.reclaimFlights.get(current.operationId)
+      if (reclaimFlight) return reclaimFlight
+      const recovery = this.recoverSettlement(current, input)
+      this.settleFlights.set(current.operationId, recovery)
+      try {
+        return await recovery
+      } finally {
+        if (this.settleFlights.get(current.operationId) === recovery) {
+          this.settleFlights.delete(current.operationId)
+        }
+      }
     } else if (current.state !== 'claimed') {
       throw new Error(`cannot settle payment in state ${current.state}`)
     }
@@ -174,6 +185,8 @@ export class MemoryPaymentOperations implements PaymentOperations {
     if (current.state === 'releasing') {
       const flight = this.releaseFlights.get(current.operationId)
       if (flight) return flight
+      const reclaimFlight = this.reclaimFlights.get(current.operationId)
+      if (reclaimFlight) return reclaimFlight
       return this.runRelease(current, reason)
     }
     if (current.state !== 'claimed') throw new Error(`cannot release payment in state ${current.state}`)
@@ -189,7 +202,9 @@ export class MemoryPaymentOperations implements PaymentOperations {
     if (current.state === 'settling') {
       const flight = this.settleFlights.get(operationId)
       if (flight) return flight
-      return this.recoverSettlement(current, {
+      const recoveryFlight = this.reclaimFlights.get(operationId)
+      if (recoveryFlight) return recoveryFlight
+      const recovery = this.recoverSettlement(current, {
         amount: current.settledAmount,
         totalCostUsd: 0,
         usage: {
@@ -202,24 +217,42 @@ export class MemoryPaymentOperations implements PaymentOperations {
           budgetEnforced: true,
         },
       })
+      this.reclaimFlights.set(operationId, recovery)
+      try {
+        return await recovery
+      } finally {
+        if (this.reclaimFlights.get(operationId) === recovery) this.reclaimFlights.delete(operationId)
+      }
     }
     if (current.state === 'releasing') {
       if (!this.options.onReclaim) throw new Error('payment release recovery is not configured')
-      await this.options.onReclaim(current)
-      const released = { ...current, state: 'released' as const }
-      this.operations.set(operationId, released)
-      return released
+      const releaseFlight = this.releaseFlights.get(operationId)
+      if (releaseFlight) return releaseFlight
+      const flight = this.reclaimFlights.get(operationId)
+      if (flight) return flight
+      const recovery = this.runReclaim(current, 'released')
+      this.reclaimFlights.set(operationId, recovery)
+      try {
+        return await recovery
+      } finally {
+        if (this.reclaimFlights.get(operationId) === recovery) this.reclaimFlights.delete(operationId)
+      }
     }
     if (current.state !== 'claiming' && current.state !== 'claimed' && current.state !== 'reclaimable') {
       throw new Error(`cannot reclaim payment in state ${current.state}`)
     }
+    const flight = this.reclaimFlights.get(operationId)
+    if (flight) return flight
     if (current.expiresAt > this.now()) throw new Error('payment operation has not expired')
     const reclaimable = { ...current, state: 'reclaimable' as const }
     this.operations.set(operationId, reclaimable)
-    await this.options.onReclaim?.(reclaimable)
-    const reclaimed = { ...reclaimable, state: 'reclaimed' as const }
-    this.operations.set(operationId, reclaimed)
-    return reclaimed
+    const recovery = this.runReclaim(reclaimable, 'reclaimed')
+    this.reclaimFlights.set(operationId, recovery)
+    try {
+      return await recovery
+    } finally {
+      if (this.reclaimFlights.get(operationId) === recovery) this.reclaimFlights.delete(operationId)
+    }
   }
 
   private async runSettlement(
@@ -251,6 +284,16 @@ export class MemoryPaymentOperations implements PaymentOperations {
     }
     this.operations.set(settling.operationId, settled)
     return settled
+  }
+
+  private async runReclaim(
+    operation: PaymentOperation,
+    finalState: 'released' | 'reclaimed',
+  ): Promise<PaymentOperation> {
+    await this.options.onReclaim?.(operation)
+    const recovered = { ...operation, state: finalState as PaymentOperationState }
+    this.operations.set(operation.operationId, recovered)
+    return recovered
   }
 
   private async runRelease(
