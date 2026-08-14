@@ -4,7 +4,7 @@ import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-stor
 /** Return the canonical opaque nonce key used by the final payment claim. */
 export function mppReplayNonceKey(authHeader: string): string | undefined {
   const decoded = decodeMppCredential(authHeader)
-  return decoded ? canonicalMppNonceKey(decoded.method, decoded.payload) : undefined
+  return decoded ? canonicalMppNonceKey(decoded.method, decoded.payload, decoded.credential) : undefined
 }
 
 /** Return the decoded MPP payload for a durable payment claim. */
@@ -44,8 +44,16 @@ function decodeMppCredential(authHeader: string): DecodedMppCredential | undefin
   }
 }
 
-function canonicalMppNonceKey(method: string, payload: Record<string, unknown>): string | undefined {
-  if (payload.nonce === undefined) return undefined
+function canonicalMppNonceKey(
+  method: string,
+  payload: Record<string, unknown>,
+  credential: string,
+): string {
+  if (payload.nonce === undefined) {
+    // Generic MPP methods may not expose a numeric nonce. The signed receipt
+    // itself is still the replay identity and must be claimed exactly once.
+    return `mpp:${method.toLowerCase()}:receipt:${Buffer.from(credential).toString('base64url')}`
+  }
   const nonce = BigInt(String(payload.nonce)).toString()
   const commitment = payload.commitment
   // BlueprinTEVM carries the same SpendAuth identity as x402. Keep one
@@ -112,7 +120,7 @@ export async function verifyX402(
     if (amount <= 0n || minimumAmount < 0n || amount < minimumAmount) return null
 
     const nonceKey = `${String(raw.commitment).toLowerCase()}:${nonce.toString()}`
-    if (nonceStore && await nonceStore.hasSeen(nonceKey)) return null
+    if (nonceStore?.hasSeen && await nonceStore.hasSeen(nonceKey)) return null
 
     if (config.verifySigner) {
       const verified = await config.verifySigner(raw, {
@@ -123,8 +131,8 @@ export async function verifyX402(
       return null
     }
 
-    // Check and mark only after the signature is accepted. Otherwise an
-    // invalid request can burn a valid payer nonce and deny the real request.
+    // Claim only after the signature is accepted. Otherwise invalid traffic
+    // can burn a valid payer nonce and deny the real request.
     if (nonceStore && markNonce) {
       const ttl = nonceTtlSeconds(expiry)
       if (ttl === undefined) return null
@@ -191,8 +199,8 @@ export async function verifyMpp(
       return null
     }
 
-    const nonceKey = nonceStore ? canonicalMppNonceKey(method, payload) ?? null : null
-    if (nonceKey && await nonceStore!.hasSeen(nonceKey)) return null
+    const nonceKey = canonicalMppNonceKey(method, payload, decoded)
+    if (nonceStore?.hasSeen && await nonceStore.hasSeen(nonceKey)) return null
 
     let consumerId: string | null = null
     if (config.verifySigner) {
@@ -211,13 +219,13 @@ export async function verifyMpp(
     }
     if (!consumerId) return null
 
-    if (nonceStore && payload.nonce !== undefined && markNonce) {
+    if (nonceStore && markNonce) {
       const expiry = payload.expiry === undefined
         ? BigInt(Math.floor(Date.now() / 1000) + 3600)
         : BigInt(String(payload.expiry))
       const ttl = nonceTtlSeconds(expiry)
       if (ttl === undefined) return null
-      const claimed = await claimStoredNonce(nonceStore, nonceKey!, ttl)
+      const claimed = await claimStoredNonce(nonceStore, nonceKey, ttl)
       if (!claimed) return null
     }
 

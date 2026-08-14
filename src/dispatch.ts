@@ -574,6 +574,9 @@ export async function claimPayment(
     }
     authz.paymentOperation = operation
   } else if (authz.paymentMethod === 'mpp') {
+    if (!authz.paymentNonceKey) {
+      throw new Error('MPP payment has no replay identity')
+    }
     const durablePayload = durableMppPaymentPayload(authz.paymentPayload)
     if (durablePayload && config.x402.paymentOperations) {
       const context = {
@@ -591,26 +594,24 @@ export async function claimPayment(
       authz.paymentPayload = durablePayload
       authz.paymentOperation = operation
       authz.paymentOperationAcquired = true
-      if (authz.paymentNonceKey) {
-        const claimed = await claimPaymentNonce(
-          state.nonceStore,
-          authz.paymentNonceKey,
-          durablePayload,
-          `${operation.operationId}:${context.requestId}`,
-        )
-        if (!claimed) {
-          try {
-            await config.x402.paymentOperations.releasePayment(operation, 'shared payment nonce was already owned')
-          } catch (releaseError) {
-            console.error(
-              `[agent-gateway] payment release failed for ${authz.requestId}:`,
-              releaseError instanceof Error ? releaseError.message : String(releaseError),
-            )
-          }
-          throw new Error('payment nonce was already consumed')
+      const claimed = await claimPaymentNonce(
+        state.nonceStore,
+        authz.paymentNonceKey,
+        durablePayload,
+        `${operation.operationId}:${context.requestId}`,
+      )
+      if (!claimed) {
+        try {
+          await config.x402.paymentOperations.releasePayment(operation, 'shared payment nonce was already owned')
+        } catch (releaseError) {
+          console.error(
+            `[agent-gateway] payment release failed for ${authz.requestId}:`,
+            releaseError instanceof Error ? releaseError.message : String(releaseError),
+          )
         }
+        throw new Error('payment nonce was already consumed')
       }
-    } else if (authz.paymentNonceKey) {
+    } else {
       const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
       if (!claimed) throw new Error('payment nonce was already consumed')
     }

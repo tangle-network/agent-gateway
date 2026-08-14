@@ -557,9 +557,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
   it('durably claims an x402-compatible MPP receipt and rejects its replay', async () => {
     const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
     const nonceStore: NonceStore = {
-      hasSeen: async () => false,
       claim: async () => true,
-      markSeen: async () => undefined,
     }
     const credential = Buffer.from(JSON.stringify({
       payload: {
@@ -603,6 +601,53 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(first.status).toBe(200)
     expect(second.status).toBe(402)
     expect(operations.get('x402:0xcommitmentalice:901')?.state).toBe('settled')
+  })
+
+  it('claims an identical generic MPP receipt without a payload nonce only once', async () => {
+    let executions = 0
+    const credential = Buffer.from(JSON.stringify({ receiptId: 'receipt-1' })).toString('base64url')
+    const { app, settlements } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          executions += 1
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'generic' } }
+          yield {
+            type: 'sandbox.usage',
+            data: {
+              usage: {
+                inputTokens: 1,
+                outputTokens: 1,
+                reasoningTokens: 0,
+                toolTokens: 0,
+                toolCallCount: 0,
+                providerCostUsd: 0,
+                budgetEnforced: true,
+              },
+            },
+          }
+        },
+      }),
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:consumer',
+      },
+    })
+    const request = () => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const responses = await Promise.all([request(), request()])
+    await Promise.all(responses.map((response) => response.text()))
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
+    expect(executions).toBe(1)
+    expect(settlements).toHaveLength(1)
   })
 
   it('requires complete receipts only for requests with durable payment ownership', async () => {

@@ -4,16 +4,14 @@
  */
 
 export interface NonceStore {
-  /** Check if nonce has been seen. Returns true if already used (reject). */
-  hasSeen(nonce: string): Promise<boolean>
+  /** Optional observation. This method never grants ownership. */
+  hasSeen?(nonce: string): Promise<boolean>
   /**
    * Atomically claim a nonce. An owner id makes a retry by the same payment
-   * operation idempotent while a legacy claim still fails closed. Version 1
-   * stores can omit this method and retain their prior check-then-mark path.
+   * operation idempotent. Calls without an owner id use first-writer-wins
+   * semantics for legacy payment authorization.
    */
-  claim?(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
-  /** Mark nonce as used. TTL = how long to remember it (seconds). */
-  markSeen(nonce: string, ttlSeconds: number): Promise<void>
+  claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
 }
 
 /**
@@ -62,11 +60,6 @@ export class MemoryNonceStore implements NonceStore {
     return true
   }
 
-  async markSeen(nonce: string, ttlSeconds: number): Promise<void> {
-    this.seen.set(nonce, { expiresAt: Date.now() + ttlSeconds * 1000 })
-    this.evictExpired()
-  }
-
   private evictExpired() {
     const now = Date.now()
     // Evict at most every 60 seconds to avoid O(n) on every request
@@ -90,7 +83,7 @@ export class MemoryNonceStore implements NonceStore {
 export interface KVNamespace {
   get(key: string, options?: { type?: 'text' | 'json' }): Promise<string | null>
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>
-  /** Optional atomic extension. Cloudflare KV does not provide this method. */
+  /** Linearizable create-if-absent extension. Cloudflare KV does not provide it. */
   putIfAbsent?(key: string, value: string, options?: { expirationTtl?: number }): Promise<boolean>
   delete(key: string): Promise<void>
 }
@@ -102,7 +95,7 @@ export interface KVNamespace {
  * Cloudflare routes requests across multiple isolates. Without shared state,
  * an attacker could retry a replayed nonce against a different isolate and
  * have it accepted. Version 2 requires an atomic binding for payment claims.
- * This store keeps the nonce only for legacy replay protection.
+ * This store requires an atomic binding for every payment claim.
  *
  * Usage:
  *   const nonceStore = new KvNonceStore(env.NONCE_KV, 'x402')
@@ -116,18 +109,12 @@ export class KvNonceStore implements NonceStore {
   ) {}
 
   async hasSeen(nonce: string): Promise<boolean> {
-    const value = await this.kv.get(this.key(nonce))
-    return value !== null
+    return (await this.kv.get(this.key(nonce))) !== null
   }
 
   async claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean> {
     if (!this.kv.putIfAbsent) {
-      if (ownerId !== undefined) {
-        throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
-      }
-      if (await this.hasSeen(nonce)) return false
-      await this.markSeen(nonce, ttlSeconds)
-      return true
+      throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
     }
     const ttl = Math.max(ttlSeconds, 60)
     const key = this.key(nonce)
@@ -143,29 +130,20 @@ export class KvNonceStore implements NonceStore {
     return (await this.kv.get(key)) === ownerId
   }
 
-  async markSeen(nonce: string, ttlSeconds: number): Promise<void> {
-    // KV minimum TTL is 60 seconds
-    const ttl = Math.max(ttlSeconds, 60)
-    await this.kv.put(this.key(nonce), '1', { expirationTtl: ttl })
-  }
-
   private key(nonce: string): string {
     return `${this.prefix}:${nonce}`
   }
 }
 
-/** Claim through a version 2 store or preserve the version 1 store contract. */
+/** Claim through the single atomic nonce-ownership contract. */
 export async function claimStoredNonce(
   store: NonceStore,
   nonce: string,
   ttlSeconds: number,
   ownerId?: string,
 ): Promise<boolean> {
-  if (store.claim) return store.claim(nonce, ttlSeconds, ownerId)
-  if (ownerId !== undefined) {
-    throw new Error('NonceStore.claim is required for version 2 payment ownership')
+  if (typeof store.claim !== 'function') {
+    throw new Error('NonceStore.claim is required for payment replay protection')
   }
-  if (await store.hasSeen(nonce)) return false
-  await store.markSeen(nonce, ttlSeconds)
-  return true
+  return store.claim(nonce, ttlSeconds, ownerId)
 }

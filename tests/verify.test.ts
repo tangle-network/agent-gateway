@@ -98,12 +98,10 @@ describe('verifyX402', () => {
   it('retains a nonce until its signed expiry, beyond the old one-hour cap', async () => {
     const ttls: number[] = []
     const nonceStore: NonceStore = {
-      hasSeen: async () => false,
       claim: async (_nonce, ttlSeconds) => {
         ttls.push(ttlSeconds)
         return true
       },
-      markSeen: async () => undefined,
     }
     const now = Math.floor(Date.now() / 1000)
     const result = await verifyX402(
@@ -117,16 +115,13 @@ describe('verifyX402', () => {
     expect(ttls[0]).toBeLessThanOrEqual(7200)
   })
 
-  it('keeps version 1 custom nonce stores source-compatible', async () => {
-    const seen = new Set<string>()
-    const nonceStore: NonceStore = {
-      hasSeen: async (nonce) => seen.has(nonce),
-      markSeen: async (nonce) => { seen.add(nonce) },
-    }
-    const payload = buildSpendAuth({ nonce: '101' })
+  it('fails closed for a custom nonce store without an atomic claim', async () => {
+    const nonceStore = {
+      hasSeen: async () => false,
+      markSeen: async () => undefined,
+    } as unknown as NonceStore
 
-    expect(await verifyX402(payload, baseConfig, nonceStore)).toBe('0xCommitmentAlice')
-    expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
+    expect(await verifyX402(buildSpendAuth({ nonce: '101' }), baseConfig, nonceStore)).toBeNull()
   })
 
   it('isolates nonces per commitment — regression: commitment-less nonce tracking lets Alice replay Bob\'s nonce', async () => {
