@@ -368,4 +368,72 @@ describe('final payment boundary protocol guards', () => {
       .map((store) => store.get(`x402:${commitment}:32`)?.state)
       .sort()).toEqual(['released', 'settled'])
   })
+
+  it('does not let an idempotent retry release the payment owner', async () => {
+    const nonceStore = new MemoryNonceStore()
+    let settlements = 0
+    let releases = 0
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { settlements += 1 },
+      onRelease: async () => { releases += 1 },
+    })
+    let operationPromise: ReturnType<typeof operations.claimPayment> | undefined
+    let authorizations = 0
+    let releaseAuthorizations!: () => void
+    const authorizationsReleased = new Promise<void>((resolve) => { releaseAuthorizations = resolve })
+    let runStarted!: () => void
+    const sandboxStarted = new Promise<void>((resolve) => { runStarted = resolve })
+    let finishRun!: () => void
+    const runReleased = new Promise<void>((resolve) => { finishRun = resolve })
+    let runs = 0
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          runs += 1
+          runStarted()
+          await runReleased
+          yield* box().streamPrompt('run')
+        },
+      }),
+      recordUsage: async () => undefined,
+      nonceStore,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+        authorizePayment: async (payload, context) => {
+          operationPromise ??= operations.claimPayment(payload, context)
+          const operation = await operationPromise
+          authorizations += 1
+          if (authorizations === 2) releaseAuthorizations()
+          await authorizationsReleased
+          return operation
+        },
+      },
+    }))
+    const request = () => app.request('/v1/agents/guards/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('33') },
+      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }] }),
+    })
+    const requests = [request(), request()]
+    await sandboxStarted
+    const loser = await Promise.race(requests)
+    expect(loser.status).toBe(402)
+    expect(operations.get(`x402:${commitment}:33`)?.state).toBe('claimed')
+    expect(releases).toBe(0)
+
+    finishRun()
+    const responses = await Promise.all(requests)
+    await Promise.all(responses.map((response) => response.text()))
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
+    expect(runs).toBe(1)
+    expect(settlements).toBe(1)
+    expect(releases).toBe(0)
+    expect(operations.get(`x402:${commitment}:33`)?.state).toBe('settled')
+  })
 })

@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
 
-import { InMemoryTaskStore } from '../src/a2a/task-store'
+import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryPaymentOperations } from '../src/payment-operations'
@@ -244,6 +244,239 @@ describe('A2A payment ownership races', () => {
     expect(body.result?.status?.state).toBe('canceled')
     expect((await taskStore.get('task-sync-cancel'))?.status.state).toBe('canceled')
     expect(operations.get(`x402:${commitment}:75`)?.state).toBe('claimed')
+  })
+
+  it('settles when cancellation wins the final task update', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let finalizationSeen!: () => void
+    const finalizationReady = new Promise<void>((resolve) => { finalizationSeen = resolve })
+    let releaseFinalization!: () => void
+    const finalizationReleased = new Promise<void>((resolve) => { releaseFinalization = resolve })
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        if (next.metadata?.gatewayFinalizing === true) {
+          finalizationSeen()
+          await finalizationReleased
+        }
+        return innerStore.compareAndSet(expected, next)
+      },
+    }
+    let settlements = 0
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { settlements += 1 },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('78') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-finalization-cancel') },
+      }),
+    })
+    await finalizationReady
+
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-finalization-cancel' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseFinalization()
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(settlements).toBe(1)
+    expect(operations.get(`x402:${commitment}:78`)?.state).toBe('settled')
+  })
+
+  it('settles a stream when cancellation wins the final task update', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let cancellationStored!: () => void
+    const cancellationReady = new Promise<void>((resolve) => { cancellationStored = resolve })
+    let releaseCancellation!: () => void
+    const cancellationReleased = new Promise<void>((resolve) => { releaseCancellation = resolve })
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        const transitioned = await innerStore.compareAndSet(expected, next)
+        if (transitioned && next.status.state === 'canceled') {
+          cancellationStored()
+          await cancellationReleased
+        }
+        return transitioned
+      },
+    }
+    let sandboxDrained!: () => void
+    const sandboxReady = new Promise<void>((resolve) => { sandboxDrained = resolve })
+    let releaseSandbox!: () => void
+    const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+    let settlements = 0
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { settlements += 1 },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+          sandboxDrained()
+          await sandboxReleased
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const stream = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('80') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: { message: message('run', 'task-stream-finalization-cancel') },
+      }),
+    })
+    const reader = stream.body!.getReader()
+    await sandboxReady
+
+    const cancelPromise = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-stream-finalization-cancel' },
+      }),
+    })
+    await cancellationReady
+    releaseSandbox()
+    let wire = ''
+    const decoder = new TextDecoder()
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      wire += decoder.decode(chunk.value, { stream: true })
+    }
+    releaseCancellation()
+    const cancel = await cancelPromise
+
+    expect(cancel.status).toBe(200)
+    expect(wire).toContain('"state":"canceled"')
+    expect(settlements).toBe(1)
+    expect(operations.get(`x402:${commitment}:80`)?.state).toBe('settled')
+  })
+
+  it('returns after cancel when a sandbox stops emitting events', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const operations = new MemoryPaymentOperations()
+    let outputSeen!: () => void
+    const outputReady = new Promise<void>((resolve) => { outputSeen = resolve })
+    const never = new Promise<void>(() => undefined)
+    let sandboxSignal: AbortSignal | undefined
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt(_message, opts) {
+          sandboxSignal = opts?.signal
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          outputSeen()
+          await never
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('79') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-silent-cancel') },
+      }),
+    })
+    await outputReady
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-silent-cancel' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    const response = await Promise.race([
+      send,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('send did not cancel')), 100)),
+    ])
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(sandboxSignal?.aborted).toBe(true)
+    expect(operations.get(`x402:${commitment}:79`)?.state).toBe('claimed')
   })
 
   it('retains ownership when cancellation follows delivered output without a receipt', async () => {
