@@ -146,7 +146,7 @@ export function createA2AHandlers(deps: A2AHandlerDeps) {
 
     switch (parsed.method) {
       case 'message/send':
-        return handleMessageSend(c, slug, parsed, deps)
+        return handleMessageSend(c, slug, parsed, deps, cancels)
       case 'message/stream':
         return handleMessageStream(c, slug, parsed, deps, cancels)
       case 'tasks/get':
@@ -180,15 +180,39 @@ async function handleMessageSend(
   slug: string,
   req: JSONRPCRequest,
   deps: A2AHandlerDeps,
+  cancels: CancelRegistry,
 ): Promise<Response> {
   const guard = await guardMessageRequest(c, slug, req, deps)
   if (guard instanceof Response) return guard
   const { authz, task } = guard
+  const controller = cancels.register(task.id)
+  try {
+    return await executeMessageSend(c, req, deps, authz, task, controller.signal)
+  } finally {
+    cancels.clear(task.id)
+  }
+}
+
+async function executeMessageSend(
+  c: Context,
+  req: JSONRPCRequest,
+  deps: A2AHandlerDeps,
+  authz: AuthorizedRequest,
+  task: Task,
+  signal: AbortSignal,
+): Promise<Response> {
   const workingTask: Task = task.status.state === 'working'
     ? task
     : { ...task, status: { state: 'working', timestamp: nowIso() } }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
     await releaseOwnedPayment(authz, deps, 'A2A task changed before execution started')
+    if (signal.aborted) {
+      const canceled = await deps.taskStore.get(task.id)
+      if (canceled?.status.state === 'canceled') {
+        await maybeDeliverPush(canceled, deps)
+        return c.json(ok(req.id, canceled))
+      }
+    }
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' changed before execution`))
   }
 
@@ -203,7 +227,7 @@ async function handleMessageSend(
       authz.userMessage,
       authz.consumerId,
       deps.config,
-      undefined,
+      signal,
       task.id,
       authz.maxOutputTokens,
     )) {
@@ -249,12 +273,36 @@ async function handleMessageSend(
     )
   }
 
+  if (signal.aborted) {
+    const canceled = await completeCanceledTask(
+      authz,
+      workingTask,
+      responseText,
+      usage,
+      workObserved,
+      deps,
+    )
+    return c.json(ok(req.id, canceled))
+  }
+
   // Settle for the work done so far before short-circuiting on input-required.
   // The user has been charged for the partial response, which is the right
   // commercial behavior — the sandbox produced tokens.
   try {
     if (!usage) throw new Error('sandbox did not provide a usage receipt')
     if (!await claimTaskFinalization(deps.taskStore, workingTask)) {
+      const currentTask = await deps.taskStore.get(task.id)
+      if (currentTask?.status.state === 'canceled') {
+        const canceled = await completeCanceledTask(
+          authz,
+          currentTask,
+          responseText,
+          usage,
+          workObserved,
+          deps,
+        )
+        return c.json(ok(req.id, canceled))
+      }
       throw new Error('A2A task changed before payment settlement')
     }
     await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
@@ -386,23 +434,37 @@ async function handleMessageStream(
         // exists; otherwise retain ownership when output or hidden work was
         // observed because releasing would make paid work free.
         if (controller.signal.aborted) {
-          if (usage) {
-            try {
-              await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
-            } catch (settlementError) {
-              console.error(
-                `[a2a] canceled task settlement retained for ${authz.requestId}:`,
-                settlementError instanceof Error ? settlementError.message : String(settlementError),
-              )
-            }
-          } else {
-            await releaseOrRetainPayment(authz, deps, 'a2a task canceled', workObserved || usage !== undefined)
-          }
-          const canceled = withStatus(task, 'canceled', undefined, [
-            responseTextToArtifact(responseText, `${task.id}-artifact-0`),
-          ])
-          try {
-            await deps.taskStore.put(canceled)
+          const canceled = await completeCanceledTask(
+            authz,
+            workingTask,
+            responseText,
+            usage,
+            workObserved,
+            deps,
+          )
+          send({
+            kind: 'status-update',
+            taskId: task.id,
+            contextId: task.contextId,
+            status: canceled.status,
+            final: true,
+          })
+          return
+        }
+
+        // Settle once for whatever the sandbox produced (full or partial).
+        if (!usage) throw new Error('sandbox did not provide a usage receipt')
+        if (!cancels.beginFinalization(task.id) || !await claimTaskFinalization(deps.taskStore, workingTask)) {
+          const currentTask = await deps.taskStore.get(task.id)
+          if (currentTask?.status.state === 'canceled') {
+            const canceled = await completeCanceledTask(
+              authz,
+              currentTask,
+              responseText,
+              usage,
+              workObserved,
+              deps,
+            )
             send({
               kind: 'status-update',
               taskId: task.id,
@@ -410,19 +472,8 @@ async function handleMessageStream(
               status: canceled.status,
               final: true,
             })
-            await maybeDeliverPush(canceled, deps)
-          } catch (taskError) {
-            console.error(
-              `[a2a] failed to persist canceled task ${task.id}:`,
-              taskError instanceof Error ? taskError.message : String(taskError),
-            )
+            return
           }
-          return
-        }
-
-        // Settle once for whatever the sandbox produced (full or partial).
-        if (!usage) throw new Error('sandbox did not provide a usage receipt')
-        if (!cancels.beginFinalization(task.id) || !await claimTaskFinalization(deps.taskStore, workingTask)) {
           await releaseOrRetainPayment(
             authz,
             deps,
@@ -953,6 +1004,41 @@ async function releaseOrRetainPayment(
       releaseError instanceof Error ? releaseError.message : String(releaseError),
     )
   }
+}
+
+async function completeCanceledTask(
+  authz: AuthorizedRequest,
+  task: Task,
+  responseText: string,
+  usage: SandboxUsageReceipt | undefined,
+  workObserved: boolean,
+  deps: A2AHandlerDeps,
+): Promise<Task> {
+  if (usage) {
+    try {
+      await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
+    } catch (settlementError) {
+      console.error(
+        `[a2a] canceled task settlement retained for ${authz.requestId}:`,
+        settlementError instanceof Error ? settlementError.message : String(settlementError),
+      )
+    }
+  } else {
+    await releaseOrRetainPayment(authz, deps, 'a2a task canceled', workObserved)
+  }
+  const currentTask = await deps.taskStore.get(task.id)
+  const canceledBase = currentTask?.status.state === 'canceled'
+    ? currentTask
+    : withStatus(task, 'canceled')
+  const canceled: Task = responseText
+    ? {
+        ...canceledBase,
+        artifacts: [responseTextToArtifact(responseText, `${task.id}-artifact-0`)],
+      }
+    : canceledBase
+  await deps.taskStore.put(canceled)
+  await maybeDeliverPush(canceled, deps)
+  return canceled
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

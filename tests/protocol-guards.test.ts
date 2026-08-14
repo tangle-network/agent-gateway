@@ -312,4 +312,60 @@ describe('final payment boundary protocol guards', () => {
     expect(legacyResponse.status).toBe(200)
     expect(operations.get(`x402:${commitment}:5`)).toBeUndefined()
   })
+
+  it('lets only one separately configured version 2 gateway own a payment', async () => {
+    const nonceStore = new MemoryNonceStore()
+    let claimsReady = 0
+    let releaseClaims!: () => void
+    const claimsReleased = new Promise<void>((resolve) => { releaseClaims = resolve })
+    let runs = 0
+    let settlements = 0
+    const stores = [
+      new MemoryPaymentOperations({ onSettle: async () => { settlements += 1 } }),
+      new MemoryPaymentOperations({ onSettle: async () => { settlements += 1 } }),
+    ]
+    const apps = stores.map((operations) => {
+      const app = new Hono()
+      app.route('/v1/agents', createAgentGateway({
+        resolveAgent: async () => agent,
+        getSandbox: async () => ({
+          async *streamPrompt() {
+            runs += 1
+            yield* box().streamPrompt('run')
+          },
+        }),
+        recordUsage: async () => undefined,
+        nonceStore,
+        x402: {
+          operatorAddress,
+          chainId: 1,
+          demoMode: true,
+          paymentProtocolVersion: 2,
+          paymentOperations: operations,
+          authorizePayment: async (payload, context) => {
+            const operation = await operations.claimPayment(payload, context)
+            claimsReady += 1
+            if (claimsReady === 2) releaseClaims()
+            await claimsReleased
+            return operation
+          },
+        },
+      }))
+      return app
+    })
+
+    const responses = await Promise.all(apps.map((app) => app.request('/v1/agents/guards/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('32') },
+      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }] }),
+    })))
+    await Promise.all(responses.map((response) => response.text()))
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
+    expect(runs).toBe(1)
+    expect(settlements).toBe(1)
+    expect(stores
+      .map((store) => store.get(`x402:${commitment}:32`)?.state)
+      .sort()).toEqual(['released', 'settled'])
+  })
 })

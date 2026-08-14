@@ -17,6 +17,8 @@ export type PaymentOperationState =
 export interface PaymentOperation {
   protocolVersion: typeof PAYMENT_PROTOCOL_VERSION
   operationId: string
+  /** Request that atomically created this operation. Idempotent reads retain the original value. */
+  acquiredByRequestId: string
   nonceKey: string
   authorizationId: string
   reservedAmount: bigint
@@ -112,6 +114,7 @@ export class MemoryPaymentOperations implements PaymentOperations {
     const operation: PaymentOperation = {
       protocolVersion: PAYMENT_PROTOCOL_VERSION,
       operationId,
+      acquiredByRequestId: context.requestId,
       nonceKey,
       authorizationId: typeof payload.authHash === 'string' ? payload.authHash : operationId,
       reservedAmount,

@@ -245,6 +245,7 @@ export interface SandboxBox {
       systemPrompt?: string
       maxOutputTokens?: number
       executionBudget?: SandboxExecutionBudget
+      signal?: AbortSignal
     },
   ): AsyncIterable<SandboxStreamEvent>
 }

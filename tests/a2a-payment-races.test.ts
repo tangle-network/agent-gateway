@@ -183,6 +183,69 @@ describe('A2A payment ownership races', () => {
     expect(finalTask?.history).toHaveLength(2)
   })
 
+  it('returns a canceled synchronous task without losing payment ownership', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const operations = new MemoryPaymentOperations()
+    let outputSeen!: () => void
+    const outputReady = new Promise<void>((resolve) => { outputSeen = resolve })
+    let releaseSandbox!: () => void
+    const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          outputSeen()
+          await sandboxReleased
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('75') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-sync-cancel') },
+      }),
+    })
+    await outputReady
+
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-sync-cancel' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseSandbox()
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect((await taskStore.get('task-sync-cancel'))?.status.state).toBe('canceled')
+    expect(operations.get(`x402:${commitment}:75`)?.state).toBe('claimed')
+  })
+
   it('retains ownership when cancellation follows delivered output without a receipt', async () => {
     const taskStore = new InMemoryTaskStore()
     const operations = new MemoryPaymentOperations()

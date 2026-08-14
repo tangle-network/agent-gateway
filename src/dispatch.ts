@@ -22,6 +22,7 @@ import type {
   GatewayConfig,
   PaymentMethod,
   SandboxExecutionBudget,
+  SandboxStreamEvent,
   SandboxUsageReceipt,
 } from './types'
 import {
@@ -65,6 +66,7 @@ export interface AuthorizedRequest {
   paymentPayload: Record<string, unknown> | null
   paymentNonceKey?: string
   paymentOperation?: PaymentOperation
+  paymentOperationAcquired?: boolean
 }
 
 function decimalFraction(value: number): { numerator: bigint; denominator: bigint } {
@@ -543,12 +545,18 @@ export async function claimPayment(
     if (operation && !config.x402.paymentOperations) {
       throw new Error('durable payment operations are required to settle a claimed operation')
     }
+    if (operation) {
+      authz.paymentOperationAcquired = operation.acquiredByRequestId === context.requestId
+      if (!authz.paymentOperationAcquired) {
+        throw new Error('payment operation was already claimed')
+      }
+    }
     if (operation && authz.paymentNonceKey) {
       const claimed = await claimPaymentNonce(
         state.nonceStore,
         authz.paymentNonceKey,
         authz.paymentPayload,
-        operation.operationId,
+        `${operation.operationId}:${context.requestId}`,
       )
       if (!claimed) {
         try {
@@ -596,7 +604,7 @@ export async function releasePayment(
   config: GatewayConfig,
   reason: string,
 ): Promise<void> {
-  if (!authz.paymentOperation || !config.x402.paymentOperations) return
+  if (!authz.paymentOperation || authz.paymentOperationAcquired !== true || !config.x402.paymentOperations) return
   await config.x402.paymentOperations.releasePayment(authz.paymentOperation, reason)
 }
 
@@ -735,9 +743,17 @@ export async function* dispatchSandboxStreamRich(
     systemPrompt: agent.systemPrompt,
     maxOutputTokens: outputLimit,
     executionBudget,
+    signal,
   })
-  for await (const event of promptStream) {
-    if (signal?.aborted) return
+  const iterator = promptStream[Symbol.asyncIterator]()
+  while (true) {
+    const next = await readSandboxEvent(iterator, signal)
+    if (next === ABORTED_SANDBOX_READ) {
+      closeSandboxIterator(iterator)
+      return
+    }
+    if (next.done) break
+    const event = next.value
     if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
     if (event.data?.reasoning?.tokens !== undefined) {
       observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
@@ -803,6 +819,39 @@ export async function* dispatchSandboxStreamRich(
     config.x402.paymentOperations !== undefined,
   )
   yield { kind: 'usage', usage }
+}
+
+const ABORTED_SANDBOX_READ = Symbol('aborted-sandbox-read')
+
+async function readSandboxEvent(
+  iterator: AsyncIterator<SandboxStreamEvent>,
+  signal?: AbortSignal,
+): Promise<IteratorResult<SandboxStreamEvent> | typeof ABORTED_SANDBOX_READ> {
+  if (!signal) return iterator.next()
+  if (signal.aborted) return ABORTED_SANDBOX_READ
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED_SANDBOX_READ)
+    signal.addEventListener('abort', onAbort, { once: true })
+    iterator.next().then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(result)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+  })
+}
+
+function closeSandboxIterator(iterator: AsyncIterator<SandboxStreamEvent>): void {
+  try {
+    const closing = iterator.return?.()
+    if (closing) void Promise.resolve(closing).catch(() => undefined)
+  } catch {
+    // The request is already canceled. Adapter cleanup must not delay it.
+  }
 }
 
 /**
