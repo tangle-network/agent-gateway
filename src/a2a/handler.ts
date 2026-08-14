@@ -454,7 +454,10 @@ async function handleMessageStream(
 
         // Settle once for whatever the sandbox produced (full or partial).
         if (!usage) throw new Error('sandbox did not provide a usage receipt')
-        if (!cancels.beginFinalization(task.id) || !await claimTaskFinalization(deps.taskStore, workingTask)) {
+        // Let the durable task-store CAS decide the cancellation race. Mark
+        // the local registry only after that CAS wins, so cancel can replace a
+        // still-pending finalization instead of being rejected prematurely.
+        if (!await claimTaskFinalization(deps.taskStore, workingTask)) {
           const currentTask = await deps.taskStore.get(task.id)
           if (currentTask?.status.state === 'canceled') {
             const canceled = await completeCanceledTask(
@@ -482,6 +485,7 @@ async function handleMessageStream(
           )
           return
         }
+        cancels.beginFinalization(task.id)
         await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs)
 
         if (inputRequiredSeen) {

@@ -9,6 +9,7 @@ export default defineConfig({
     'src/publish.ts',
     'src/rate-limit.ts',
     'src/nonce-store.ts',
+    'src/observer.ts',
   ],
   format: ['esm'],
   dts: true,
