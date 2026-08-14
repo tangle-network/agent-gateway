@@ -83,6 +83,9 @@ export class MemoryPaymentOperations implements PaymentOperations {
   private readonly now: () => number
 
   constructor(private readonly options: MemoryPaymentOperationsOptions = {}) {
+    if (options.onClaim && !options.onReclaim) {
+      throw new Error('onReclaim is required when onClaim can reserve external funds')
+    }
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000))
   }
 
@@ -185,9 +188,7 @@ export class MemoryPaymentOperations implements PaymentOperations {
     if (current.state === 'releasing') {
       const flight = this.releaseFlights.get(current.operationId)
       if (flight) return flight
-      const reclaimFlight = this.reclaimFlights.get(current.operationId)
-      if (reclaimFlight) return reclaimFlight
-      return this.runRelease(current, reason)
+      return this.reclaimPayment(current.operationId)
     }
     if (current.state !== 'claimed') throw new Error(`cannot release payment in state ${current.state}`)
     const releasing = { ...current, state: 'releasing' as const }

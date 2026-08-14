@@ -138,6 +138,109 @@ describe('final payment boundary protocol guards', () => {
     expect(claims).toBe(0)
   })
 
+  it('rejects a continuation before it can mutate another caller task', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const paused: Task = {
+      kind: 'task',
+      id: 'victim-task',
+      contextId: 'victim-context',
+      status: { state: 'input-required', timestamp: new Date().toISOString() },
+      history: [],
+    }
+    await taskStore.put(paused)
+    let sandboxRuns = 0
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxRuns += 1
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'work' } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      settlePayment: async () => undefined,
+      verifyApiKey: async () => ({ consumerId: 'intruder', keyId: 'intruder', scopes: ['chat'] }),
+      x402: { operatorAddress, chainId: 1, demoMode: true },
+      a2a: {
+        taskStore,
+        authorizeTaskAccess: async (_task, context) => context.authorization === 'Bearer owner',
+      },
+    }))
+
+    const response = await app.request('/v1/agents/guards', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer intruder' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: paused.id,
+            parts: [{ kind: 'text', text: 'continue as attacker' }],
+          },
+        },
+      }),
+    })
+
+    expect(response.status).toBe(403)
+    const body = await response.json() as { error?: { code: number } }
+    expect(body.error?.code).toBe(A2A_ERROR_CODES.TASK_ACCESS_DENIED)
+    expect(sandboxRuns).toBe(0)
+    expect(await taskStore.get(paused.id)).toEqual(paused)
+  })
+
+  it('keeps a paused task retryable when continuation payment fails', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const paused: Task = {
+      kind: 'task',
+      id: 'paused-payment-task',
+      contextId: 'paused-context',
+      status: { state: 'input-required', timestamp: new Date().toISOString() },
+      history: [],
+    }
+    await taskStore.put(paused)
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
+      resolveAgent: async () => agent,
+      getSandbox: async () => box(),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 1,
+        authorizePayment: async () => false,
+      },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }))
+
+    const response = await app.request('/v1/agents/guards', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('31') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: paused.id,
+            parts: [{ kind: 'text', text: 'retry' }],
+          },
+        },
+      }),
+    })
+
+    const body = await response.json() as { error?: { code: number } }
+    expect(body.error?.code).toBe(A2A_ERROR_CODES.INTERNAL_ERROR)
+    expect(await taskStore.get(paused.id)).toEqual(paused)
+  })
+
   it('shares one canonical nonce authority across mixed verifier versions', async () => {
     const store = new MemoryNonceStore()
     const config = { operatorAddress, chainId: 1, demoMode: true }

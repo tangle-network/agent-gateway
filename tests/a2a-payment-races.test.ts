@@ -58,6 +58,76 @@ function usage() {
 }
 
 describe('A2A payment ownership races', () => {
+  it('does not execute a continuation canceled during payment authorization', async () => {
+    const taskStore = new InMemoryTaskStore()
+    await taskStore.put({
+      kind: 'task',
+      id: 'task-payment-cancel',
+      contextId: 'ctx-race',
+      status: { state: 'input-required', timestamp: new Date().toISOString() },
+      history: [message('initial', 'task-payment-cancel')],
+    })
+    let authorizeEntered!: () => void
+    const authorizationStarted = new Promise<void>((resolve) => { authorizeEntered = resolve })
+    let finishAuthorization!: () => void
+    const authorizationReleased = new Promise<void>((resolve) => { finishAuthorization = resolve })
+    let runs = 0
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          runs += 1
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 1,
+        authorizePayment: async () => {
+          authorizeEntered()
+          await authorizationReleased
+          return true
+        },
+      },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const continuation = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('76') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('continue', 'task-payment-cancel') },
+      }),
+    })
+    await authorizationStarted
+
+    const canceled = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-payment-cancel' },
+      }),
+    })
+    expect(canceled.status).toBe(200)
+    finishAuthorization()
+    const response = await continuation
+    const body = await response.json() as { error?: { code?: number } }
+
+    expect(body.error?.code).toBe(-32602)
+    expect(runs).toBe(0)
+    expect((await taskStore.get('task-payment-cancel'))?.status.state).toBe('canceled')
+  })
+
   it('allows only one concurrent continuation to claim and settle a task', async () => {
     const taskStore = new InMemoryTaskStore()
     await taskStore.put({

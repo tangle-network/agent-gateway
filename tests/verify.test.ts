@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { verifyX402, verifyMpp, defaultVerifyApiKey } from '../src/verify'
-import { MemoryNonceStore } from '../src/nonce-store'
+import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import type { X402Config, MppConfig } from '../src/types'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
@@ -78,6 +78,18 @@ describe('verifyX402', () => {
 
     const second = await verifyX402(payload, baseConfig, nonceStore)
     expect(second).toBeNull()
+  })
+
+  it('keeps version 1 custom nonce stores source-compatible', async () => {
+    const seen = new Set<string>()
+    const nonceStore: NonceStore = {
+      hasSeen: async (nonce) => seen.has(nonce),
+      markSeen: async (nonce) => { seen.add(nonce) },
+    }
+    const payload = buildSpendAuth({ nonce: '101' })
+
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBe('0xCommitmentAlice')
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
   })
 
   it('isolates nonces per commitment — regression: commitment-less nonce tracking lets Alice replay Bob\'s nonce', async () => {

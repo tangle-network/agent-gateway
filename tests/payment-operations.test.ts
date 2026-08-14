@@ -124,6 +124,32 @@ describe('version 2 payment operations', () => {
     expect(recovered.state).toBe('released')
   })
 
+  it('reconciles an ambiguous release without repeating its side effect', async () => {
+    let releases = 0
+    let recoveries = 0
+    const operations = new MemoryPaymentOperations({
+      onRelease: async () => {
+        releases += 1
+        throw new Error('acknowledgement lost')
+      },
+      onReclaim: async () => { recoveries += 1 },
+    })
+    const owner = await operations.claimPayment(payload('1000', '21'), context())
+
+    await expect(operations.releasePayment(owner, 'sandbox failed')).rejects.toThrow('acknowledgement lost')
+    const recovered = await operations.releasePayment(owner, 'retry release')
+
+    expect(recovered.state).toBe('released')
+    expect(releases).toBe(1)
+    expect(recoveries).toBe(1)
+  })
+
+  it('requires a recovery callback when claim can reserve external funds', () => {
+    expect(() => new MemoryPaymentOperations({
+      onClaim: async () => undefined,
+    })).toThrow('onReclaim is required')
+  })
+
   it('runs one settlement side effect for concurrent retries', async () => {
     let effects = 0
     const operations = new MemoryPaymentOperations({

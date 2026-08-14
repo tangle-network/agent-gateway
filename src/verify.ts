@@ -1,5 +1,5 @@
 import type { X402Config, MppConfig, ApiKeyInfo, GatewayConfig } from './types'
-import type { NonceStore } from './nonce-store'
+import { claimStoredNonce, type NonceStore } from './nonce-store'
 
 /** Return the canonical opaque nonce key used by the final payment claim. */
 export function mppReplayNonceKey(authHeader: string): string | undefined {
@@ -103,7 +103,7 @@ export async function verifyX402(
     if (nonceStore && markNonce) {
       // Mark seen with TTL matching the expiry window (max 1 hour)
       const ttl = Math.min(Number(expiry) - Math.floor(Date.now() / 1000), 3600)
-      const claimed = await nonceStore.claim(nonceKey, Math.max(ttl, 60))
+      const claimed = await claimStoredNonce(nonceStore, nonceKey, Math.max(ttl, 60))
       if (!claimed) return null
     }
 
@@ -202,7 +202,7 @@ export async function verifyMpp(
         ? Math.floor(Date.now() / 1000) + 3600
         : Number(payload.expiry)
       const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
-      const claimed = await nonceStore.claim(nonceKey!, Math.max(ttl, 60))
+      const claimed = await claimStoredNonce(nonceStore, nonceKey!, Math.max(ttl, 60))
       if (!claimed) return null
     }
 

@@ -830,12 +830,16 @@ async function guardMessageRequest(
   const authz = guard
 
   // Multi-turn continuation: if the caller addressed an existing task that is
-  // currently in `input-required`, append the new message and transition to
-  // `working`. Any other taskId (unknown OR pointing at a terminal/working
+  // currently in `input-required`, append the new message and reserve it as
+  // `submitted`. The handler transitions it to `working` only after payment
+  // succeeds, so cancellation during payment cannot start sandbox work.
+  // Any other taskId (unknown OR pointing at a terminal/working
   // task) means the caller is starting a fresh task and we mint a new id.
   if (typeof params.message.taskId === 'string') {
     const existing = await deps.taskStore.get(params.message.taskId)
     if (existing) {
+      const accessError = await authorizeTaskAccess(c, req, existing, deps)
+      if (accessError) return accessError
       if (existing.status.state !== 'input-required') {
         return c.json(
           fail(
@@ -852,7 +856,7 @@ async function guardMessageRequest(
       }
       const continued: Task = {
         ...existing,
-        status: { state: 'working', timestamp: nowIso() },
+        status: { state: 'submitted', timestamp: nowIso() },
         history: [...(existing.history ?? []), appendedMessage],
       }
       if (!await compareAndSetTask(deps.taskStore, existing, continued)) {
@@ -860,7 +864,7 @@ async function guardMessageRequest(
           fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${existing.id}' changed before continuation`),
         )
       }
-      const claimError = await claimTaskPayment(c, req, continued, authz, deps)
+      const claimError = await claimTaskPayment(c, req, continued, authz, deps, existing)
       if (claimError) return claimError
       return { authz, task: continued }
     }
@@ -898,16 +902,18 @@ async function claimTaskPayment(
   task: Task,
   authz: AuthorizedRequest,
   deps: A2AHandlerDeps,
+  paymentFailureTask?: Task,
 ): Promise<Response | undefined> {
   try {
     await claimPayment(authz, deps.config, deps.state)
     return undefined
   } catch {
     await releaseOwnedPayment(authz, deps, 'payment authorization failed')
-    const failed = withStatus(task, 'failed')
+    const failed = paymentFailureTask ?? withStatus(task, 'failed')
     try {
-      await deps.taskStore.put(failed)
-      await maybeDeliverPush(failed, deps)
+      if (await compareAndSetTask(deps.taskStore, task, failed) && isTerminal(failed.status.state)) {
+        await maybeDeliverPush(failed, deps)
+      }
     } catch (taskError) {
       console.error(
         `[a2a] failed to persist payment-failed task ${task.id}:`,

@@ -97,6 +97,20 @@ describe('KvNonceStore', () => {
     expect(results).toEqual([true, true])
     expect(await isolateA.claim('shared-operation', 300, 'operation-2')).toBe(false)
   })
+
+  it('preserves legacy claims on the standard Cloudflare KV surface', async () => {
+    const backing = new StubKV()
+    const cloudflareKv: NonceKV = {
+      get: backing.get.bind(backing),
+      put: backing.put.bind(backing),
+      delete: backing.delete.bind(backing),
+    }
+    const store = new KvNonceStore(cloudflareKv)
+
+    expect(await store.claim('legacy', 300)).toBe(true)
+    expect(await store.claim('legacy', 300)).toBe(false)
+    await expect(store.claim('version-2', 300, 'operation-1')).rejects.toThrow('atomic putIfAbsent')
+  })
 })
 
 describe('KvRateLimitStore', () => {

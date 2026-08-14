@@ -13,7 +13,7 @@ import type { Context } from 'hono'
 import { filterConsumerMessagesStrict, redactSystemPromptFromOutput } from './filter'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { type RateLimitStore, checkRateLimit } from './rate-limit'
-import type { NonceStore } from './nonce-store'
+import { claimStoredNonce, type NonceStore } from './nonce-store'
 import type { PaymentOperation } from './payment-operations'
 import type {
   AgentMeta,
@@ -513,7 +513,7 @@ export async function claimPayment(
       // the shared nonce while this callback is still running. Claim first so
       // an external reserve or charge cannot happen for a losing request.
       const legacyClaimed = config.x402.paymentProtocolVersion !== 2 && authz.paymentNonceKey
-        ? await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+        ? await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
         : undefined
       if (legacyClaimed === false) throw new Error('payment nonce was already consumed')
       const result = await config.x402.authorizePayment(authz.paymentPayload, context)
@@ -528,13 +528,13 @@ export async function claimPayment(
       else if (config.x402.paymentProtocolVersion === 2) {
         throw new Error('version 2 payment authorization did not return an operation')
       } else if (authz.paymentNonceKey && legacyClaimed === undefined) {
-        const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+        const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
         if (!claimed) throw new Error('payment nonce was already consumed')
       }
     } else if (config.x402.paymentOperations) {
       operation = await config.x402.paymentOperations.claimPayment(authz.paymentPayload, context)
     } else if (authz.paymentNonceKey) {
-      const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
+      const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
       if (!claimed) throw new Error('payment nonce was already consumed')
     }
     if (operation && operation.protocolVersion !== 2) {
@@ -544,7 +544,7 @@ export async function claimPayment(
       throw new Error('durable payment operations are required to settle a claimed operation')
     }
     if (operation && authz.paymentNonceKey) {
-      const claimed = await claimNonce(
+      const claimed = await claimPaymentNonce(
         state.nonceStore,
         authz.paymentNonceKey,
         authz.paymentPayload,
@@ -564,7 +564,7 @@ export async function claimPayment(
     }
     authz.paymentOperation = operation
   } else if (authz.paymentMethod === 'mpp' && authz.paymentNonceKey) {
-    const claimed = await claimNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
+    const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
     if (!claimed) throw new Error('payment nonce was already consumed')
   }
 
@@ -627,7 +627,7 @@ export async function reclaimPayment(
   return config.x402.paymentOperations.reclaimPayment(operationId)
 }
 
-async function claimNonce(
+async function claimPaymentNonce(
   nonceStore: NonceStore,
   nonceKey: string,
   payload: Record<string, unknown>,
@@ -636,7 +636,7 @@ async function claimNonce(
   const expiry = Number(payload.expiry ?? Math.floor(Date.now() / 1000) + 3600)
   const ttl = Math.min(expiry - Math.floor(Date.now() / 1000), 3600)
   if (!Number.isFinite(ttl) || ttl <= 0) return false
-  return nonceStore.claim(nonceKey, Math.max(ttl, 60), ownerId)
+  return claimStoredNonce(nonceStore, nonceKey, Math.max(ttl, 60), ownerId)
 }
 
 /**

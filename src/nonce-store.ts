@@ -8,9 +8,10 @@ export interface NonceStore {
   hasSeen(nonce: string): Promise<boolean>
   /**
    * Atomically claim a nonce. An owner id makes a retry by the same payment
-   * operation idempotent while a legacy claim still fails closed.
+   * operation idempotent while a legacy claim still fails closed. Version 1
+   * stores can omit this method and retain their prior check-then-mark path.
    */
-  claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
+  claim?(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
   /** Mark nonce as used. TTL = how long to remember it (seconds). */
   markSeen(nonce: string, ttlSeconds: number): Promise<void>
 }
@@ -74,7 +75,7 @@ export class MemoryNonceStore implements NonceStore {
 export interface KVNamespace {
   get(key: string, options?: { type?: 'text' | 'json' }): Promise<string | null>
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>
-  /** Required for version 2 gateway claims. A plain KV put is not atomic. */
+  /** Optional atomic extension. Cloudflare KV does not provide this method. */
   putIfAbsent?(key: string, value: string, options?: { expirationTtl?: number }): Promise<boolean>
   delete(key: string): Promise<void>
 }
@@ -105,6 +106,11 @@ export class KvNonceStore implements NonceStore {
   }
 
   async claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean> {
+    if (ownerId === undefined) {
+      if (await this.hasSeen(nonce)) return false
+      await this.markSeen(nonce, ttlSeconds)
+      return true
+    }
     if (!this.kv.putIfAbsent) {
       throw new Error('KvNonceStore requires an atomic putIfAbsent binding for payment claims')
     }
@@ -129,4 +135,20 @@ export class KvNonceStore implements NonceStore {
   private key(nonce: string): string {
     return `${this.prefix}:${nonce}`
   }
+}
+
+/** Claim through a version 2 store or preserve the version 1 store contract. */
+export async function claimStoredNonce(
+  store: NonceStore,
+  nonce: string,
+  ttlSeconds: number,
+  ownerId?: string,
+): Promise<boolean> {
+  if (store.claim) return store.claim(nonce, ttlSeconds, ownerId)
+  if (ownerId !== undefined) {
+    throw new Error('NonceStore.claim is required for version 2 payment ownership')
+  }
+  if (await store.hasSeen(nonce)) return false
+  await store.markSeen(nonce, ttlSeconds)
+  return true
 }
