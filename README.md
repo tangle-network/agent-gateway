@@ -118,6 +118,8 @@ Push destinations must use HTTPS without URL credentials.
 Push delivery does not follow redirects.
 Production push delivery also requires `a2a.pushUrlValidator` to reject private DNS destinations.
 Tasks created before this release have no recorded origin and fail closed; migrate them with a verified owner binding or let them expire.
+The payment claim keeps its submission lease until the atomic submitted-to-working transition.
+An expired execution lease fails the working task and preserves its payment recovery markers.
 
 ## Tier
 

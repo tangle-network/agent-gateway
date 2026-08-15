@@ -44,6 +44,7 @@ import { buildAgentCard } from './agent-card'
 import {
   claimTaskExecution,
   clearTaskExecution,
+  hasExpiredTaskExecution,
   renewTaskExecution,
 } from './execution-fence'
 import { fail, ok, parseEnvelope } from './jsonrpc'
@@ -301,10 +302,14 @@ async function executeMessageSend(
   signal: AbortSignal,
 ): Promise<Response> {
   if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
+  const taskWithoutSubmission = clearTaskSubmission(task)
   let workingTask: Task = task.status.state === 'working'
-    ? task
-    : { ...task, status: { state: 'working', timestamp: nowIso() } }
-  if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
+    ? taskWithoutSubmission
+    : { ...taskWithoutSubmission, status: { state: 'working', timestamp: nowIso() } }
+  if (
+    JSON.stringify(task) !== JSON.stringify(workingTask) &&
+    !await compareAndSetTask(deps.taskStore, task, workingTask)
+  ) {
     await releaseTaskPayment(authz, task, deps, 'A2A task changed before execution started', false)
     if (signal.aborted) {
       const canceled = await deps.taskStore.get(task.id)
@@ -927,26 +932,34 @@ async function handleTasksCancel(
       ),
     )
   }
-  const canceled = withStatus(task, 'canceled')
-  const transitioned = await compareAndSetTask(deps.taskStore, task, canceled)
-  if (!transitioned) {
-    const current = await deps.taskStore.get(task.id)
-    if (current && (isTerminal(current.status.state) || isTaskFinalizing(current))) {
+  let stillActive = false
+  let candidate = task
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (isTerminal(candidate.status.state)) {
       return c.json(
         fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' changed before cancellation`),
       )
     }
-    return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'task changed before cancellation'))
+    if (isTaskFinalizing(candidate)) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' is being finalized`),
+      )
+    }
+    const canceled = withStatus(candidate, 'canceled')
+    if (await compareAndSetTask(deps.taskStore, candidate, canceled)) {
+      stillActive = cancels.cancel(task.id)
+      // If a stream was active, it observes the abort and emits its own final
+      // status update and push delivery. Otherwise this handler owns delivery.
+      if (!stillActive) await maybeDeliverPush(canceled, deps)
+      return c.json(ok(req.id, canceled))
+    }
+    const current = await deps.taskStore.get(task.id)
+    if (!current) {
+      return c.json(fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${task.id}' not found`))
+    }
+    candidate = current
   }
-  const stillActive = cancels.cancel(task.id)
-
-  // If a stream was active, it'll observe the abort and emit its own final
-  // status-update AND fire its own push delivery; the dispatcher only fires
-  // push when the cancel races to terminal state with no active streamer.
-  if (!stillActive) {
-    await maybeDeliverPush(canceled, deps)
-  }
-  return c.json(ok(req.id, canceled))
+  return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'task changed before cancellation'))
 }
 
 // ── tasks/resubscribe ─────────────────────────────────────────────────────
@@ -1332,8 +1345,6 @@ async function claimTaskPayment(
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))
   }
 
-  const submissionClear = await clearTaskSubmissionMarker(deps.taskStore, paymentTask)
-  if (submissionClear.applied) paymentTask = submissionClear.task
   const current = await deps.taskStore.get(task.id)
   if (current && JSON.stringify(current) === JSON.stringify(paymentTask)) {
     return paymentTask
@@ -2274,7 +2285,30 @@ async function recoverTaskIfNeeded(
   const released = await recoverPaymentReleaseIfNeeded(task, deps)
   const finalized = await recoverFinalizationIfNeeded(released, deps, requestedAgentSlug)
   const paymentRecovered = await recoverPaymentMarkerIfNeeded(finalized, deps)
-  return recoverSubmissionIfNeeded(paymentRecovered, deps)
+  const submissionRecovered = await recoverSubmissionIfNeeded(paymentRecovered, deps)
+  return recoverExpiredExecutionIfNeeded(submissionRecovered, deps)
+}
+
+async function recoverExpiredExecutionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
+  if (
+    task.status.state !== 'working' ||
+    isTaskFinalizing(task) ||
+    !hasExpiredTaskExecution(task)
+  ) return task
+  const failed: Task = {
+    ...withStatus(task, 'failed'),
+    metadata: {
+      ...(clearTaskExecution(task).metadata ?? {}),
+      [EXECUTION_RECOVERY_METADATA_KEY]: {
+        error: 'A2A execution lease expired before a task result was stored',
+      },
+    },
+  }
+  if (await compareAndSetTask(deps.taskStore, task, failed)) {
+    await maybeDeliverPush(failed, deps)
+    return failed
+  }
+  return await deps.taskStore.get(task.id) ?? task
 }
 
 async function recoverSubmissionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
@@ -2333,7 +2367,7 @@ async function clearReconciledPaymentRecoveryMarker(
   const record = await deps.config.paymentRecovery.store.get(marker.id)
   if (record?.state !== 'reconciled') return task
   const cleared = clearPaymentRecoveryMarker(task)
-  if (cleared.status.state === 'working') {
+  if (cleared.status.state === 'working' || cleared.status.state === 'submitted') {
     const failed: Task = {
       ...withStatus(cleared, 'failed'),
       metadata: {

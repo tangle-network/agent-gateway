@@ -37,6 +37,8 @@ If cancellation must release an unused durable operation, the shared outbox ente
 An ambiguous release acknowledgement remains in that outbox and is retried by operation ID.
 Usage attribution must atomically upsert by `requestId`.
 The finalization record stores whether attribution was acknowledged, so recovery does not repeat an acknowledged usage event.
+The payment claim keeps its submission lease until the task changes to `working` in one compare-and-set operation.
+An expired execution lease fails the task while leaving payment recovery metadata available for reconciliation.
 If a legacy record is malformed or has no recoverable operation, the gateway expires the task as failed.
 If work exists without a receipt, the outbox settles the original quoted ceiling after its configured timeout.
 The task-store TTL cannot delete a task while any payment recovery marker remains.

@@ -68,6 +68,12 @@ export function hasActiveTaskExecution(task: Task, now = Date.now()): boolean {
   return marker !== undefined && marker.lease.expiresAt > now
 }
 
+/** A working task with this marker has lost its execution owner. */
+export function hasExpiredTaskExecution(task: Task, now = Date.now()): boolean {
+  const marker = readTaskExecution(task)
+  return marker !== undefined && !hasActiveTaskExecution(task, now)
+}
+
 /** Remove the marker when the task reaches a terminal or paused state. */
 export function clearTaskExecution(task: Task): Task {
   if (!task.metadata || !(TASK_EXECUTION_METADATA_KEY in task.metadata)) return task

@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { InMemoryTaskStore } from '../src/a2a/task-store'
+import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
 import { createAgentGateway } from '../src/middleware'
 import { dispatchSandboxStreamRich, requiredX402Amount } from '../src/dispatch'
@@ -331,6 +331,139 @@ describe('PR #11 production regressions', () => {
       .toBeUndefined()
   })
 
+  it('keeps the submission lease until the task enters working state', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let transitionStarted!: () => void
+    const transitionReady = new Promise<void>((resolve) => { transitionStarted = resolve })
+    let releaseTransition!: () => void
+    const transitionReleased = new Promise<void>((resolve) => { releaseTransition = resolve })
+    let blocked = false
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        if (!blocked && next.status.state === 'working') {
+          blocked = true
+          transitionStarted()
+          await transitionReleased
+        }
+        return innerStore.compareAndSet(expected, next)
+      },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        verifySigner: async () => true,
+        paymentOperations: new MemoryPaymentOperations({ onReclaim: async () => undefined }),
+      },
+    })))
+
+    const send = app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9010'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: 'submission-lease-task',
+            contextId: 'submission-lease-context',
+            messageId: 'submission-lease-message',
+            parts: [{ kind: 'text', text: 'run' }],
+          },
+        },
+      }),
+    })
+    await transitionReady
+
+    const pending = await taskStore.get('submission-lease-task')
+    expect(pending?.status.state).toBe('submitted')
+    expect(pending?.metadata?.gatewaySubmission).toBeDefined()
+    expect(pending?.metadata?.gatewayPaymentRecovery).toBeDefined()
+
+    releaseTransition()
+    const response = await send
+    expect(response.status).toBe(200)
+    expect((await response.json() as { result?: { status?: { state?: string } } })
+      .result?.status?.state).toBe('completed')
+  })
+
+  it('retries cancellation after a heartbeat changes the task row', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let cancelAttempts = 0
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        if (next.status.state === 'canceled' && cancelAttempts++ === 0) {
+          await innerStore.put({
+            ...expected,
+            metadata: {
+              ...(expected.metadata ?? {}),
+              gatewayExecution: {
+                version: 1,
+                requestId: 'heartbeat-owner',
+                lease: { id: 'heartbeat-owner', expiresAt: Date.now() + 60_000 },
+              },
+            },
+          })
+          return false
+        }
+        return innerStore.compareAndSet(expected, next)
+      },
+    }
+    await taskStore.put({
+      kind: 'task',
+      id: 'cancel-heartbeat-task',
+      contextId: 'cancel-heartbeat-context',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'heartbeat-owner',
+          lease: { id: 'heartbeat-owner', expiresAt: Date.now() + 60_000 },
+        },
+      },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/cancel',
+        params: { id: 'cancel-heartbeat-task' },
+      }),
+    })
+    const body = await response.json() as { result?: Task; error?: unknown }
+
+    expect(response.status).toBe(200)
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status.state).toBe('canceled')
+    expect(cancelAttempts).toBe(2)
+  })
+
   it('quotes retained A2A history before charging a continuation', async () => {
     const taskStore = new InMemoryTaskStore()
     let invocations = 0
@@ -562,6 +695,45 @@ describe('PR #11 production regressions', () => {
 
     expect(response.status).toBe(200)
     expect(body.result?.status?.state).toBe('failed')
+  })
+
+  it('fails a working task after its execution fence expires', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const now = Date.now()
+    await taskStore.put({
+      kind: 'task',
+      id: 'expired-execution-task',
+      contextId: 'expired-execution-context',
+      status: { state: 'working', timestamp: new Date(now).toISOString() },
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'abandoned-execution-request',
+          lease: { id: 'abandoned-execution-request', expiresAt: now - 1 },
+        },
+      },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/get',
+        params: { id: 'expired-execution-task' },
+      }),
+    })
+    const body = await response.json() as { result?: Task }
+
+    expect(body.result?.status.state).toBe('failed')
+    expect(body.result?.metadata?.gatewayExecution).toBeUndefined()
+    expect(body.result?.metadata?.gatewayExecutionRecovery).toBeDefined()
   })
 
   it('rejects a legacy check-then-mark nonce store instead of racing two payments', async () => {
@@ -870,6 +1042,8 @@ describe('PR #11 production regressions', () => {
     const urls = [
       'https://[::ffff:169.254.169.254]/metadata',
       'https://[::ffff:a9fe:a9fe]/metadata',
+      'https://[::127.0.0.1]/metadata',
+      'https://[::a9fe:a9fe]/metadata',
     ]
 
     for (const [index, url] of urls.entries()) {
