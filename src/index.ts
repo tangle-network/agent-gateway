@@ -10,6 +10,7 @@ export {
 export {
   verifyX402,
   verifyMpp,
+  verifyMppCredential,
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
@@ -46,6 +47,8 @@ export {
   type MemoryPaymentOperationsOptions,
   type PaymentAuthorizationContext,
   type PaymentOperation,
+  type PaymentOperationNotFound,
+  type PaymentOperationRecoveryResult,
   type PaymentOperationState,
   type PaymentOperations,
   type PaymentSettlementInput,
@@ -76,7 +79,9 @@ export {
   MemoryNonceStore,
   KvNonceStore,
   isAtomicNonceStore,
+  type AtomicKvNonceClaim,
   type AtomicNonceStore,
+  type KvNonceStoreOptions,
   type NonceStore,
 } from './nonce-store'
 export {
@@ -114,7 +119,7 @@ export type {
 
 // --- A2A protocol surface (Google Agent-to-Agent) ---
 // Types + task-store adapter. Handlers are wired automatically by
-// createAgentGateway when `GatewayConfig.a2a` (or its default) is honored;
+// createAgentGateway with an in-memory store by default;
 // consumers only import these to BYO a durable TaskStore (D1, postgres, DO)
 // or to declare richer AgentMeta.skills for the Agent Card.
 export { InMemoryTaskStore, type TaskStore } from './a2a/task-store'

@@ -493,7 +493,8 @@ describe('generic MPP charge lifecycle', () => {
     releaseObserver()
     const response = await pending
 
-    expect(response.status).toBe(402)
+    // The streaming response is committed before a second worker fences the row.
+    expect(response.status).toBe(200)
     expect(runs).toBe(0)
     expect(lifecycle.confirmations).toBe(1)
     expect(lifecycle.refunds).toBe(1)
@@ -738,7 +739,7 @@ describe('durable OpenAI recovery', () => {
     await response.text()
 
     const pending = await recoveryStore.get(operationId)
-    expect(pending?.state).toBe('executing')
+    expect(pending?.state).toBe('claimed')
     expect(pending?.lease).toBeUndefined()
     expect(operations.get(operationId)?.state).toBe('claimed')
   })

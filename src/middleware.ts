@@ -7,6 +7,8 @@ import {
   type GatewayState,
   authenticateAndGuard,
   beginPaymentExecution,
+  markPaymentExecutionStarted,
+  renewPaymentExecution,
   claimPayment,
   dispatchSandboxStreamRich,
   releasePayment,
@@ -126,9 +128,7 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
   if (config.mpp && mppMethod !== 'blueprintevm' && !mppAuthenticator) {
     throw new Error('createAgentGateway: generic MPP methods require credential authentication')
   }
-  const needsAtomicNonce = config.x402.paymentProtocolVersion === 2 ||
-    (mppMethod !== 'blueprintevm' && config.mpp?.charge !== undefined)
-  if (needsAtomicNonce && config.nonceStore && !isAtomicNonceStore(config.nonceStore)) {
+  if (config.nonceStore && !isAtomicNonceStore(config.nonceStore)) {
     throw new Error('createAgentGateway: durable payment ownership requires an atomic nonce store')
   }
   const needsRecovery = config.x402.paymentProtocolVersion === 2 ||
@@ -296,29 +296,6 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
       )
     }
 
-    try {
-      await beginPaymentExecution(authz, config)
-    } catch {
-      try {
-        await releasePayment(authz, config, 'payment execution fence was lost')
-      } catch (releaseError) {
-        console.error(
-          `[agent-gateway] payment release failed for ${authz.requestId}:`,
-          releaseError instanceof Error ? releaseError.message : String(releaseError),
-        )
-      }
-      return c.json(
-        {
-          error: {
-            message: 'Payment authorization failed',
-            type: 'payment_required',
-            code: 'payment_execution_fence_lost',
-          },
-        },
-        { status: 402, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': authz.requestId } },
-      )
-    }
-
     return streamChatCompletions(c, authz, config, obs)
   })
 
@@ -329,9 +306,24 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
   // regardless of which protocol the caller used.
   const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
   const pushStore = config.a2a?.pushStore
-  const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
-  gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
-  gw.post('/:slug', a2a.handleJsonRpc)
+  try {
+    const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
+    gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
+    gw.post('/:slug', a2a.handleJsonRpc)
+  } catch (error) {
+    // An older custom store must not take down the OpenAI surface. Keep the
+    // A2A surface unavailable until its owner supplies atomic methods.
+    console.error(
+      '[agent-gateway] A2A is unavailable until its task store is upgraded:',
+      error instanceof Error ? error.message : String(error),
+    )
+    const unavailable = (c: import('hono').Context) => c.json(
+      { error: 'A2A task persistence is not configured for concurrent workers' },
+      503,
+    )
+    gw.get('/:slug/.well-known/agent.json', unavailable)
+    gw.post('/:slug', unavailable)
+  }
 
   return gw
 }
@@ -405,11 +397,14 @@ function streamChatCompletions(
           abortController.signal,
           undefined,
           maxOutputTokens,
-          undefined,
+          () => beginPaymentExecution(authz, config),
           authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-          () => {
+          async () => {
             if (authz.paymentRecoveryId) workObserved = true
+            await markPaymentExecutionStarted(authz, config)
           },
+          authz.executionBudget.maxInputTokens,
+          () => renewPaymentExecution(authz, config),
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)

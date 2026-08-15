@@ -136,6 +136,13 @@ async function reconcileLeased(
         throw new Error('x402 payment recovery is not configured')
       }
       const recovered = await config.x402.paymentOperations.reclaimPayment(record.payment.operationId)
+      if (recovered.state === 'not-found') {
+        if (recovered.operationId !== record.payment.operationId) {
+          throw new Error('x402 recovery operation id mismatch')
+        }
+        await completeRecord(record, config)
+        return
+      }
       if (recovered.state !== 'released' && recovered.state !== 'reclaimed') {
         throw new Error(`ambiguous x402 claim recovered in state ${recovered.state}`)
       }
@@ -245,6 +252,13 @@ async function releaseRecoveredPayment(
     if (!record.payment.operation) {
       if (!config.x402.paymentOperations) throw new Error('x402 payment recovery is not configured')
       const recovered = await config.x402.paymentOperations.reclaimPayment(record.payment.operationId)
+      if (recovered.state === 'not-found') {
+        if (recovered.operationId !== record.payment.operationId) {
+          throw new Error('x402 recovery operation id mismatch')
+        }
+        await completeRecord(record, config)
+        return
+      }
       if (recovered.state !== 'released' && recovered.state !== 'reclaimed') {
         throw new Error(`x402 release recovered in state ${recovered.state}`)
       }

@@ -16,6 +16,15 @@ export type PaymentOperationState =
   | 'reclaimable'
   | 'reclaimed'
 
+/** Fenced result for a recovery lookup that found no provider operation. */
+export interface PaymentOperationNotFound {
+  protocolVersion: typeof PAYMENT_PROTOCOL_VERSION
+  operationId: string
+  state: 'not-found'
+}
+
+export type PaymentOperationRecoveryResult = PaymentOperation | PaymentOperationNotFound
+
 /** Durable ownership of one signed payment authorization. */
 export interface PaymentOperation {
   protocolVersion: typeof PAYMENT_PROTOCOL_VERSION
@@ -79,7 +88,7 @@ export interface PaymentOperations {
    * Repeated calls must recover an ambiguous acknowledgement by operationId.
    */
   releasePayment(operation: PaymentOperation, reason: string): Promise<PaymentOperation>
-  reclaimPayment(operationId: string): Promise<PaymentOperation>
+  reclaimPayment(operationId: string): Promise<PaymentOperationRecoveryResult>
 }
 
 export interface MemoryPaymentOperationsOptions {
@@ -263,7 +272,11 @@ export class MemoryPaymentOperations implements PaymentOperations {
     if (current.state === 'releasing') {
       const flight = this.releaseFlights.get(current.operationId)
       if (flight) return flight
-      return this.reclaimPayment(current.operationId)
+      const recovered = await this.reclaimPayment(current.operationId)
+      if (recovered.state === 'not-found') {
+        throw new Error('payment operation disappeared during release recovery')
+      }
+      return recovered
     }
     if (current.state !== 'claimed' && current.state !== 'executing') {
       throw new Error(`cannot release payment in state ${current.state}`)
@@ -273,9 +286,15 @@ export class MemoryPaymentOperations implements PaymentOperations {
     return this.runRelease(releasing, reason)
   }
 
-  async reclaimPayment(operationId: string): Promise<PaymentOperation> {
+  async reclaimPayment(operationId: string): Promise<PaymentOperationRecoveryResult> {
     const current = this.operations.get(operationId)
-    if (!current) throw new Error('payment operation was not found')
+    if (!current) {
+      return {
+        protocolVersion: PAYMENT_PROTOCOL_VERSION,
+        operationId,
+        state: 'not-found',
+      }
+    }
     if (current.state === 'reclaimed') return current
     if (current.state === 'executing' || current.state === 'retained') {
       throw new Error(`cannot reclaim payment in state ${current.state} without a usage receipt`)

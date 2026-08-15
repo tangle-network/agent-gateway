@@ -59,14 +59,18 @@ A retained operation settles from its receipt when one exists.
 If the receipt does not arrive before `receiptTimeoutMs`, recovery settles the original quoted ceiling.
 The fallback never settles the payer's larger authorization amount.
 Keep version 1 explicitly configured while old and new gateways coexist; shared nonce storage must reject a version 1 claim owned by a version 2 operation.
-Before it calls the verifier, the gateway requires the signed amount to cover filtered input plus the requested output limit.
+Before it calls the verifier, the gateway requires the signed amount to cover the complete filtered conversation plus the requested output limit.
+The default bound includes system text, message roles, and JSON framing.
+Set `inputTokenBound` when the provider adds harness, tool, workspace, or other hidden context.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
 Requests with a version 2 operation or generic MPP charge reject missing receipts.
 API-key requests keep the legacy visible-token estimate path.
 recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.
-Older custom A2A task stores remain source-compatible through a process-safe fallback.
+The default gateway still exposes A2A with an in-memory task store.
+Older custom A2A task stores remain source-compatible at the type boundary.
+The OpenAI surface stays available when such a store is configured, while A2A returns `503` until its owner supplies atomic methods.
 Use an atomic task store for multi-worker production deployments.
 
 MPP is method-specific.
@@ -90,7 +94,11 @@ The nonce and recovery stores persist only the SHA-256 digest of `paymentIdentit
 `Payment-Receipt` values must contain visible ASCII only.
 
 `NonceStore` remains source-compatible with 0.7.1 `hasSeen`/`markSeen` stores.
-That legacy path is limited to non-owner payment claims; version 2 and MPP charge lifecycles require an atomic `claim` method.
+Payment requests now require its atomic `claim` method, including version 1.
+This is a deliberate safety boundary: a check followed by a write can accept two concurrent payments.
+`KvNonceStore` with plain Cloudflare KV is not atomic and is rejected by `createAgentGateway`.
+Provide `KvNonceStore` an `atomicClaim` callback backed by D1, a Durable Object, or another linearizable store.
+Payment paths fail closed unless the store also provides one atomic `claim` method.
 The 0.7.1 `mpp.verifySigner` callback is also supported; the gateway derives a stable identity until the integration moves to `authenticateCredential`.
 
 The same authentication, authorization, rate-limit, filtering, sandbox, settlement, and usage-recording pipeline is used by the OpenAI-compatible and A2A endpoints.

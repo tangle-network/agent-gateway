@@ -361,7 +361,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const body = await res.json() as { error: { payment_methods: string[]; x402: Record<string, unknown> } }
     expect(body.error.payment_methods).toContain('x402')
     expect(body.error.x402.operator).toBe(operatorAddress)
-    expect(body.error.x402.required_amount).toBe('184861')
+    expect(body.error.x402.required_amount).toBe('185460')
     expect(body.error.x402.max_output_tokens).toBe(1024)
   })
 

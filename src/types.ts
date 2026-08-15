@@ -331,6 +331,15 @@ export interface GatewayConfig {
   /** Output token limit used when a request omits `max_tokens`. Defaults to 1024. */
   defaultOutputTokens?: number
 
+  /**
+   * Return a safe upper bound for the complete provider input.
+   * Include system, chat framing, retained history, tools, harness, and workspace context.
+   */
+  inputTokenBound?: (input: {
+    agent: AgentMeta
+    messages: ChatMessage[]
+  }) => number
+
   /** Hidden provider spend limits included in the pre-execution payment quote. */
   executionBudget?: {
     maxReasoningTokens?: number
@@ -363,8 +372,8 @@ export interface GatewayConfig {
   observer?: import('./observer').GatewayObserver
 
   /**
-   * A2A protocol configuration. When set, the gateway exposes the A2A
-   * surface alongside its OpenAI-compatible endpoints:
+   * A2A protocol configuration. The gateway exposes A2A with an in-memory
+   * task store by default. Set this object to provide durable storage or push:
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel

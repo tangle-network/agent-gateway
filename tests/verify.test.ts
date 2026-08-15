@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { verifyX402, verifyMpp, defaultVerifyApiKey } from '../src/verify'
+import { verifyX402, verifyMppCredential, defaultVerifyApiKey } from '../src/verify'
 import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import type { X402Config, MppConfig } from '../src/types'
 
@@ -116,7 +116,7 @@ describe('verifyX402', () => {
     expect(ttls[0]).toBeLessThanOrEqual(7200)
   })
 
-  it('keeps 0.7.1 custom nonce stores working on the legacy path', async () => {
+  it('fails closed for a 0.7.1 custom nonce store without atomic claims', async () => {
     const seen = new Set<string>()
     const nonceStore = {
       hasSeen: async (nonce: string) => seen.has(nonce),
@@ -124,7 +124,7 @@ describe('verifyX402', () => {
     } as unknown as NonceStore
 
     const payload = buildSpendAuth({ nonce: '101' })
-    expect(await verifyX402(payload, baseConfig, nonceStore)).toBe('0xCommitmentAlice')
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
     expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
   })
 
@@ -190,7 +190,7 @@ describe('verifyMpp', () => {
 
   it('parses a valid Payment header and returns the signer', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress, amount: '1000', nonce: '5' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toMatchObject({
+    expect(await verifyMppCredential(header, mppConfig, baseConfig)).toMatchObject({
       consumerId: '0xAlice',
       replayKey: '0xalice:5',
     })
@@ -215,11 +215,11 @@ describe('verifyMpp', () => {
     const productionX402: X402Config = { ...baseConfig, demoMode: false }
     const nonceStore = new MemoryNonceStore()
 
-    expect(await verifyMpp(header, config, productionX402, nonceStore)).toMatchObject({
+    expect(await verifyMppCredential(header, config, productionX402, nonceStore)).toMatchObject({
       consumerId: 'mpp:alice',
       replayKey: '0xalice:6',
     })
-    expect(await verifyMpp(header, config, productionX402, nonceStore)).toBeNull()
+    expect(await verifyMppCredential(header, config, productionX402, nonceStore)).toBeNull()
     expect(seen).toHaveLength(1)
     expect(seen[0].method).toBe('blueprintevm')
     expect(seen[0].credential).toContain('commitment')
@@ -243,7 +243,7 @@ describe('verifyMpp', () => {
       },
     }
 
-    await expect(verifyMpp(
+    await expect(verifyMppCredential(
       header,
       legacyConfig,
       { ...baseConfig, demoMode: false },
@@ -264,7 +264,7 @@ describe('verifyMpp', () => {
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }
     expect(await verifyX402(JSON.stringify({ ...payload, nonce: '1' }), baseConfig, nonceStore)).toBe('0xAlice')
-    expect(await verifyMpp(
+    expect(await verifyMppCredential(
       buildCredential({ ...payload, commitment: '0xALICE' }),
       mppConfig,
       baseConfig,
@@ -289,7 +289,7 @@ describe('verifyMpp', () => {
       },
     }
 
-    expect(await verifyMpp(header, config, { ...baseConfig, demoMode: false }, undefined, 20000n)).toBeNull()
+    expect(await verifyMppCredential(header, config, { ...baseConfig, demoMode: false }, undefined, 20000n)).toBeNull()
     expect(calls).toBe(0)
   })
 
@@ -302,14 +302,14 @@ describe('verifyMpp', () => {
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }).replace('Payment blueprintevm ', 'Payment BLUEPRINTEVM ')
 
-    expect(await verifyMpp(
+    expect(await verifyMppCredential(
       underfunded,
       { realm: 'agents.tangle.tools' },
       baseConfig,
       undefined,
       20000n,
     )).toBeNull()
-    expect(await verifyMpp(
+    expect(await verifyMppCredential(
       underfunded,
       mppConfig,
       baseConfig,
@@ -321,7 +321,7 @@ describe('verifyMpp', () => {
   it('rejects MPP in production when no method verifier is configured', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress })
     const productionX402: X402Config = { ...baseConfig, demoMode: false }
-    expect(await verifyMpp(header, mppConfig, productionX402)).toBeNull()
+    expect(await verifyMppCredential(header, mppConfig, productionX402)).toBeNull()
   })
 
   it('does not reuse the x402 verifier for a different MPP method', async () => {
@@ -332,34 +332,34 @@ describe('verifyMpp', () => {
       demoMode: false,
       verifySigner: async () => true,
     }
-    expect(await verifyMpp(header, { ...mppConfig, method: 'stripe' }, productionX402)).toBeNull()
+    expect(await verifyMppCredential(header, { ...mppConfig, method: 'stripe' }, productionX402)).toBeNull()
   })
 
   it('falls back to the `from` field when no `commitment` present — regression: EIP-3009 wallets expose `from` only', async () => {
     const header = buildCredential({ from: '0xWallet', to: operatorAddress, value: '1000' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toMatchObject({
+    expect(await verifyMppCredential(header, mppConfig, baseConfig)).toMatchObject({
       consumerId: '0xWallet',
     })
   })
 
   it('rejects malformed Payment header shape', async () => {
-    expect(await verifyMpp('Bearer sk_agent_123', mppConfig, baseConfig)).toBeNull()
-    expect(await verifyMpp('Payment', mppConfig, baseConfig)).toBeNull()
-    expect(await verifyMpp('Payment blueprintevm', mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential('Bearer sk_agent_123', mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential('Payment', mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential('Payment blueprintevm', mppConfig, baseConfig)).toBeNull()
   })
 
   it('rejects bad base64url — regression: decode crash must return null', async () => {
-    expect(await verifyMpp('Payment blueprintevm !@#$not-b64$#@!', mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential('Payment blueprintevm !@#$not-b64$#@!', mppConfig, baseConfig)).toBeNull()
   })
 
   it('rejects operator mismatch', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: '0xWrongOp', amount: '1000' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential(header, mppConfig, baseConfig)).toBeNull()
   })
 
   it('rejects non-numeric amount/nonce — regression: BigInt throw should become null, not crash', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress, amount: 'not-a-number' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toBeNull()
+    expect(await verifyMppCredential(header, mppConfig, baseConfig)).toBeNull()
   })
 })
 

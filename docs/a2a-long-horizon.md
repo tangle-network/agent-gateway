@@ -9,16 +9,21 @@ The A2A protocol works well for short request-response calls out of the box. For
 | Resubscribe | `tasks/resubscribe` | A client that lost its SSE stream can re-attach to find out where the task ended up |
 | Input-required + multi-turn | `input-required` state + follow-up `message/send` with the same `taskId` | The agent can pause and ask the user a question without ending the task |
 
-All four are gated on configuration — they cost nothing for agents that don't need them, and the agent card honestly reflects what each gateway will actually do.
+The A2A surface is available with an in-memory task store by default.
+Durable storage and push notifications are enabled through `GatewayConfig.a2a`.
 
 ## Durable tasks (SqlTaskStore)
 
 By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments.
 Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a `SqlAdapter` shim.
 Custom production task stores must implement both atomic methods, `createIfAbsent` and `compareAndSet`.
-The gateway rejects a production task store that lacks either method before it serves A2A requests.
-Explicit `x402.demoMode` keeps a read-then-write fallback for local tests only.
+The gateway keeps the OpenAI surface available when an older store lacks either method.
+It returns `503` for A2A until the store is upgraded, rather than using a cross-worker unsafe fallback.
 Use `SqlTaskStore` or another atomic adapter for multi-worker production deployments.
+
+Payment nonce stores also require an atomic claim operation on every payment protocol version.
+Plain Cloudflare KV cannot provide that operation.
+Use D1, a Durable Object, or a custom atomic adapter for the claim callback passed to `KvNonceStore`.
 
 Before a payment provider can mutate state, the gateway stores the recovery identity in task metadata.
 The record contains the payment operation, usage receipt, output artifact, and a five-minute lease.
@@ -299,6 +304,10 @@ The gateway then:
 3. Persists the task with the partial response as an artifact.
 4. Does NOT fire push notifications — `input-required` is non-terminal.
 5. Returns the task envelope (for `message/send`) or emits a final `status-update` (for `message/stream`).
+
+The gateway records a short-lived execution fence after sandbox acquisition and before the provider call.
+Another worker can cancel before that fence is recorded.
+After the fence is recorded, a remote cancellation returns `TASK_NOT_CANCELABLE` because it cannot abort the live worker safely.
 
 Sandboxes that never emit input-required see identical behavior to before.
 

@@ -150,7 +150,7 @@ function recoveredOperation(operation: PaymentOperation) {
 }
 
 describe('A2A task atomicity and restart recovery', () => {
-  it('rejects a non-atomic task store outside explicit demo mode', () => {
+  it('keeps OpenAI available and returns 503 for a non-atomic A2A store', async () => {
     const legacyStore: TaskStore = {
       get: async () => undefined,
       put: async () => undefined,
@@ -158,9 +158,14 @@ describe('A2A task atomicity and restart recovery', () => {
     }
     const config = atomicityConfig(legacyStore, { runs: 0, records: 0, settlements: 0 })
 
-    expect(() => createAgentGateway(config)).toThrow(
-      /A2A production task store must implement createIfAbsent and compareAndSet/,
-    )
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const response = await app.request(`/v1/agents/${agent.slug}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    expect(response.status).toBe(503)
   })
 
   it('lets exactly one of two workers create, execute, and settle a task', async () => {

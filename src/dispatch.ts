@@ -19,7 +19,11 @@ import {
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { type RateLimitStore, checkRateLimit } from './rate-limit'
 import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
-import { paymentNonceKey, type PaymentOperation } from './payment-operations'
+import {
+  paymentNonceKey,
+  type PaymentOperation,
+  type PaymentOperationRecoveryResult,
+} from './payment-operations'
 import {
   PAYMENT_RECOVERY_VERSION,
   PaymentRecoveryFenceError,
@@ -47,7 +51,7 @@ import {
   isMppAuthEnabled,
   mppPaymentPayload,
   mppPaymentCredential,
-  verifyMpp,
+  verifyMppCredential,
   verifyX402,
 } from './verify'
 
@@ -228,7 +232,38 @@ export async function authenticateAndGuard(
   }
 
   let requiredPaymentAmount: bigint
-  const maxInputTokens = maximumBillableInputTokens(agent, userMessage)
+  const messageInputBound = maximumBillableInputTokens(agent, filtered)
+  let maxInputTokens = messageInputBound
+  if (config.inputTokenBound) {
+    let configuredBound: number
+    try {
+      configuredBound = config.inputTokenBound({ agent, messages: filtered })
+    } catch {
+      return c.json(
+        {
+          error: {
+            message: 'Agent input token bound is unavailable',
+            type: 'server_error',
+            code: 'input_token_bound_unavailable',
+          },
+        },
+        503,
+      )
+    }
+    if (!Number.isSafeInteger(configuredBound) || configuredBound < messageInputBound) {
+      return c.json(
+        {
+          error: {
+            message: 'Agent input token bound is invalid',
+            type: 'server_error',
+            code: 'invalid_input_token_bound',
+          },
+        },
+        503,
+      )
+    }
+    maxInputTokens = configuredBound
+  }
   const maxReasoningTokens = state.maxReasoningTokens
   const maxToolTokens = state.maxToolTokens
   const maxToolCalls = state.maxToolCalls
@@ -312,7 +347,7 @@ export async function authenticateAndGuard(
     consumerId = signer
     paymentMethod = 'x402'
   } else if (isMppAuthEnabled(config) && authHeader.toLowerCase().startsWith('payment ')) {
-    const authenticated = await verifyMpp(
+    const authenticated = await verifyMppCredential(
       authHeader,
       config.mpp!,
       config.x402,
@@ -898,12 +933,17 @@ export async function beginPaymentExecution(
   authz: AuthorizedRequest,
   config: GatewayConfig,
 ): Promise<void> {
-  if (!authz.paymentRecoveryId) {
-    if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
-      authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
-    }
-    return
+  if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
+    authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
   }
+}
+
+/** Persist the sandbox handoff immediately before the adapter call. */
+export async function markPaymentExecutionStarted(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  if (!authz.paymentRecoveryId) return
   const recovery = config.paymentRecovery
   if (!recovery) throw new Error('durable payment recovery is not configured')
   const fenceId = requirePaymentRecoveryFence(authz)
@@ -918,9 +958,26 @@ export async function beginPaymentExecution(
     lease: { id: fenceId, expiresAt: fallbackAt },
     nextAttemptAt: fallbackAt,
   }), now)
-  if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
-    authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
-  }
+}
+
+/** Renew the live execution lease while a provider stream is still open. */
+export async function renewPaymentExecution(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  if (!authz.paymentRecoveryId) return
+  const recovery = config.paymentRecovery
+  if (!recovery) throw new Error('durable payment recovery is not configured')
+  const fenceId = requirePaymentRecoveryFence(authz)
+  const now = Date.now()
+  const fallbackAt = now + recoveryTiming(recovery).receiptTimeoutMs
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    state: 'executing',
+    fallbackAt,
+    lease: { id: fenceId, expiresAt: fallbackAt },
+    nextAttemptAt: fallbackAt,
+  }), now)
 }
 
 /**
@@ -1024,7 +1081,7 @@ async function markRecoveryReconciled(
 export async function reclaimPayment(
   operationId: string,
   config: GatewayConfig,
-): Promise<PaymentOperation> {
+): Promise<PaymentOperationRecoveryResult> {
   if (!config.x402.paymentOperations) throw new Error('durable payment operations are not configured')
   return config.x402.paymentOperations.reclaimPayment(operationId)
 }
@@ -1131,7 +1188,9 @@ export async function* dispatchSandboxStreamRich(
   maxOutputTokens?: number,
   onExecutionStart?: () => Promise<void>,
   requiresReceipt = config.x402.paymentOperations !== undefined,
-  onSandboxStart?: () => void,
+  onSandboxStart?: () => void | Promise<void>,
+  maxInputTokens?: number,
+  onExecutionHeartbeat?: () => Promise<void>,
 ): AsyncIterable<A2ADispatchEvent> {
   if (signal?.aborted) return
   const box = await config.getSandbox(agent)
@@ -1153,34 +1212,66 @@ export async function* dispatchSandboxStreamRich(
   let observedToolTokens = 0
   let observedToolCalls = 0
   let legacyOutputText = ''
+  const executionController = new AbortController()
+  const forwardAbort = () => executionController.abort()
+  if (signal?.aborted) return
+  signal?.addEventListener('abort', forwardAbort, { once: true })
   const executionBudget: SandboxExecutionBudget = {
-    maxInputTokens: maximumBillableInputTokens(agent, userMessage),
+    maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
     maxOutputTokens: outputLimit,
     maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
     maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
     maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
-    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ??
-      (maximumBillableInputTokens(agent, userMessage) + outputLimit +
+    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
+      (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit +
         (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
-        (config.executionBudget?.maxToolTokens ?? outputLimit)) * agent.pricePerTokenUsd,
+        (config.executionBudget?.maxToolTokens ?? outputLimit)
+    ) * agent.pricePerTokenUsd,
   }
-  if (signal?.aborted) return
+  if (executionController.signal.aborted) return
   await onExecutionStart?.()
-  if (signal?.aborted) return
-  // A stream adapter can start paid work synchronously during this call.
-  onSandboxStart?.()
-  const promptStream = box.streamPrompt(userMessage, {
-    sessionId: sessionId ?? `consumer:${consumerId}`,
-    systemPrompt: agent.systemPrompt,
-    maxOutputTokens: outputLimit,
-    executionBudget,
-    signal,
-  })
-  const iterator = promptStream[Symbol.asyncIterator]()
+  if (executionController.signal.aborted) return
+  let heartbeatError: unknown
+  let heartbeatInFlight: Promise<void> | undefined
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+  let iterator: AsyncIterator<SandboxStreamEvent> | undefined
   try {
+    // This durable handoff is after sandbox acquisition and immediately before
+    // the adapter call that may start paid work.
+    await onSandboxStart?.()
+    const promptStream = box.streamPrompt(userMessage, {
+      sessionId: sessionId ?? `consumer:${consumerId}`,
+      systemPrompt: agent.systemPrompt,
+      maxOutputTokens: outputLimit,
+      executionBudget,
+      signal: executionController.signal,
+    })
+    iterator = promptStream[Symbol.asyncIterator]()
+    const heartbeatMs = onExecutionHeartbeat
+      ? Math.max(100, Math.min(
+          Math.floor((config.paymentRecovery?.receiptTimeoutMs ?? 5 * 60_000) / 3),
+          5_000,
+        ))
+      : 0
+    if (onExecutionHeartbeat) {
+      heartbeatTimer = setInterval(() => {
+        if (heartbeatInFlight || heartbeatError !== undefined) return
+        heartbeatInFlight = onExecutionHeartbeat()
+          .catch((error: unknown) => {
+            heartbeatError = error
+            executionController.abort()
+          })
+          .finally(() => {
+            heartbeatInFlight = undefined
+          })
+      }, heartbeatMs)
+    }
     while (true) {
-      const next = await readSandboxEvent(iterator, signal)
-      if (next === ABORTED_SANDBOX_READ) return
+      const next = await readSandboxEvent(iterator, executionController.signal)
+      if (next === ABORTED_SANDBOX_READ) {
+        if (heartbeatError !== undefined) throw heartbeatError
+        return
+      }
       if (next.done) break
       const event = next.value
       if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
@@ -1249,7 +1340,9 @@ export async function* dispatchSandboxStreamRich(
     )
     yield { kind: 'usage', usage }
   } finally {
-    await closeSandboxIterator(iterator)
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
+    signal?.removeEventListener('abort', forwardAbort)
+    if (iterator) await closeSandboxIterator(iterator)
   }
 }
 
@@ -1650,7 +1743,12 @@ export function estimateBillableInputTokens(agent: AgentMeta, userMessage: strin
 }
 
 /** A tokenizer cannot emit more tokens than the UTF-8 bytes it consumes. */
-export function maximumBillableInputTokens(agent: AgentMeta, userMessage: string): number {
+export function maximumBillableInputTokens(agent: AgentMeta, userMessage: string): number
+export function maximumBillableInputTokens(agent: AgentMeta, messages: readonly ChatMessage[]): number
+export function maximumBillableInputTokens(agent: AgentMeta, userMessageOrMessages: string | readonly ChatMessage[]): number {
   const encoder = new TextEncoder()
-  return encoder.encode(userMessage).byteLength + encoder.encode(agent.systemPrompt ?? '').byteLength
+  const prompt = typeof userMessageOrMessages === 'string'
+    ? userMessageOrMessages
+    : JSON.stringify(userMessageOrMessages)
+  return encoder.encode(prompt).byteLength + encoder.encode(agent.systemPrompt ?? '').byteLength
 }

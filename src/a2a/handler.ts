@@ -18,6 +18,8 @@ import {
   type GatewayState,
   authenticateAndGuard,
   beginPaymentExecution,
+  markPaymentExecutionStarted,
+  renewPaymentExecution,
   claimPayment,
   dispatchSandboxStreamRich,
   releasePayment,
@@ -32,12 +34,19 @@ import {
 } from '../payment-recovery'
 import { recoverPayment as recoverDurablePayment } from '../payment-recovery-worker'
 import type {
+  ChatMessage,
   GatewayConfig,
   PaymentMethod,
   SandboxExecutionBudget,
   SandboxUsageReceipt,
 } from '../types'
 import { buildAgentCard } from './agent-card'
+import {
+  claimTaskExecution,
+  clearTaskExecution,
+  hasActiveTaskExecution,
+  renewTaskExecution,
+} from './execution-fence'
 import { fail, ok, parseEnvelope } from './jsonrpc'
 import {
   deliverPushNotifications,
@@ -168,6 +177,11 @@ class CancelRegistry {
     return this.finalizing.has(taskId)
   }
 
+  hasController(taskId: string): boolean {
+    const controller = this.controllers.get(taskId)
+    return controller !== undefined && !controller.signal.aborted
+  }
+
   cancel(taskId: string): boolean {
     if (this.finalizing.has(taskId)) return false
     const c = this.controllers.get(taskId)
@@ -283,7 +297,7 @@ async function executeMessageSend(
   signal: AbortSignal,
 ): Promise<Response> {
   if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
-  const workingTask: Task = task.status.state === 'working'
+  let workingTask: Task = task.status.state === 'working'
     ? task
     : { ...task, status: { state: 'working', timestamp: nowIso() } }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
@@ -305,7 +319,6 @@ async function executeMessageSend(
   let inputRequiredSeen = false
   let finalizationLeaseId: string | undefined
   try {
-    await beginPaymentExecution(authz, deps.config)
     for await (const event of dispatchSandboxStreamRich(
       authz.agent,
       authz.userMessage,
@@ -314,10 +327,19 @@ async function executeMessageSend(
       signal,
       task.id,
       authz.maxOutputTokens,
-      undefined,
+      async () => {
+        workingTask = await claimTaskExecution(deps.taskStore, workingTask, authz.requestId)
+        await beginPaymentExecution(authz, deps.config)
+      },
       authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-      () => {
+      async () => {
         workObserved = true
+        await markPaymentExecutionStarted(authz, deps.config)
+      },
+      authz.executionBudget.maxInputTokens,
+      async () => {
+        workingTask = await renewTaskExecution(deps.taskStore, task.id, authz.requestId)
+        await renewPaymentExecution(authz, deps.config)
       },
     )) {
       if (event.kind === 'text') {
@@ -499,7 +521,7 @@ async function handleMessageStream(
     cancels.clear(task.id)
     return c.json(ok(req.id, task))
   }
-  const workingTask: Task = task.status.state === 'working'
+  let workingTask: Task = task.status.state === 'working'
     ? task
     : { ...task, status: workingStatus.status }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
@@ -514,26 +536,6 @@ async function handleMessageStream(
     )
     if (current.status.state === 'canceled') return c.json(ok(req.id, current))
     return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' changed before execution`))
-  }
-  try {
-    await beginPaymentExecution(authz, deps.config)
-  } catch (error) {
-    detachRequestAbort()
-    cancels.clear(task.id)
-    await releaseTaskPayment(
-      authz,
-      workingTask,
-      deps,
-      error instanceof Error ? error.message : String(error),
-      false,
-    )
-    return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment execution authorization failed'))
-  }
-  if (controller.signal.aborted) {
-    detachRequestAbort()
-    cancels.clear(task.id)
-    const canceled = await completeCanceledTask(authz, workingTask, '', undefined, false, deps)
-    return c.json(ok(req.id, canceled))
   }
   let responseText = ''
   let usage: SandboxUsageReceipt | undefined
@@ -566,10 +568,19 @@ async function handleMessageStream(
             controller.signal,
             task.id,
             authz.maxOutputTokens,
-            undefined,
+            async () => {
+              workingTask = await claimTaskExecution(deps.taskStore, workingTask, authz.requestId)
+              await beginPaymentExecution(authz, deps.config)
+            },
             authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-            () => {
+            async () => {
               workObserved = true
+              await markPaymentExecutionStarted(authz, deps.config)
+            },
+            authz.executionBudget.maxInputTokens,
+            async () => {
+              workingTask = await renewTaskExecution(deps.taskStore, task.id, authz.requestId)
+              await renewPaymentExecution(authz, deps.config)
             },
           )) {
             if (event.kind === 'text') {
@@ -900,7 +911,11 @@ async function handleTasksCancel(
     )
   }
 
-  if (isTaskFinalizing(task) || cancels.isFinalizing(task.id)) {
+  if (
+    isTaskFinalizing(task) ||
+    cancels.isFinalizing(task.id) ||
+    (hasActiveTaskExecution(task) && !cancels.hasController(task.id))
+  ) {
     return c.json(
       fail(
         req.id,
@@ -1132,15 +1147,34 @@ async function guardMessageRequest(
     return c.json(fail(req.id, extracted.error.code, extracted.error.message))
   }
 
+  let billingMessages: ChatMessage[] = [{ role: 'user', content: extracted.text }]
+  if (typeof params.message.taskId === 'string') {
+    const storedForQuote = await deps.taskStore.get(params.message.taskId)
+    if (storedForQuote) {
+      const accessError = await authorizeTaskAccess(c, req, storedForQuote, deps)
+      if (accessError) return accessError
+      const quotedTask = await recoverTaskIfNeeded(storedForQuote, deps, slug)
+      if (quotedTask.status.state === 'input-required') {
+        billingMessages = [
+          ...taskHistoryAsChatMessages(quotedTask),
+          { role: 'user', content: extracted.text },
+        ]
+      }
+    }
+  }
+
   const guard = await authenticateAndGuard(
     c,
     slug,
-    [{ role: 'user', content: extracted.text }],
+    billingMessages,
     deps.config,
     deps.state,
   )
   if (guard instanceof Response) return guard
   const authz = guard
+  // The provider session receives only the new turn. The quote above covers
+  // every retained message and the configured hidden provider context.
+  authz.userMessage = extracted.text
 
   // Multi-turn continuation: if the caller addressed an existing task that is
   // currently in `input-required`, append the new message and reserve it as
@@ -1496,6 +1530,7 @@ async function completeCanceledTask(
 const FINALIZING_METADATA_KEY = 'gatewayFinalizing'
 const PAYMENT_RELEASE_METADATA_KEY = 'gatewayPaymentRelease'
 const PAYMENT_RECOVERY_METADATA_KEY = 'gatewayPaymentRecovery'
+const EXECUTION_RECOVERY_METADATA_KEY = 'gatewayExecutionRecovery'
 const FINALIZATION_LEASE_MS = 5 * 60 * 1000
 const PAYMENT_RELEASE_LEASE_MS = 5 * 60 * 1000
 
@@ -1567,6 +1602,17 @@ function bindRequestAbort(requestSignal: AbortSignal, controller: AbortControlle
   if (requestSignal.aborted) abort()
   else requestSignal.addEventListener('abort', abort, { once: true })
   return () => requestSignal.removeEventListener('abort', abort)
+}
+
+function taskHistoryAsChatMessages(task: Task): ChatMessage[] {
+  return (task.history ?? []).flatMap((message) => {
+    const extracted = extractTextFromMessage(message)
+    if ('error' in extracted) return []
+    return [{
+      role: message.role === 'agent' ? 'assistant' : 'user',
+      content: extracted.text,
+    }]
+  })
 }
 
 function withTaskOrigin(
@@ -2258,6 +2304,19 @@ async function clearReconciledPaymentRecoveryMarker(
   const record = await deps.config.paymentRecovery.store.get(marker.id)
   if (record?.state !== 'reconciled') return task
   const cleared = clearPaymentRecoveryMarker(task)
+  if (cleared.status.state === 'working') {
+    const failed: Task = {
+      ...withStatus(cleared, 'failed'),
+      metadata: {
+        ...(cleared.metadata ?? {}),
+        [EXECUTION_RECOVERY_METADATA_KEY]: {
+          error: 'payment recovery completed without a task result',
+        },
+      },
+    }
+    if (await compareAndSetTask(deps.taskStore, task, failed)) return failed
+    return await deps.taskStore.get(task.id) ?? failed
+  }
   if (await compareAndSetTask(deps.taskStore, task, cleared)) return cleared
   return await deps.taskStore.get(task.id) ?? cleared
 }
@@ -2378,11 +2437,12 @@ function withStatus(
   message?: Message,
   artifacts?: Task['artifacts'],
 ): Task {
-  return {
+  const next: Task = {
     ...task,
     status: { state, timestamp: nowIso(), ...(message ? { message } : {}) },
     ...(artifacts !== undefined ? { artifacts } : {}),
   }
+  return isTerminal(state) || state === 'input-required' ? clearTaskExecution(next) : next
 }
 
 /**

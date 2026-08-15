@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { KvNonceStore, type KVNamespace as NonceKV } from '../src/nonce-store'
+import { isAtomicNonceStore, KvNonceStore, type KVNamespace as NonceKV } from '../src/nonce-store'
 import { KvRateLimitStore, checkRateLimit } from '../src/rate-limit'
 import type { KVNamespace as RlKV } from '../src/rate-limit'
 
@@ -110,8 +110,31 @@ describe('KvNonceStore', () => {
     }
     const store = new KvNonceStore(cloudflareKv)
 
-    await expect(store.claim('legacy', 300)).rejects.toThrow('atomic putIfAbsent')
-    await expect(store.claim('version-2', 300, 'operation-1')).rejects.toThrow('atomic putIfAbsent')
+    expect(isAtomicNonceStore(store)).toBe(false)
+    await expect(store.claim('legacy', 300)).rejects.toThrow('atomicClaim')
+    await expect(store.claim('version-2', 300, 'operation-1')).rejects.toThrow('atomicClaim')
+  })
+
+  it('accepts an explicitly supplied atomic claim backend for standard KV', async () => {
+    const backing = new StubKV()
+    const cloudflareKv: NonceKV = {
+      get: backing.get.bind(backing),
+      put: backing.put.bind(backing),
+      delete: backing.delete.bind(backing),
+    }
+    const claims = new Map<string, string>()
+    const store = new KvNonceStore(cloudflareKv, 'nonce', {
+      atomicClaim: async (key, ttlSeconds, ownerId) => {
+        const existing = claims.get(key)
+        if (existing !== undefined) return ownerId !== undefined && existing === ownerId
+        claims.set(key, ownerId ?? '1')
+        await cloudflareKv.put(key, ownerId ?? '1', { expirationTtl: ttlSeconds })
+        return true
+      },
+    })
+
+    expect(isAtomicNonceStore(store)).toBe(true)
+    expect(await store.claim('backend', 300, 'operation-1')).toBe(true)
   })
 })
 

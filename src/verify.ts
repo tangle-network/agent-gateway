@@ -195,7 +195,7 @@ export async function verifyX402(
  * Returns authenticated identity if valid, null otherwise.
  * In demo mode, accepts any well-formed Payment header with an identity.
  */
-export async function verifyMpp(
+export async function verifyMppCredential(
   authHeader: string,
   config: MppConfig,
   x402Config: X402Config,
@@ -303,6 +303,29 @@ export async function verifyMpp(
   } catch {
     return null
   }
+}
+
+/**
+ * Verify an MPP credential using the 0.7.1 public return shape.
+ * Rich durable callers use verifyMppCredential instead.
+ */
+export async function verifyMpp(
+  authHeader: string,
+  config: MppConfig,
+  x402Config: X402Config,
+  nonceStore?: NonceStore,
+  minimumAmount = 1n,
+  markNonce = true,
+): Promise<string | null> {
+  const authenticated = await verifyMppCredential(
+    authHeader,
+    config,
+    x402Config,
+    nonceStore,
+    minimumAmount,
+    markNonce,
+  )
+  return authenticated?.consumerId ?? null
 }
 
 /**
