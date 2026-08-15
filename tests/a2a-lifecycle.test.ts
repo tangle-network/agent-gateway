@@ -305,8 +305,6 @@ describe('A2A lifecycle recovery and ownership', () => {
     const created = await taskStore.get('task-created-before-claim')
     expect(created?.status.state).toBe('submitted')
     expect(created?.metadata?.gatewaySubmission).toBeDefined()
-    await taskStore.delete('task-created-before-claim')
-    expect(await taskStore.get('task-created-before-claim')).toBeDefined()
     const submission = created?.metadata?.gatewaySubmission as {
       lease: { id: string; expiresAt: number }
     }

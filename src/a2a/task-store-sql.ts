@@ -123,6 +123,34 @@ export class SqlTaskStore implements TaskStore {
     return this.opts.table ?? 'a2a_tasks'
   }
 
+  private async readRow(id: string): Promise<{
+    payload: string
+    updatedAt: number
+  } | undefined> {
+    const rows = await this.db.query<{ payload: string; updated_at: number }>(
+      `SELECT payload, updated_at FROM ${this.table} WHERE id = ?`,
+      [id],
+    )
+    const row = rows[0]
+    return row ? { payload: row.payload, updatedAt: row.updated_at } : undefined
+  }
+
+  private isExpired(updatedAt: number, task: Task): boolean {
+    return Date.now() - updatedAt > this.ttlMs && !hasPendingPaymentRecovery(task)
+  }
+
+  private async deleteObservedRow(
+    id: string,
+    payload: string,
+    updatedAt: number,
+  ): Promise<number> {
+    const result = await this.db.exec(
+      `DELETE FROM ${this.table} WHERE id = ? AND payload = ? AND updated_at = ?`,
+      [id, payload, updatedAt],
+    )
+    return result.rowsAffected
+  }
+
   /** Idempotent. Call once at deploy. */
   async migrate(): Promise<void> {
     await this.db.exec(TASKS_TABLE_DDL(this.table))
@@ -130,23 +158,25 @@ export class SqlTaskStore implements TaskStore {
   }
 
   async get(id: string): Promise<Task | undefined> {
-    const rows = await this.db.query<{ payload: string; updated_at: number }>(
-      `SELECT payload, updated_at FROM ${this.table} WHERE id = ?`,
-      [id],
-    )
-    const row = rows[0]
+    const row = await this.readRow(id)
     if (!row) return undefined
     const task = JSON.parse(row.payload) as Task
-    if (Date.now() - row.updated_at > this.ttlMs && !hasPendingPaymentRecovery(task)) {
+    if (this.isExpired(row.updatedAt, task)) {
       // Delete only the version that was observed as stale. A refresh can reuse
-      // the same payload, so payload equality alone does not protect the row.
-      void this.db.exec(
-        `DELETE FROM ${this.table} WHERE id = ? AND payload = ? AND updated_at = ?`,
-        [id, row.payload, row.updated_at],
-      )
+      // the same payload, so payload equality and updated_at both fence the row.
+      await this.deleteObservedRow(id, row.payload, row.updatedAt)
       return undefined
     }
     return task
+  }
+
+  private async insert(task: Task): Promise<number> {
+    const payload = JSON.stringify(task)
+    const result = await this.db.exec(
+      `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
+      [task.id, task.contextId, task.status.state, payload, Date.now()],
+    )
+    return result.rowsAffected
   }
 
   async put(task: Task): Promise<void> {
@@ -168,18 +198,25 @@ export class SqlTaskStore implements TaskStore {
   }
 
   async createIfAbsent(task: Task): Promise<boolean> {
-    const payload = JSON.stringify(task)
     try {
-      const result = await this.db.exec(
-        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
-        [task.id, task.contextId, task.status.state, payload, Date.now()],
-      )
-      return result.rowsAffected === 1
+      return (await this.insert(task)) === 1
     } catch (error) {
-      // SQL dialects report duplicate primary keys as errors. Convert only a
-      // confirmed existing row into the protocol-level "already exists" result.
-      if (await this.get(task.id)) return false
-      throw error
+      // SQL dialects report duplicate primary keys as errors. Inspect the raw
+      // row so an expired row can be removed and retried in the same call.
+      const row = await this.readRow(task.id)
+      if (!row) throw error
+      const existing = JSON.parse(row.payload) as Task
+      if (!this.isExpired(row.updatedAt, existing)) return false
+
+      await this.deleteObservedRow(task.id, row.payload, row.updatedAt)
+      try {
+        return (await this.insert(task)) === 1
+      } catch (retryError) {
+        // Another writer may have won the retry after the stale row was
+        // removed. Return the normal idempotency result in that case.
+        if (await this.get(task.id)) return false
+        throw retryError
+      }
     }
   }
 

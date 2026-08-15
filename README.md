@@ -109,9 +109,12 @@ Wire protocol handlers only translate their request and response shapes.
 The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
 Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
 Custom production task stores must implement atomic `createIfAbsent` and `compareAndSet` methods.
-Task stores must retain gateway recovery metadata until reconciliation clears it.
+Task stores must retain payment recovery metadata until reconciliation clears it.
+The short-lived `gatewaySubmission` marker is not a payment recovery record and may expire with its task.
 The bundled memory and SQL stores enforce this rule even after the normal task TTL.
 Push destinations must use HTTPS without URL credentials.
+Push delivery does not follow redirects.
+Tasks created before this release have no recorded origin and fail closed; migrate them with a verified owner binding or let them expire.
 
 ## Tier
 

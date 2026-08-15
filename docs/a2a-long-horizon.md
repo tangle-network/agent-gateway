@@ -39,11 +39,16 @@ Usage attribution must atomically upsert by `requestId`.
 The finalization record stores whether attribution was acknowledged, so recovery does not repeat an acknowledged usage event.
 If a legacy record is malformed or has no recoverable operation, the gateway expires the task as failed.
 If work exists without a receipt, the outbox settles the original quoted ceiling after its configured timeout.
-The task-store TTL cannot delete a task while any gateway recovery marker remains.
+The task-store TTL cannot delete a task while any payment recovery marker remains.
+The short-lived `gatewaySubmission` marker is not a payment recovery marker.
+An abandoned submission without a payment marker may expire after the normal task TTL.
 
 Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
 The hook receives the task and request headers so the application can enforce task ownership.
 Explicit `x402.demoMode` permits these methods without the hook for local tests only.
+This is a fail-closed upgrade boundary.
+Tasks stored before this release do not have a `gatewayOrigin` binding and cannot pass the default ownership check.
+Migrate those records with a verified owner binding, or allow them to expire before enabling production control methods.
 
 ### D1 (Cloudflare Workers)
 

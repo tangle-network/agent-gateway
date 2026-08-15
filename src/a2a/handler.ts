@@ -144,6 +144,9 @@ const TASK_ORIGIN_METADATA_KEY = 'gatewayOrigin'
 const TASK_SUBMISSION_METADATA_KEY = 'gatewaySubmission'
 const TASK_SUBMISSION_RECOVERY_METADATA_KEY = 'gatewaySubmissionRecovery'
 const TASK_SUBMISSION_LEASE_MS = 5 * 60 * 1000
+const MAX_A2A_BODY_BYTES = 64 * 1024
+
+class RequestBodyTooLargeError extends Error {}
 
 /**
  * Per-gateway in-process registry of cancellable runs. Keyed by task id;
@@ -221,14 +224,20 @@ export function createA2AHandlers(deps: A2AHandlerDeps) {
 
     // Body size limit (DoS prevention) — mirrors the OpenAI-compat handler.
     const contentLength = Number.parseInt(c.req.header('Content-Length') ?? '0', 10)
-    if (contentLength > 65536) {
+    if (contentLength > MAX_A2A_BODY_BYTES) {
       return c.json(fail(null, A2A_ERROR_CODES.INVALID_REQUEST, 'request body too large (max 64KB)'), 413)
     }
 
     let raw: unknown
     try {
-      raw = await c.req.json()
-    } catch {
+      raw = await readJsonBody(c.req.raw)
+    } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        return c.json(
+          fail(null, A2A_ERROR_CODES.INVALID_REQUEST, 'request body too large (max 64KB)'),
+          413,
+        )
+      }
       return c.json(fail(null, A2A_ERROR_CODES.PARSE_ERROR, 'invalid JSON'), 400)
     }
     const parsed = parseEnvelope(raw)
@@ -2455,10 +2464,49 @@ function agentMessage(task: Task, text: string): Message {
     kind: 'message',
     role: 'agent',
     parts: [{ kind: 'text', text }],
-    messageId: `${task.id}-status-${task.status.state}-${nowIso()}`,
+    messageId: `${task.id}-status-${task.status.state}-${stableMessageDigest(text)}`,
     taskId: task.id,
     contextId: task.contextId,
   }
+}
+
+function stableMessageDigest(value: string): string {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+async function readJsonBody(request: Request): Promise<unknown> {
+  if (!request.body) return await request.json()
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        total += value.byteLength
+        if (total > MAX_A2A_BODY_BYTES) {
+          await reader.cancel().catch(() => undefined)
+          throw new RequestBodyTooLargeError('request body too large')
+        }
+        chunks.push(value)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const body = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return JSON.parse(new TextDecoder().decode(body)) as unknown
 }
 
 /**

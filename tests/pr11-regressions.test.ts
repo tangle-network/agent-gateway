@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { InMemoryTaskStore } from '../src/a2a/task-store'
+import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
 import { createAgentGateway } from '../src/middleware'
 import { dispatchSandboxStreamRich, requiredX402Amount } from '../src/dispatch'
 import { MemoryNonceStore, claimStoredNonce, type NonceStore } from '../src/nonce-store'
@@ -10,6 +11,7 @@ import { MemoryPaymentRecoveryStore, type PaymentRecoveryRecord } from '../src/p
 import { recoverPayment } from '../src/payment-recovery-worker'
 import { verifyMpp } from '../src/verify'
 import type { AgentMeta, GatewayConfig, SandboxStreamEvent } from '../src/types'
+import type { Task } from '../src/a2a/types'
 import type { MppConfig } from '../src/types'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
@@ -561,5 +563,196 @@ describe('PR #11 production regressions', () => {
 
     expect(discovery.status).toBe(200)
     expect(a2a.status).toBe(503)
+  })
+
+  it('does not retain an abandoned submission marker as payment recovery', async () => {
+    vi.useFakeTimers()
+    const store = new InMemoryTaskStore(10)
+    const task: Task = {
+      kind: 'task',
+      id: 'expired-submission',
+      contextId: 'expired-context',
+      status: { state: 'submitted', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewaySubmission: {
+          version: 1,
+          lease: { id: 'submission-lease', expiresAt: Date.now() + 5 * 60 * 1000 },
+          agentId: agent.id,
+          agentSlug: agent.slug,
+          requestId: 'submission-request',
+          consumerId: commitment,
+        },
+      },
+    }
+    await store.put(task)
+    await vi.advanceTimersByTimeAsync(11)
+
+    expect(await store.get(task.id)).toBeUndefined()
+  })
+
+  it('keeps generated input-required message ids stable across retries', async () => {
+    const makeApp = (nonce: string) => {
+      const app = new Hono()
+      const taskStore = new InMemoryTaskStore()
+      app.route('/v1/agents', createAgentGateway({
+        resolveAgent: async () => agent,
+        getSandbox: async () => sandbox([
+          { type: 'input-required', data: { inputRequired: { prompt: 'Need one more detail' } } },
+          { type: 'sandbox.usage', data: { usage: usage() } },
+        ]),
+        recordUsage: async () => undefined,
+        x402: {
+          operatorAddress,
+          chainId: 1,
+          demoMode: true,
+          paymentProtocolVersion: 1,
+          authorizePayment: async () => true,
+        },
+        nonceStore: new MemoryNonceStore(),
+        a2a: { taskStore, authorizeTaskAccess: async () => true },
+      }))
+      return app.request('/v1/agents/pr11', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Payment-Signature': paymentHeader(nonce),
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: nonce,
+          method: 'message/send',
+          params: {
+            message: {
+              kind: 'message',
+              role: 'user',
+              taskId: 'stable-input-required',
+              contextId: 'stable-context',
+              messageId: 'stable-request',
+              parts: [{ kind: 'text', text: 'run' }],
+            },
+          },
+        }),
+      })
+    }
+
+    const first = await makeApp('stable-1')
+    const second = await makeApp('stable-2')
+    const firstBody = await first.json() as { result?: { status?: { message?: { messageId?: string } } } }
+    const secondBody = await second.json() as { result?: { status?: { message?: { messageId?: string } } } }
+
+    expect(firstBody.result?.status?.message?.messageId).toBe(
+      secondBody.result?.status?.message?.messageId,
+    )
+  })
+
+  it('rejects oversized chunked A2A bodies without trusting Content-Length', async () => {
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig()))
+    const response = await app.fetch(new Request('http://gateway.test/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/get',
+        params: { id: 'oversized' },
+        padding: 'x'.repeat(70_000),
+      }),
+    }))
+
+    expect(response.status).toBe(413)
+  })
+
+  it('retries SQL task creation after removing an expired colliding row', async () => {
+    interface Row {
+      id: string
+      context_id: string
+      state: string
+      payload: string
+      updated_at: number
+    }
+    const rows = new Map<string, Row>()
+    const db: SqlAdapter = {
+      async exec(sql, params = []) {
+        const statement = sql.trim()
+        if (statement.startsWith('CREATE TABLE') || statement.startsWith('CREATE INDEX')) {
+          return { rowsAffected: 0 }
+        }
+        if (statement.startsWith('INSERT INTO')) {
+          const [id, contextId, state, payload, updatedAt] = params as [
+            string,
+            string,
+            string,
+            string,
+            number,
+          ]
+          if (rows.has(id)) throw new Error('duplicate primary key')
+          rows.set(id, { id, context_id: contextId, state, payload, updated_at: updatedAt })
+          return { rowsAffected: 1 }
+        }
+        if (statement.startsWith('DELETE FROM')) {
+          const [id, payload, updatedAt] = params as [string, string, number]
+          const row = rows.get(id)
+          if (!row || row.payload !== payload || row.updated_at !== updatedAt) {
+            return { rowsAffected: 0 }
+          }
+          rows.delete(id)
+          return { rowsAffected: 1 }
+        }
+        throw new Error(`unrecognized SQL: ${statement}`)
+      },
+      async query<TRow>(_sql: string, params: readonly unknown[] = []): Promise<TRow[]> {
+        const row = rows.get(params[0] as string)
+        return (row ? [{ payload: row.payload, updated_at: row.updated_at }] : []) as TRow[]
+      },
+    }
+    const store = new SqlTaskStore(db, { ttlMs: 10 })
+    const oldTask: Task = {
+      kind: 'task',
+      id: 'sql-expired-task',
+      contextId: 'sql-context',
+      status: { state: 'submitted', timestamp: new Date().toISOString() },
+    }
+    expect(await store.createIfAbsent(oldTask)).toBe(true)
+    rows.get(oldTask.id)!.updated_at = Date.now() - 100
+    const replacement: Task = {
+      ...oldTask,
+      status: { state: 'failed', timestamp: new Date().toISOString() },
+    }
+
+    expect(await store.createIfAbsent(replacement)).toBe(true)
+    expect((await store.get(replacement.id))?.status.state).toBe('failed')
+  })
+
+  it('does not follow push notification redirects', async () => {
+    const { deliverPushNotifications } = await import('../src/a2a/push-notifications')
+    const pushStore = {
+      async list() {
+        return [{ id: 'redirect', url: 'https://hook.example/redirect' }]
+      },
+    }
+    const fetcher = vi.fn(async (_url: string, _init: RequestInit) => (
+      new Response(null, { status: 302, headers: { Location: 'http://169.254.169.254/' } })
+    ))
+    const results = await deliverPushNotifications({
+      task: {
+        kind: 'task',
+        id: 'redirect-task',
+        contextId: 'redirect-context',
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      },
+      store: {
+        list: pushStore.list,
+        set: async () => undefined,
+        get: async () => undefined,
+        delete: async () => undefined,
+      },
+      webhookSecret: undefined,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    expect(results[0]).toMatchObject({ ok: false, status: 302 })
+    expect(results[0]?.error).toContain('redirect')
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ redirect: 'manual' })
   })
 })

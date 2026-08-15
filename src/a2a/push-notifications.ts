@@ -252,13 +252,23 @@ export async function deliverPushNotifications(args: {
       if (url.protocol !== 'https:' || url.username !== '' || url.password !== '') {
         throw new Error('push notification URL must use https without credentials')
       }
-      const res = await fetcher(config.url, { method: 'POST', headers, body })
+      const res = await fetcher(config.url, {
+        method: 'POST',
+        headers,
+        body,
+        // Never follow a user-controlled redirect. The redirected destination
+        // could be an internal HTTP service or instance metadata endpoint.
+        redirect: 'manual',
+      })
       result = {
         taskId: args.task.id,
         configId: config.id,
         url: config.url,
         ok: res.ok,
         status: res.status,
+        ...(res.status >= 300 && res.status < 400
+          ? { error: 'push notification redirect rejected' }
+          : {}),
       }
     } catch (err) {
       result = {
