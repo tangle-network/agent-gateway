@@ -20,17 +20,21 @@ The gateway rejects a production task store that lacks either method before it s
 Explicit `x402.demoMode` keeps a read-then-write fallback for local tests only.
 Use `SqlTaskStore` or another atomic adapter for multi-worker production deployments.
 
-Before payment settlement, the gateway stores a recovery record in task metadata.
+Before a payment provider can mutate state, the gateway stores the recovery identity in task metadata.
 The record contains the payment operation, usage receipt, output artifact, and a five-minute lease.
+The task also points to the shared payment recovery outbox.
+This outbox survives task-handler crashes and supports scheduled recovery without a task read.
 After a restart, the first task read after lease expiry resumes settlement with the same operation.
 If settlement acknowledgement fails, the gateway keeps the operation and retries after the lease expires.
 Cancellation stores the recovery record before it completes the canceled task.
 The canceled task therefore keeps a retryable lease when settlement acknowledgement fails.
-If cancellation must release an unused durable operation, the gateway stores a separate release record before calling the release adapter.
-An ambiguous release acknowledgement is retried after its five-minute lease, and the record is cleared only after release acknowledgement.
+If cancellation must release an unused durable operation, the shared outbox enters `releasing` before the adapter call.
+An ambiguous release acknowledgement remains in that outbox and is retried by operation ID.
 Usage attribution must atomically upsert by `requestId`.
 The finalization record stores whether attribution was acknowledged, so recovery does not repeat an acknowledged usage event.
-If the record is malformed or has no recoverable operation, the gateway expires the task as failed.
+If a legacy record is malformed or has no recoverable operation, the gateway expires the task as failed.
+If work exists without a receipt, the outbox settles the original quoted ceiling after its configured timeout.
+The task-store TTL cannot delete a task while any gateway recovery marker remains.
 
 Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
 The hook receives the task and request headers so the application can enforce task ownership.
@@ -132,7 +136,10 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context ON a2a_tasks (context_id, updated_at);
 ```
 
-One table, JSON payload. TTL is enforced at read time (default 1 hour, configurable via `new SqlTaskStore(db, { ttlMs })`); expired rows are lazily deleted so callers see consistent "expired" semantics regardless of when the GC actually runs.
+One table stores the JSON payload.
+TTL is enforced at read time and defaults to one hour.
+Configure it with `new SqlTaskStore(db, { ttlMs })`.
+Expired rows are lazily deleted only when they have no payment recovery marker.
 
 `SqlTaskStore` also exposes `listByContext(contextId)` for surfacing all tasks in a conversation when the consumer's UI wants to show a thread view.
 

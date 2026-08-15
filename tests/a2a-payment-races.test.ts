@@ -3,12 +3,22 @@ import { describe, expect, it } from 'vitest'
 
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { createAgentGateway } from '../src/middleware'
+import type { MppChargeLifecycle, MppChargeOperation } from '../src/mpp-payment'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryPaymentOperations, type PaymentOperation } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
+import { recoverPayment } from '../src/payment-recovery-worker'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
+
+function createTestGateway(config: GatewayConfig) {
+  return createAgentGateway({
+    ...config,
+    paymentRecovery: config.paymentRecovery ?? { store: new MemoryPaymentRecoveryStore() },
+  })
+}
 
 const agent: AgentMeta = {
   id: 'agent-a2a-races',
@@ -32,6 +42,53 @@ function paymentHeader(nonce: string): string {
     nonce,
     expiry: String(Math.floor(Date.now() / 1000) + 300),
   })
+}
+
+function stripePaymentHeader(token: string): string {
+  const credential = Buffer.from(JSON.stringify({ sharedPaymentToken: token })).toString('base64url')
+  return `Payment stripe ${credential}`
+}
+
+class A2AChargeLifecycle implements MppChargeLifecycle {
+  readonly protocolVersion = 1 as const
+  readonly operations = new Map<string, MppChargeOperation>()
+  confirmations = 0
+  releases = 0
+  confirmationGate?: Promise<void>
+  confirmationStarted?: () => void
+  loseConfirmationAcknowledgement = false
+
+  async confirmPayment(request: Parameters<MppChargeLifecycle['confirmPayment']>[0]) {
+    this.confirmations += 1
+    this.confirmationStarted?.()
+    await this.confirmationGate
+    const operation: MppChargeOperation = {
+      protocolVersion: 1,
+      operationId: request.operationId,
+      acquiredByRequestId: request.requestId,
+      method: request.method,
+      receipt: `stripe-receipt=${request.operationId}`,
+      state: 'confirmed',
+    }
+    this.operations.set(request.operationId, operation)
+    if (this.loseConfirmationAcknowledgement) {
+      throw new Error('Stripe confirmation acknowledgement lost')
+    }
+    return operation
+  }
+
+  async releasePayment(operation: MppChargeOperation) {
+    const current = this.operations.get(operation.operationId)
+    if (current?.state === 'released') return current
+    this.releases += 1
+    const released: MppChargeOperation = { ...operation, state: 'released' }
+    this.operations.set(operation.operationId, released)
+    return released
+  }
+
+  async recoverPayment(operationId: string) {
+    return this.operations.get(operationId) ?? { operationId, state: 'not-found' as const }
+  }
 }
 
 function message(text: string, taskId: string) {
@@ -95,7 +152,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const continuation = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('76') },
@@ -121,11 +178,90 @@ describe('A2A payment ownership races', () => {
     expect(canceled.status).toBe(200)
     finishAuthorization()
     const response = await continuation
-    const body = await response.json() as { error?: { code?: number } }
+    const body = await response.json() as { result?: { status?: { state?: string } } }
 
-    expect(body.error?.code).toBe(-32602)
+    expect(body.result?.status?.state).toBe('canceled')
     expect(runs).toBe(0)
     expect((await taskStore.get('task-payment-cancel'))?.status.state).toBe('canceled')
+  })
+
+  it('retains a continuation task until ambiguous Stripe confirmation reconciles', async () => {
+    const taskStore = new InMemoryTaskStore()
+    await taskStore.put({
+      kind: 'task',
+      id: 'task-stripe-continuation-recovery',
+      contextId: 'ctx-race',
+      status: { state: 'input-required', timestamp: new Date().toISOString() },
+      history: [message('initial', 'task-stripe-continuation-recovery')],
+    })
+    const lifecycle = new A2AChargeLifecycle()
+    lifecycle.loseConfirmationAcknowledgement = true
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    let runs = 0
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          runs += 1
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: { operatorAddress, chainId: 1, demoMode: true },
+      mpp: {
+        realm: 'gateway.test',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'stripe:customer',
+          paymentIdentity: String(payload.sharedPaymentToken),
+        }),
+        charge: lifecycle,
+      },
+      paymentRecovery: { store: recoveryStore },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const continuation = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: stripePaymentHeader('spt_continuation_ack'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('continue', 'task-stripe-continuation-recovery') },
+      }),
+    })
+    const failed = await continuation.json() as { error?: { code?: number } }
+    const retained = await taskStore.get('task-stripe-continuation-recovery')
+    const marker = retained?.metadata?.gatewayPaymentRecovery as { id: string }
+
+    expect(failed.error?.code).toBe(-32603)
+    expect(retained?.status.state).toBe('input-required')
+    expect(marker.id).toMatch(/^mpp:stripe:/)
+    await taskStore.delete('task-stripe-continuation-recovery')
+    expect(await taskStore.get('task-stripe-continuation-recovery')).toBeDefined()
+    expect(runs).toBe(0)
+    expect(lifecycle.confirmations).toBe(1)
+
+    expect((await recoverPayment(marker.id, config, { force: true }))?.state).toBe('reconciled')
+    const fetched = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/get',
+        params: { id: 'task-stripe-continuation-recovery' },
+      }),
+    })
+    expect(fetched.status).toBe(200)
+    expect(lifecycle.releases).toBe(1)
+    expect((await taskStore.get('task-stripe-continuation-recovery'))?.metadata?.gatewayPaymentRecovery)
+      .toBeUndefined()
   })
 
   it('releases payment when cancellation interrupts execution before sandbox start', async () => {
@@ -168,7 +304,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
 
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -234,7 +370,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const request = (text: string) => app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk_agent_race' },
@@ -288,7 +424,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('75') },
@@ -366,7 +502,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('78') },
@@ -453,7 +589,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const stream = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('80') },
@@ -524,7 +660,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('79') },
@@ -588,7 +724,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const streamPromise = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: {
@@ -678,7 +814,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
 
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -753,6 +889,7 @@ describe('A2A payment ownership races', () => {
 
   it('persists and recovers an ambiguous release acknowledgement', async () => {
     const taskStore = new InMemoryTaskStore()
+    const recoveryStore = new MemoryPaymentRecoveryStore()
     let executionStarted!: () => void
     const executionReady = new Promise<void>((resolve) => { executionStarted = resolve })
     let releaseExecution!: () => void
@@ -796,10 +933,11 @@ describe('A2A payment ownership races', () => {
         paymentOperations: operations,
       },
       nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: recoveryStore },
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
 
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -835,26 +973,11 @@ describe('A2A payment ownership races', () => {
     expect(releaseCalls).toBe(1)
 
     const retained = await taskStore.get('task-release-recovery')
-    const marker = retained?.metadata?.gatewayPaymentRelease as {
-      lease: { id: string; expiresAt: number }
-      operationId: string
-      recoveryAttempts?: number
-    }
+    const marker = retained?.metadata?.gatewayPaymentRecovery as { id: string }
     expect(retained?.status.state).toBe('canceled')
-    expect(marker.operationId).toBe(`x402:${commitment}:84`)
-    expect(marker.lease.expiresAt).toBeGreaterThan(Date.now())
-    expect(marker.recoveryAttempts).toBe(1)
-
-    await taskStore.put({
-      ...retained!,
-      metadata: {
-        ...retained!.metadata,
-        gatewayPaymentRelease: {
-          ...marker,
-          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
-        },
-      },
-    })
+    expect(marker.id).toBe(`x402:${commitment}:84`)
+    expect((await recoveryStore.get(marker.id))?.state).toBe('releasing')
+    expect((await recoverPayment(marker.id, config, { force: true }))?.state).toBe('reconciled')
     const recovered = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -869,7 +992,7 @@ describe('A2A payment ownership races', () => {
       result?: { status?: { state?: string } }
     }
     expect(recoveredBody.result?.status?.state).toBe('canceled')
-    expect((await taskStore.get('task-release-recovery'))?.metadata?.gatewayPaymentRelease).toBeUndefined()
+    expect((await taskStore.get('task-release-recovery'))?.metadata?.gatewayPaymentRecovery).toBeUndefined()
     expect(operations.get(`x402:${commitment}:84`)?.state).toBe('released')
     expect(releaseCalls).toBe(1)
     expect(recoveryCalls).toBe(1)
@@ -877,6 +1000,7 @@ describe('A2A payment ownership races', () => {
 
   it('recovers an ambiguous release after shared nonce ownership fails', async () => {
     const taskStore = new InMemoryTaskStore()
+    const recoveryStore = new MemoryPaymentRecoveryStore()
     const nonceStore = {
       hasSeen: async () => false,
       claim: async () => false,
@@ -917,10 +1041,11 @@ describe('A2A payment ownership races', () => {
         paymentOperations: operations,
       },
       nonceStore,
+      paymentRecovery: { store: recoveryStore },
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
 
     const response = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -937,25 +1062,17 @@ describe('A2A payment ownership races', () => {
     expect(sandboxStarted).toBe(false)
     expect(operations.get(`x402:${commitment}:86`)?.state).toBe('releasing')
     expect(releaseCalls).toBe(1)
-    expect(recoveryCalls).toBe(1)
+    expect(recoveryCalls).toBe(0)
 
     const retained = await taskStore.get('task-nonce-release-recovery')
-    const marker = retained?.metadata?.gatewayPaymentRelease as {
-      lease: { id: string; expiresAt: number }
-      operationId: string
-    }
+    const marker = retained?.metadata?.gatewayPaymentRecovery as { id: string }
     expect(retained?.status.state).toBe('failed')
-    expect(marker.operationId).toBe(`x402:${commitment}:86`)
-    await taskStore.put({
-      ...retained!,
-      metadata: {
-        ...retained!.metadata,
-        gatewayPaymentRelease: {
-          ...marker,
-          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
-        },
-      },
-    })
+    expect(marker.id).toBe(`x402:${commitment}:86`)
+    await expect(recoverPayment(marker.id, config, { force: true })).rejects.toThrow(
+      'release recovery acknowledgement also lost',
+    )
+    expect(recoveryCalls).toBe(1)
+    expect((await recoverPayment(marker.id, config, { force: true }))?.state).toBe('reconciled')
 
     const recovered = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -968,7 +1085,7 @@ describe('A2A payment ownership races', () => {
       }),
     })
     expect(recovered.status).toBe(200)
-    expect((await taskStore.get('task-nonce-release-recovery'))?.metadata?.gatewayPaymentRelease)
+    expect((await taskStore.get('task-nonce-release-recovery'))?.metadata?.gatewayPaymentRecovery)
       .toBeUndefined()
     expect(operations.get(`x402:${commitment}:86`)?.state).toBe('released')
     expect(recoveryCalls).toBe(2)
@@ -1011,7 +1128,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
 
     const send = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
@@ -1066,5 +1183,225 @@ describe('A2A payment ownership races', () => {
     expect(usageRequestIds.size).toBe(1)
     expect((await taskStore.get('task-usage-recovery'))?.metadata?.gatewayFinalizing).toBeUndefined()
     expect(operations.get(`x402:${commitment}:85`)?.state).toBe('settled')
+  })
+
+  it('cancels during generic MPP confirmation without executing or stranding the charge', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const lifecycle = new A2AChargeLifecycle()
+    let confirmationStarted!: () => void
+    const confirmationReady = new Promise<void>((resolve) => { confirmationStarted = resolve })
+    lifecycle.confirmationStarted = confirmationStarted
+    let releaseConfirmation!: () => void
+    lifecycle.confirmationGate = new Promise<void>((resolve) => { releaseConfirmation = resolve })
+    let runs = 0
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          runs += 1
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: { operatorAddress, chainId: 1, demoMode: true },
+      mpp: {
+        realm: 'gateway.test',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'stripe:customer',
+          paymentIdentity: String(payload.sharedPaymentToken),
+        }),
+        charge: lifecycle,
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: stripePaymentHeader('spt_cancel_confirm'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-stripe-confirm-cancel') },
+      }),
+    })
+    await confirmationReady
+    expect((await taskStore.get('task-stripe-confirm-cancel'))?.metadata?.gatewayPaymentRecovery)
+      .toBeDefined()
+    await taskStore.delete('task-stripe-confirm-cancel')
+    expect(await taskStore.get('task-stripe-confirm-cancel')).toBeDefined()
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-stripe-confirm-cancel' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseConfirmation()
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } } }
+
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(runs).toBe(0)
+    expect(lifecycle.confirmations).toBe(1)
+    expect(lifecycle.releases).toBe(1)
+    expect([...lifecycle.operations.values()][0]?.state).toBe('released')
+    expect((await taskStore.get('task-stripe-confirm-cancel'))?.metadata?.gatewayPaymentRecovery)
+      .toBeUndefined()
+  })
+
+  it('returns the confirmed generic MPP receipt on A2A send and stream responses', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const lifecycle = new A2AChargeLifecycle()
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: { operatorAddress, chainId: 1, demoMode: true },
+      mpp: {
+        realm: 'gateway.test',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'stripe:customer',
+          paymentIdentity: String(payload.sharedPaymentToken),
+        }),
+        charge: lifecycle,
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const request = (method: 'message/send' | 'message/stream', taskId: string, token: string) =>
+      app.request('/v1/agents/a2a-races', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: stripePaymentHeader(token),
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: taskId,
+          method,
+          params: { message: message('run', taskId) },
+        }),
+      })
+
+    const sent = await request('message/send', 'task-stripe-send-receipt', 'spt_send_receipt')
+    await sent.text()
+    const streamed = await request('message/stream', 'task-stripe-stream-receipt', 'spt_stream_receipt')
+    await streamed.text()
+
+    expect(sent.status).toBe(200)
+    expect(sent.headers.get('Payment-Receipt')).toContain('stripe-receipt=')
+    expect(sent.headers.get('X-Payment-Operation-Id')).toMatch(/^mpp:stripe:/)
+    expect(streamed.status).toBe(200)
+    expect(streamed.headers.get('Payment-Receipt')).toContain('stripe-receipt=')
+    expect(streamed.headers.get('X-Payment-Operation-Id')).toMatch(/^mpp:stripe:/)
+    expect(lifecycle.confirmations).toBe(2)
+  })
+
+  it('recovers generic MPP usage acknowledgement loss from the durable task receipt', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const lifecycle = new A2AChargeLifecycle()
+    const requestIds = new Set<string>()
+    let recordCalls = 0
+    let firstAcknowledgement = true
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async (event) => {
+        recordCalls += 1
+        requestIds.add(event.requestId)
+        if (firstAcknowledgement) {
+          firstAcknowledgement = false
+          throw new Error('usage acknowledgement lost after insert')
+        }
+      },
+      x402: { operatorAddress, chainId: 1, demoMode: true },
+      mpp: {
+        realm: 'gateway.test',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'stripe:customer',
+          paymentIdentity: String(payload.sharedPaymentToken),
+        }),
+        charge: lifecycle,
+      },
+      paymentRecovery: { store: recoveryStore },
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const sent = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: stripePaymentHeader('spt_usage_ack'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-stripe-usage-recovery') },
+      }),
+    })
+    const failed = await sent.json() as { error?: { code?: number } }
+    expect(failed.error?.code).toBe(-32603)
+    const retained = await taskStore.get('task-stripe-usage-recovery')
+    const finalization = retained?.metadata?.gatewayFinalizing as {
+      lease: { id: string; expiresAt: number }
+    }
+    expect(retained?.metadata?.gatewayPaymentRecovery).toBeDefined()
+    await taskStore.put({
+      ...retained!,
+      metadata: {
+        ...retained!.metadata,
+        gatewayFinalizing: {
+          ...finalization,
+          lease: { ...finalization.lease, expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+
+    const recovered = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/get',
+        params: { id: 'task-stripe-usage-recovery' },
+      }),
+    })
+    const body = await recovered.json() as { result?: { status?: { state?: string } } }
+
+    expect(body.result?.status?.state).toBe('completed')
+    expect(recordCalls).toBe(2)
+    expect(requestIds.size).toBe(1)
+    expect(lifecycle.confirmations).toBe(1)
+    expect(lifecycle.releases).toBe(0)
+    expect((await taskStore.get('task-stripe-usage-recovery'))?.metadata).toBeUndefined()
   })
 })

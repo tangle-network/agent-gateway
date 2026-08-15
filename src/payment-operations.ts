@@ -1,4 +1,5 @@
 import type { SandboxUsageReceipt } from './types'
+import type { PaymentSettlementBasis } from './payment-recovery'
 
 /** Version negotiated by gateways that use durable payment operations. */
 export const PAYMENT_PROTOCOL_VERSION = 2 as const
@@ -51,6 +52,8 @@ export interface PaymentSettlementInput {
   amount: bigint
   totalCostUsd: number
   usage: SandboxUsageReceipt
+  /** Distinguishes a provider receipt from the bounded missing-receipt fallback. */
+  basis: PaymentSettlementBasis
 }
 
 /**
@@ -260,6 +263,7 @@ export class MemoryPaymentOperations implements PaymentOperations {
       const recovery = this.recoverSettlement(current, {
         amount: current.settledAmount,
         totalCostUsd: 0,
+        basis: 'usage-receipt',
         usage: {
           inputTokens: 0,
           outputTokens: 0,
@@ -409,4 +413,7 @@ function validateSettlement(operation: PaymentOperation, input: PaymentSettlemen
     throw new Error('settlement cost must be finite and non-negative')
   }
   if (!input.usage.budgetEnforced) throw new Error('sandbox usage receipt is not budget-enforced')
+  if (input.basis !== 'usage-receipt' && input.basis !== 'quoted-ceiling') {
+    throw new Error('payment settlement basis is invalid')
+  }
 }

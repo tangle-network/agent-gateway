@@ -15,6 +15,11 @@ import {
 } from './dispatch'
 import { MemoryNonceStore } from './nonce-store'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
+import {
+  MemoryPaymentRecoveryStore,
+  PaymentRecoveryReplayError,
+  assertPaymentRecoveryConfig,
+} from './payment-recovery'
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import type { ChatCompletionChunk, ChatCompletionRequest, GatewayConfig } from './types'
 import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
@@ -29,7 +34,8 @@ import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
  *   GET  /:slug/chat/completions  — agent discovery metadata (Tangle-native shape)
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
-export function createAgentGateway(config: GatewayConfig) {
+export function createAgentGateway(inputConfig: GatewayConfig) {
+  let config = inputConfig
   // Production gateways must verify x402 signatures. Tests and local
   // dev can opt into the explicit demo path.
   if (!config.x402.verifySigner && !config.x402.demoMode) {
@@ -86,6 +92,37 @@ export function createAgentGateway(config: GatewayConfig) {
   if (config.x402.paymentProtocolVersion === 1 && config.x402.paymentOperations) {
     throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
   }
+  const mppMethod = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
+  if (config.mpp?.charge && config.mpp.charge.protocolVersion !== 1) {
+    throw new Error('createAgentGateway: unsupported MPP charge lifecycle version')
+  }
+  if (
+    config.mpp?.charge &&
+    mppMethod !== 'blueprintevm' &&
+    !config.mpp.authenticateCredential
+  ) {
+    throw new Error('createAgentGateway: generic MPP methods require pure credential authentication')
+  }
+  if (
+    config.mpp &&
+    mppMethod !== 'blueprintevm' &&
+    config.mpp.authenticateCredential &&
+    !config.mpp.charge
+  ) {
+    throw new Error('createAgentGateway: generic MPP methods require a charge lifecycle')
+  }
+  const needsRecovery = config.x402.paymentProtocolVersion === 2 ||
+    (mppMethod !== 'blueprintevm' && config.mpp?.charge !== undefined)
+  if (needsRecovery && !config.paymentRecovery) {
+    if (!config.x402.demoMode) {
+      throw new Error('createAgentGateway: durable payment recovery is required in production')
+    }
+    config = {
+      ...config,
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    }
+  }
+  if (config.paymentRecovery) assertPaymentRecoveryConfig(config.paymentRecovery)
   const gw = new Hono()
   const rateLimitStore: RateLimitStore = config.rateLimitStore ?? new MemoryRateLimitStore()
   const state: GatewayState = {
@@ -194,7 +231,10 @@ export function createAgentGateway(config: GatewayConfig) {
     const authz = guard
     try {
       await claimPayment(authz, config, state)
-    } catch {
+    } catch (error) {
+      const replayedGenericMpp = error instanceof PaymentRecoveryReplayError &&
+        authz.paymentMethod === 'mpp' &&
+        authz.mppMethod !== 'blueprintevm'
       try {
         await releasePayment(authz, config, 'payment authorization failed')
       } catch (releaseError) {
@@ -209,14 +249,50 @@ export function createAgentGateway(config: GatewayConfig) {
           agentSlug: authz.agent.slug,
           startMs: authz.startMs,
         },
-        { method: authz.paymentMethod, code: 'payment_authorization_failed', httpStatus: 402 },
+        {
+          method: authz.paymentMethod,
+          code: replayedGenericMpp ? 'invalid_mpp_credential' : 'payment_authorization_failed',
+          httpStatus: replayedGenericMpp ? 401 : 402,
+        },
       )
+      const status = replayedGenericMpp ? 401 : 402
+      return c.json(
+        {
+          error: {
+            message: replayedGenericMpp ? 'Invalid Payment credential' : 'Payment authorization failed',
+            type: replayedGenericMpp ? 'authentication_error' : 'payment_required',
+            code: replayedGenericMpp ? 'invalid_mpp_credential' : 'payment_authorization_failed',
+          },
+        },
+        replayedGenericMpp
+          ? {
+              status,
+              headers: {
+                'WWW-Authenticate': `Payment realm="${config.mpp!.realm}", method="${config.mpp!.method ?? 'blueprintevm'}"`,
+                'X-Request-Id': authz.requestId,
+              },
+            }
+          : { status, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': authz.requestId } },
+      )
+    }
+
+    try {
+      await beginPaymentExecution(authz, config)
+    } catch {
+      try {
+        await releasePayment(authz, config, 'payment execution fence was lost')
+      } catch (releaseError) {
+        console.error(
+          `[agent-gateway] payment release failed for ${authz.requestId}:`,
+          releaseError instanceof Error ? releaseError.message : String(releaseError),
+        )
+      }
       return c.json(
         {
           error: {
             message: 'Payment authorization failed',
             type: 'payment_required',
-            code: 'payment_authorization_failed',
+            code: 'payment_execution_fence_lost',
           },
         },
         { status: 402, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': authz.requestId } },
@@ -309,12 +385,10 @@ function streamChatCompletions(
           abortController.signal,
           undefined,
           maxOutputTokens,
-          async () => {
-            await beginPaymentExecution(authz, config)
-          },
-          authz.paymentOperation !== undefined,
+          undefined,
+          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
           () => {
-            if (authz.paymentOperation) workObserved = true
+            if (authz.paymentRecoveryId) workObserved = true
           },
         )) {
           if (event.kind === 'text') {
@@ -394,7 +468,13 @@ function streamChatCompletions(
       'X-Agent-Slug': agent.slug,
       'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
       'X-Payment-Method': paymentMethod,
-      'X-Payment-Settled': paymentMethod === 'x402' ? 'pending' : 'true',
+      'X-Payment-Settled': paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
+      ...(authz.mppChargeOperation
+        ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
+        : {}),
+      ...(authz.paymentRecoveryId
+        ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
+        : {}),
       ...(rateLimitRemaining !== undefined
         ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
         : {}),

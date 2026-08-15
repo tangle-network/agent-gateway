@@ -19,6 +19,17 @@ export interface TaskStore {
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000
 
+const PAYMENT_RECOVERY_KEYS = [
+  'gatewayFinalizing',
+  'gatewayPaymentRelease',
+  'gatewayPaymentRecovery',
+] as const
+
+/** Recovery-bearing tasks must remain readable until reconciliation clears the marker. */
+export function hasPendingPaymentRecovery(task: Task): boolean {
+  return PAYMENT_RECOVERY_KEYS.some((key) => task.metadata?.[key] !== undefined)
+}
+
 export class InMemoryTaskStore implements TaskStore {
   private readonly entries = new Map<string, { task: Task; expiresAt: number }>()
 
@@ -52,6 +63,8 @@ export class InMemoryTaskStore implements TaskStore {
   }
 
   async delete(id: string): Promise<void> {
+    const entry = this.entries.get(id)
+    if (entry && hasPendingPaymentRecovery(entry.task)) return
     this.entries.delete(id)
   }
 
@@ -62,7 +75,9 @@ export class InMemoryTaskStore implements TaskStore {
   private gc(): void {
     const now = Date.now()
     for (const [id, entry] of this.entries) {
-      if (entry.expiresAt <= now) this.entries.delete(id)
+      if (entry.expiresAt <= now && !hasPendingPaymentRecovery(entry.task)) {
+        this.entries.delete(id)
+      }
     }
   }
 }

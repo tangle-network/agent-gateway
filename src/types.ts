@@ -3,6 +3,8 @@ import type {
   PaymentOperation,
   PaymentOperations,
 } from './payment-operations'
+import type { MppAuthenticatedCredential, MppChargeLifecycle } from './mpp-payment'
+import type { PaymentRecoveryConfig, PaymentSettlementBasis } from './payment-recovery'
 
 // --- Agent resolution ---
 
@@ -134,17 +136,16 @@ export interface MppConfig {
   /** MPP method name (default: "blueprintevm") */
   method?: string
   /**
-   * Production verifier for the method-specific credential. Return the
-   * authenticated consumer id, or null when the credential is invalid.
-   * The callback receives the decoded JSON payload when one exists plus the
-   * original decoded credential so non-JSON methods can verify their own form.
-   * Omit only when x402.demoMode is explicitly enabled for local testing, or
-   * when x402.verifySigner handles an x402-compatible MPP credential.
+   * Pure credential authentication. Return stable method-owned identity, or null.
+   * This callback must not consume a credential, create a processor object,
+   * reserve funds, confirm payment, or perform any other financial mutation.
    */
-  verifySigner?: (
+  authenticateCredential?: (
     payload: Record<string, unknown>,
     context: { method: string; credential: string },
-  ) => Promise<string | null>
+  ) => Promise<MppAuthenticatedCredential | null>
+  /** Required immediate-charge lifecycle for every non-BlueprinTEVM method. */
+  charge?: MppChargeLifecycle
 }
 
 export interface PaymentResult {
@@ -203,6 +204,8 @@ export interface GatewayUsageEvent {
   ownerEarnedUsd: number
   platformFeeUsd: number
   durationMs: number
+  /** Exact receipt in normal operation; quoted ceiling only after receipt timeout. */
+  settlementBasis?: PaymentSettlementBasis
 }
 
 // --- Sandbox interface ---
@@ -286,6 +289,12 @@ export interface GatewayConfig {
 
   /** MPP (Machine Payments Protocol) configuration. It is advertised only when a production verifier or explicit demo mode is available. */
   mpp?: MppConfig
+
+  /**
+   * Durable payment recovery outbox. Production payment protocol version 2
+   * and generic MPP charge methods require this configuration.
+   */
+  paymentRecovery?: PaymentRecoveryConfig
 
   /**
    * Verify an API key. Return key info if valid, null if invalid.

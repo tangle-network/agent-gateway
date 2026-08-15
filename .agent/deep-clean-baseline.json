@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-08-15T03:39:51.140Z",
+  "scope": {
+    "repository": "/home/drew/code/agent-gateway-x402-priced-reservation",
+    "base_ref": "origin/fix/x402-priced-reservation",
+    "head": "187194d94f3c214b6b807877567a168c06fcccdb",
+    "local_commits_ahead": 7,
+    "working_tree_paths": 26,
+    "working_tree_status": [
+      " M README.md",
+      " M docs/a2a-long-horizon.md",
+      " M src/a2a/handler.ts",
+      " M src/a2a/task-store-sql.ts",
+      " M src/a2a/task-store.ts",
+      " M src/dispatch.ts",
+      " M src/index.ts",
+      " M src/middleware.ts",
+      " M src/payment-operations.ts",
+      " M src/types.ts",
+      " M src/verify.ts",
+      " M tests/a2a-atomicity.test.ts",
+      " M tests/a2a-durability.test.ts",
+      " M tests/a2a-payment-races.test.ts",
+      " M tests/a2a.test.ts",
+      " M tests/middleware.test.ts",
+      " M tests/payment-operations.test.ts",
+      " M tests/protocol-guards.test.ts",
+      " M tests/verify.test.ts",
+      "?? .agent/",
+      "?? src/mpp-payment.ts",
+      "?? src/payment-recovery-sql.ts",
+      "?? src/payment-recovery-worker.ts",
+      "?? src/payment-recovery.ts",
+      "?? tests/payment-recovery-sql.test.ts",
+      "?? tests/payment-recovery.test.ts"
+    ],
+    "committed_diff_stat": " .github/workflows/publish.yml    |    1 +\n README.md                        |    1 +\n docs/a2a-long-horizon.md         |   17 +-\n src/a2a/handler.ts               | 1012 +++++++++++++++++++++++++++++++++-----\n src/a2a/task-store-sql.ts        |    5 +-\n src/a2a/task-store.ts            |    4 +-\n src/dispatch.ts                  |  135 ++++-\n src/middleware.ts                |    4 +-\n src/nonce-store.ts               |   52 +-\n src/payment-operations.ts        |    8 +-\n src/types.ts                     |    7 +-\n src/verify.ts                    |   92 ++--\n tests/a2a-atomicity.test.ts      |  433 ++++++++++++++++\n tests/a2a-payment-races.test.ts  |  527 +++++++++++++++++++-\n tests/kv-stores.test.ts          |   46 +-\n tests/middleware.test.ts         |  187 ++++++-\n tests/nonce-store.test.ts        |   74 ++-\n tests/payment-operations.test.ts |  142 +++++-\n tests/protocol-guards.test.ts    |   11 +-\n tests/verify.test.ts             |   46 +-\n 20 files changed, 2535 insertions(+), 269 deletions(-)\n",
+    "uncommitted_diff_stat": " README.md                        |  40 +++-\n docs/a2a-long-horizon.md         |  17 +-\n src/a2a/handler.ts               | 355 +++++++++++++++++++++++++++----\n src/a2a/task-store-sql.ts        |  26 ++-\n src/a2a/task-store.ts            |  17 +-\n src/dispatch.ts                  | 439 ++++++++++++++++++++++++++++++++++++---\n src/index.ts                     |  33 ++-\n src/middleware.ts                |  77 ++++++-\n src/payment-operations.ts        |   7 +\n src/types.ts                     |  25 ++-\n src/verify.ts                    | 119 +++++++----\n tests/a2a-atomicity.test.ts      |   3 +\n tests/a2a-durability.test.ts     |  36 +++-\n tests/a2a-payment-races.test.ts  | 439 ++++++++++++++++++++++++++++++++++-----\n tests/a2a.test.ts                |   5 +-\n tests/middleware.test.ts         |  78 ++++++-\n tests/payment-operations.test.ts |  10 +-\n tests/protocol-guards.test.ts    |  13 +-\n tests/verify.test.ts             |  24 ++-\n 19 files changed, 1523 insertions(+), 240 deletions(-)\n"
+  },
+  "config_read": {
+    "tsconfig_strict": true,
+    "tsconfig_strict_flags_off": [],
+    "knip_config_files": [],
+    "top_10_churn": "     14 src/middleware.ts\n     14 src/dispatch.ts\n     14 src/a2a/handler.ts\n     14 package.json\n     13 src/types.ts\n     11 tests/middleware.test.ts\n     11 tests/a2a-payment-races.test.ts\n      9 src/verify.ts\n      9 README.md\n      8 tests/verify.test.ts\n"
+  },
+  "metrics": {
+    "type_errors": {
+      "command": "npx tsc --noEmit",
+      "exit_code": 0,
+      "value": 0,
+      "raw_output": "(node:1416767) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n"
+    },
+    "knip_issues": {
+      "command": "npx knip --reporter json",
+      "exit_code": 1,
+      "value": 5,
+      "raw_output": "(node:1420486) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:1422626) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n{\"issues\":[{\"file\":\"coverage/block-navigation.js\",\"binaries\":[],\"catalog\":[],\"catalogReferences\":[],\"dependencies\":[],\"devDependencies\":[],\"duplicates\":[],\"enumMembers\":[],\"exports\":[],\"files\":[{\"name\":\"coverage/block-navigation.js\"}],\"namespaceMembers\":[],\"optionalPeerDependencies\":[],\"types\":[],\"unlisted\":[],\"unresolved\":[]},{\"file\":\"coverage/prettify.js\",\"binaries\":[],\"catalog\":[],\"catalogReferences\":[],\"dependencies\":[],\"devDependencies\":[],\"duplicates\":[],\"enumMembers\":[],\"exports\":[],\"files\":[{\"name\":\"coverage/prettify.js\"}],\"namespaceMembers\":[],\"optionalPeerDependencies\":[],\"types\":[],\"unlisted\":[],\"unresolved\":[]},{\"file\":\"coverage/sorter.js\",\"binaries\":[],\"catalog\":[],\"catalogReferences\":[],\"dependencies\":[],\"devDependencies\":[],\"duplicates\":[],\"enumMembers\":[],\"exports\":[],\"files\":[{\"name\":\"coverage/sorter.js\"}],\"namespaceMembers\":[],\"optionalPeerDependencies\":[],\"types\":[],\"unlisted\":[],\"unresolved\":[]},{\"file\":\"src/dispatch.ts\",\"binaries\":[],\"catalog\":[],\"catalogReferences\":[],\"dependencies\":[],\"devDependencies\":[],\"duplicates\":[],\"enumMembers\":[],\"exports\":[{\"name\":\"dispatchSandboxStream\",\"line\":1061,\"col\":24,\"pos\":36966},{\"name\":\"estimateTokens\",\"line\":1625,\"col\":17,\"pos\":57245},{\"name\":\"estimateBillableInputTokens\",\"line\":1630,\"col\":17,\"pos\":57418}],\"files\":[],\"namespaceMembers\":[],\"optionalPeerDependencies\":[],\"types\":[],\"unlisted\":[],\"unresolved\":[]},{\"file\":\"src/payment-recovery.ts\",\"binaries\":[],\"catalog\":[],\"catalogReferences\":[],\"dependencies\":[],\"devDependencies\":[],\"duplicates\":[],\"enumMembers\":[],\"exports\":[{\"name\":\"DEFAULT_STALE_REQUEST_MS\",\"line\":111,\"col\":14,\"pos\":2998},{\"name\":\"DEFAULT_RECEIPT_TIMEOUT_MS\",\"line\":112,\"col\":14,\"pos\":3045},{\"name\":\"DEFAULT_RECOVERY_RETRY_MS\",\"line\":113,\"col\":14,\"pos\":3098},{\"name\":\"DEFAULT_RECOVERY_LEASE_MS\",\"line\":114,\"col\":14,\"pos\":3146}],\"files\":[],\"namespaceMembers\":[],\"optionalPeerDependencies\":[],\"types\":[],\"unlisted\":[],\"unresolved\":[]}]}\n"
+    },
+    "cycles": {
+      "command": "npx madge --circular src/",
+      "exit_code": 0,
+      "value": 0,
+      "raw_output": "(node:1423767) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:1427702) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n- Finding files\nProcessed \u001b[1m0\u001b[22m files \u001b[2m(3s)\u001b[22m \n\n\u001b[32m✔\u001b[39m \u001b[1mNo circular dependency found!\u001b[22m\n\n"
+    },
+    "duplication": {
+      "command": "npx jscpd --min-lines 6 --min-tokens 50 src/",
+      "exit_code": 0,
+      "clones": 21,
+      "total_lines": 8741,
+      "duplicated_lines": 262,
+      "duplicated_line_percent": "3.00%",
+      "total_tokens": 44037,
+      "duplicated_tokens": 1759,
+      "duplicated_token_percent": "3.99%",
+      "raw_output": "(node:1447741) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [246:33 - 257:47] (12 lines, 75 tokens)\n   a2a/handler.ts [463:35 - 475:47]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [301:7 - 312:28] (12 lines, 53 tokens)\n   a2a/handler.ts [538:22 - 549:32]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [331:5 - 347:40] (17 lines, 100 tokens)\n   a2a/handler.ts [444:5 - 457:63]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [373:5 - 391:10] (19 lines, 85 tokens)\n   a2a/handler.ts [598:9 - 619:14]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [397:5 - 403:83] (7 lines, 59 tokens)\n   a2a/handler.ts [640:9 - 646:87]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [657:81 - 671:18] (15 lines, 76 tokens)\n   a2a/handler.ts [685:82 - 699:16]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [808:30 - 829:4] (22 lines, 148 tokens)\n   a2a/handler.ts [914:38 - 935:4]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [811:23 - 829:4] (19 lines, 136 tokens)\n   a2a/handler.ts [837:26 - 855:4]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [962:29 - 970:31] (9 lines, 54 tokens)\n   a2a/handler.ts [997:29 - 1005:31]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [962:29 - 970:31] (9 lines, 54 tokens)\n   a2a/handler.ts [1030:30 - 1038:31]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [962:29 - 985:31] (24 lines, 160 tokens)\n   a2a/handler.ts [1052:32 - 1071:38]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [1009:5 - 1017:8] (9 lines, 66 tokens)\n   a2a/handler.ts [1040:85 - 1048:8]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [1661:63 - 1678:2] (18 lines, 116 tokens)\n   payment-recovery.ts [247:1 - 264:2]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32ma2a/handler.ts\u001b[39m\u001b[22m [1683:71 - 1699:2] (17 lines, 111 tokens)\n   payment-recovery.ts [271:67 - 287:2]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mdispatch.ts\u001b[39m\u001b[22m [603:29 - 617:6] (15 lines, 68 tokens)\n   dispatch.ts [644:23 - 658:6]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mdispatch.ts\u001b[39m\u001b[22m [973:17 - 980:10] (8 lines, 54 tokens)\n   dispatch.ts [1438:24 - 1445:18]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mdispatch.ts\u001b[39m\u001b[22m [1417:42 - 1425:16] (9 lines, 58 tokens)\n   dispatch.ts [1437:27 - 1444:15]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mnonce-store.ts\u001b[39m\u001b[22m [69:56 - 85:87] (17 lines, 58 tokens)\n   rate-limit.ts [58:55 - 70:87]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mpayment-recovery-worker.ts\u001b[39m\u001b[22m [449:73 - 457:2] (9 lines, 61 tokens)\n   payment-recovery.ts [235:1 - 243:2]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mpublish.ts\u001b[39m\u001b[22m [56:13 - 64:10] (9 lines, 85 tokens)\n   publish.ts [69:14 - 77:10]\n\u001b[1mClone found (typescript)\u001b[22m\n - \u001b[1m\u001b[32mpublish.ts\u001b[39m\u001b[22m [56:36 - 62:58] (7 lines, 82 tokens)\n   publish.ts [103:39 - 109:58]\n\u001b[90m┌────────────┬────────────────┬─────────────┬──────────────┬──────────────┬──────────────────┬───────────────────┐\u001b[39m\n\u001b[90m│\u001b[39m\u001b[31m Format     \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Files analyzed \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Total lines \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Total tokens \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Clones found \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Duplicated lines \u001b[39m\u001b[90m│\u001b[39m\u001b[31m Duplicated tokens \u001b[39m\u001b[90m│\u001b[39m\n\u001b[90m├────────────┼────────────────┼─────────────┼──────────────┼──────────────┼──────────────────┼───────────────────┤\u001b[39m\n\u001b[90m│\u001b[39m typescript \u001b[90m│\u001b[39m 24             \u001b[90m│\u001b[39m 8741        \u001b[90m│\u001b[39m 44037        \u001b[90m│\u001b[39m 21           \u001b[90m│\u001b[39m 262 (3.00%)      \u001b[90m│\u001b[39m 1759 (3.99%)      \u001b[90m│\u001b[39m\n\u001b[90m├────────────┼────────────────┼─────────────┼──────────────┼──────────────┼──────────────────┼───────────────────┤\u001b[39m\n\u001b[90m│\u001b[39m \u001b[1mTotal:\u001b[22m     \u001b[90m│\u001b[39m 24             \u001b[90m│\u001b[39m 8741        \u001b[90m│\u001b[39m 44037        \u001b[90m│\u001b[39m 21           \u001b[90m│\u001b[39m 262 (3.00%)      \u001b[90m│\u001b[39m 1759 (3.99%)      \u001b[90m│\u001b[39m\n\u001b[90m└────────────┴────────────────┴─────────────┴──────────────┴──────────────┴──────────────────┴───────────────────┘\u001b[39m\n\u001b[90mFound 21 clones.\u001b[39m\n\u001b[90mtime: 290.216ms\u001b[39m\n\n\u001b[90m💡 Auto-refactor with AI: \u001b[1m\u001b[39mnpx skills add https://github.com/kucherenko/jscpd --skill dry-refactoring\u001b[90m\u001b[22m\n\u001b[90m🎩 New: Gangsta Agents — discipline your AI coding → gangsta.page\u001b[39m\n\u001b[90m💖 Support jscpd project → https://opencollective.com/jscpd\u001b[39m\n"
+    },
+    "escape_hatches": {
+      "command": "grep -rEn 'as any|: any|@ts-(ignore|expect-error)' src/ | wc -l",
+      "exit_code": 1,
+      "value": 0,
+      "raw_output": ""
+    },
+    "debt_markers": {
+      "command": "grep -rEn 'TODO|FIXME|HACK|XXX' src/ | wc -l",
+      "exit_code": 1,
+      "value": 0,
+      "raw_output": ""
+    }
+  }
+}

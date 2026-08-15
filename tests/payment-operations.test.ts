@@ -122,6 +122,7 @@ describe('version 2 payment operations', () => {
     const settled = await operations.settlePayment(owner, {
       amount: 200n,
       totalCostUsd: 0.2,
+      basis: 'usage-receipt',
       usage: {
         inputTokens: 1,
         outputTokens: 1,
@@ -138,6 +139,7 @@ describe('version 2 payment operations', () => {
     await expect(operations.settlePayment(owner, {
       amount: 1001n,
       totalCostUsd: 1,
+      basis: 'usage-receipt',
       usage: { ...settledUsage(), budgetEnforced: true },
     })).rejects.toThrow()
   })
@@ -174,6 +176,7 @@ describe('version 2 payment operations', () => {
     const settled = await operations.settlePayment(retained, {
       amount: 200n,
       totalCostUsd: 0.2,
+      basis: 'usage-receipt',
       usage: settledUsage(),
     })
     expect(settled.state).toBe('settled')
@@ -242,6 +245,7 @@ describe('version 2 payment operations', () => {
     const input = {
       amount: 200n,
       totalCostUsd: 0.2,
+      basis: 'usage-receipt' as const,
       usage: settledUsage(),
     }
     const settled = await Promise.all([
@@ -289,7 +293,7 @@ describe('version 2 payment operations', () => {
       },
     })
     const owner = await operations.claimPayment(payload('1000', '17'), context())
-    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage(), basis: 'usage-receipt' as const }
     await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
     const first = operations.reclaimPayment(owner.operationId)
     while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
@@ -313,7 +317,7 @@ describe('version 2 payment operations', () => {
       },
     })
     const owner = await operations.claimPayment(payload('1000', '18'), context())
-    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage(), basis: 'usage-receipt' as const }
     await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
     const first = operations.settlePayment(owner, input)
     while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
@@ -337,7 +341,7 @@ describe('version 2 payment operations', () => {
       },
     })
     const owner = await operations.claimPayment(payload('1000', '19'), context())
-    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage() }
+    const input = { amount: 200n, totalCostUsd: 0.2, usage: settledUsage(), basis: 'usage-receipt' as const }
     await expect(operations.settlePayment(owner, input)).rejects.toThrow('worker crashed')
     const reclaim = operations.reclaimPayment(owner.operationId)
     while (entered === 0) await new Promise((resolve) => setTimeout(resolve, 0))
@@ -370,12 +374,6 @@ describe('version 2 payment operations', () => {
     expect(entered).toBe(1)
     expect(recovered[0].state).toBe('released')
     expect(recovered[1].state).toBe('released')
-  })
-
-  it('rejects a release callback without a recovery proof', () => {
-    expect(() => new MemoryPaymentOperations({
-      onRelease: async () => { throw new Error('acknowledgement lost') },
-    })).toThrow('onReclaim is required')
   })
 
   it('reclaims a claim that crashed after durable ownership but before completion', async () => {

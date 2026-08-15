@@ -384,10 +384,6 @@ describe('final payment boundary protocol guards', () => {
       onRelease: async () => { releases += 1 },
       onReclaim: async () => undefined,
     })
-    let operationPromise: ReturnType<typeof operations.claimPayment> | undefined
-    let authorizations = 0
-    let releaseAuthorizations!: () => void
-    const authorizationsReleased = new Promise<void>((resolve) => { releaseAuthorizations = resolve })
     let runStarted!: () => void
     const sandboxStarted = new Promise<void>((resolve) => { runStarted = resolve })
     let finishRun!: () => void
@@ -412,14 +408,7 @@ describe('final payment boundary protocol guards', () => {
         demoMode: true,
         paymentProtocolVersion: 2,
         paymentOperations: operations,
-        authorizePayment: async (payload, context) => {
-          operationPromise ??= operations.claimPayment(payload, context)
-          const operation = await operationPromise
-          authorizations += 1
-          if (authorizations === 2) releaseAuthorizations()
-          await authorizationsReleased
-          return operation
-        },
+        authorizePayment: (payload, context) => operations.claimPayment(payload, context),
       },
     }))
     const request = () => app.request('/v1/agents/guards/chat/completions', {

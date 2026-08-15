@@ -186,7 +186,10 @@ describe('verifyMpp', () => {
 
   it('parses a valid Payment header and returns the signer', async () => {
     const header = buildCredential({ commitment: '0xAlice', operator: operatorAddress, amount: '1000', nonce: '5' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toBe('0xAlice')
+    expect(await verifyMpp(header, mppConfig, baseConfig)).toMatchObject({
+      consumerId: '0xAlice',
+      replayKey: '0xalice:5',
+    })
   })
 
   it('requires and calls a production MPP verifier, then rejects nonce replay', async () => {
@@ -200,15 +203,18 @@ describe('verifyMpp', () => {
     const seen: Array<{ method: string; credential: string }> = []
     const config: MppConfig = {
       ...mppConfig,
-      verifySigner: async (_payload, context) => {
+      authenticateCredential: async (_payload, context) => {
         seen.push(context)
-        return 'mpp:alice'
+        return { consumerId: 'mpp:alice', paymentIdentity: 'payment:alice:6' }
       },
     }
     const productionX402: X402Config = { ...baseConfig, demoMode: false }
     const nonceStore = new MemoryNonceStore()
 
-    expect(await verifyMpp(header, config, productionX402, nonceStore)).toBe('mpp:alice')
+    expect(await verifyMpp(header, config, productionX402, nonceStore)).toMatchObject({
+      consumerId: 'mpp:alice',
+      replayKey: '0xalice:6',
+    })
     expect(await verifyMpp(header, config, productionX402, nonceStore)).toBeNull()
     expect(seen).toHaveLength(1)
     expect(seen[0].method).toBe('blueprintevm')
@@ -245,9 +251,9 @@ describe('verifyMpp', () => {
     })
     const config: MppConfig = {
       ...mppConfig,
-      verifySigner: async () => {
+      authenticateCredential: async () => {
         calls += 1
-        return 'mpp:alice'
+        return { consumerId: 'mpp:alice', paymentIdentity: 'underfunded' }
       },
     }
 
@@ -277,7 +283,7 @@ describe('verifyMpp', () => {
       baseConfig,
       undefined,
       1n,
-    )).toBe('0xAlice')
+    )).toMatchObject({ consumerId: '0xAlice', replayKey: '0xalice:9' })
   })
 
   it('rejects MPP in production when no method verifier is configured', async () => {
@@ -299,7 +305,9 @@ describe('verifyMpp', () => {
 
   it('falls back to the `from` field when no `commitment` present — regression: EIP-3009 wallets expose `from` only', async () => {
     const header = buildCredential({ from: '0xWallet', to: operatorAddress, value: '1000' })
-    expect(await verifyMpp(header, mppConfig, baseConfig)).toBe('0xWallet')
+    expect(await verifyMpp(header, mppConfig, baseConfig)).toMatchObject({
+      consumerId: '0xWallet',
+    })
   })
 
   it('rejects malformed Payment header shape', async () => {

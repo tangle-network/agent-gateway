@@ -19,9 +19,38 @@ import type {
 import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import { MemoryPaymentOperations } from '../src/payment-operations'
+import type { MppChargeLifecycle } from '../src/mpp-payment'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const fundedRequestAmount = '1000000'
+
+function mppChargeLifecycle(onConfirm?: (credential: string) => void): MppChargeLifecycle {
+  const operations = new Map<string, Awaited<ReturnType<MppChargeLifecycle['confirmPayment']>>>()
+  return {
+    protocolVersion: 1,
+    async confirmPayment(request) {
+      onConfirm?.(request.credential)
+      const operation = {
+        protocolVersion: 1 as const,
+        operationId: request.operationId,
+        acquiredByRequestId: request.requestId,
+        method: request.method,
+        receipt: `receipt=${request.operationId}`,
+        state: 'confirmed' as const,
+      }
+      operations.set(operation.operationId, operation)
+      return operation
+    },
+    async releasePayment(operation) {
+      const released = { ...operation, state: 'released' as const }
+      operations.set(operation.operationId, released)
+      return released
+    },
+    async recoverPayment(operationId) {
+      return operations.get(operationId) ?? { operationId, state: 'not-found' as const }
+    },
+  }
+}
 
 /** Sandbox that emits a fixed reply, captures the prompt + opts for assertion */
 class StubSandbox implements SandboxBox {
@@ -574,7 +603,10 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       mpp: {
         realm: 'agents.tangle.tools',
         method: 'blueprintevm',
-        verifySigner: async () => 'mpp:consumer',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: `${String(payload.commitment)}:${String(payload.nonce)}`,
+        }),
       },
       x402: {
         operatorAddress,
@@ -615,7 +647,12 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const { app, settlements, usage } = buildHarness({
       mpp: {
         realm: 'agents.tangle.tools',
-        verifySigner: async () => 'mpp:stripe-customer',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:stripe-customer',
+          paymentIdentity: String(payload.receiptId),
+        }),
+        charge: mppChargeLifecycle(),
       },
       x402: {
         operatorAddress,
@@ -639,8 +676,8 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(streamed.combinedText).toBe('Hello, world!')
     expect(streamed.done).toBe(true)
     expect(operations.get('x402:stripe-customer:902')).toBeUndefined()
-    expect(settlements).toHaveLength(1)
-    expect(settlements[0]?.method).toBe('mpp')
+    expect(settlements).toHaveLength(0)
+    expect(response.headers.get('Payment-Receipt')).toContain('receipt=')
     expect(usage).toHaveLength(1)
   })
 
@@ -671,7 +708,11 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       mpp: {
         realm: 'agents.tangle.tools',
         method: 'stripe',
-        verifySigner: async () => 'mpp:consumer',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: String(payload.receiptId),
+        }),
+        charge: mppChargeLifecycle(),
       },
     })
     const request = () => app.request('/v1/agents/test-agent/chat/completions', {
@@ -686,12 +727,14 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const responses = await Promise.all([request(), request()])
     await Promise.all(responses.map((response) => response.text()))
 
-    expect(responses.map((response) => response.status).sort()).toEqual([200, 402])
+    const statuses = responses.map((response) => response.status)
+    expect(statuses.filter((status) => status === 200)).toHaveLength(1)
+    expect(statuses.filter((status) => status === 401 || status === 402)).toHaveLength(1)
     expect(executions).toBe(1)
-    expect(settlements).toHaveLength(1)
+    expect(settlements).toHaveLength(0)
   })
 
-  it('requires complete receipts only for requests with durable payment ownership', async () => {
+  it('requires complete receipts for every durable x402 or generic MPP payment', async () => {
     const operations = new MemoryPaymentOperations()
     const { app } = buildHarness({
       getSandbox: async () => ({
@@ -703,7 +746,11 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       mpp: {
         realm: 'agents.tangle.tools',
         method: 'stripe',
-        verifySigner: async () => 'mpp:consumer',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: String(payload.receiptId ?? 'empty-receipt'),
+        }),
+        charge: mppChargeLifecycle(),
       },
       x402: {
         operatorAddress,
@@ -740,7 +787,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(apiKeyStream.combinedText).toBe('legacy')
     expect(mppStream.combinedText).toBe('legacy')
     expect(apiKeyStream.done).toBe(true)
-    expect(mppStream.done).toBe(true)
+    expect(mppStream.done).toBe(false)
   })
 
   it('threads a unique requestId per concurrent request — regression: two same-consumer requests get distinct ids', async () => {
@@ -1101,6 +1148,21 @@ describe('createAgentGateway — production-config guard', () => {
         paymentOperations: new MemoryPaymentOperations(),
       },
     })).toThrow(/paymentProtocolVersion must be explicit/)
+  })
+
+  it('requires a durable recovery outbox for production payment protocol version 2', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+    })).toThrow(/durable payment recovery is required in production/)
   })
 
   it('keeps older custom A2A task stores source-compatible', () => {

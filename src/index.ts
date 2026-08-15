@@ -1,13 +1,45 @@
 export { createAgentGateway } from './middleware'
 export { reclaimPayment } from './dispatch'
 export {
+  recoverPayment,
+  recoverPayments,
+  type RecoverPaymentOptions,
+  type RecoverPaymentsOptions,
+  type PaymentRecoveryRun,
+} from './payment-recovery-worker'
+export {
   verifyX402,
   verifyMpp,
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
   mppReplayNonceKey,
+  mppPaymentCredential,
+  type VerifiedMppCredential,
 } from './verify'
+export {
+  MPP_CHARGE_PROTOCOL_VERSION,
+  mppPaymentOperationId,
+  type MppAuthenticatedCredential,
+  type MppChargeLifecycle,
+  type MppChargeOperation,
+  type MppChargeOperationState,
+  type MppChargeRecoveryResult,
+  type MppChargeRequest,
+} from './mpp-payment'
+export {
+  PAYMENT_RECOVERY_VERSION,
+  MemoryPaymentRecoveryStore,
+  PaymentRecoveryFenceError,
+  type PaymentRecoveryAttribution,
+  type PaymentRecoveryConfig,
+  type PaymentRecoveryRecord,
+  type PaymentRecoveryState,
+  type PaymentRecoveryStore,
+  type PaymentRecoveryTarget,
+  type PaymentSettlementBasis,
+} from './payment-recovery'
+export { SqlPaymentRecoveryStore } from './payment-recovery-sql'
 export {
   PAYMENT_PROTOCOL_VERSION,
   MemoryPaymentOperations,

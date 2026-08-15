@@ -40,7 +40,7 @@
  *   await store.migrate()
  */
 
-import type { TaskStore } from './task-store'
+import { hasPendingPaymentRecovery, type TaskStore } from './task-store'
 import type { Task } from './types'
 
 /**
@@ -136,15 +136,19 @@ export class SqlTaskStore implements TaskStore {
     )
     const row = rows[0]
     if (!row) return undefined
-    if (Date.now() - row.updated_at > this.ttlMs) {
+    const task = JSON.parse(row.payload) as Task
+    if (Date.now() - row.updated_at > this.ttlMs && !hasPendingPaymentRecovery(task)) {
       // Lazy GC. If the delete loses a race with another reader, that reader
       // observes either the stale-then-deleted task (returning undefined here)
       // or, after this delete commits, observes undefined directly — either
       // way callers see consistent "expired" semantics.
-      void this.db.exec(`DELETE FROM ${this.table} WHERE id = ?`, [id])
+      void this.db.exec(
+        `DELETE FROM ${this.table} WHERE id = ? AND payload = ?`,
+        [id, row.payload],
+      )
       return undefined
     }
-    return JSON.parse(row.payload) as Task
+    return task
   }
 
   async put(task: Task): Promise<void> {
@@ -192,7 +196,12 @@ export class SqlTaskStore implements TaskStore {
   }
 
   async delete(id: string): Promise<void> {
-    await this.db.exec(`DELETE FROM ${this.table} WHERE id = ?`, [id])
+    const task = await this.get(id)
+    if (!task || hasPendingPaymentRecovery(task)) return
+    await this.db.exec(
+      `DELETE FROM ${this.table} WHERE id = ? AND payload = ?`,
+      [id, JSON.stringify(task)],
+    )
   }
 
   /**
@@ -208,7 +217,10 @@ export class SqlTaskStore implements TaskStore {
     )
     const now = Date.now()
     return rows
-      .filter((r) => now - r.updated_at <= this.ttlMs)
-      .map((r) => JSON.parse(r.payload) as Task)
+      .map((r) => ({ task: JSON.parse(r.payload) as Task, updatedAt: r.updated_at }))
+      .filter(({ task, updatedAt }) =>
+        now - updatedAt <= this.ttlMs || hasPendingPaymentRecovery(task),
+      )
+      .map(({ task }) => task)
   }
 }

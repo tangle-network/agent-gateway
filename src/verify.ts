@@ -1,7 +1,16 @@
 import type { X402Config, MppConfig, ApiKeyInfo, GatewayConfig } from './types'
 import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
+import {
+  mppPaymentOperationId,
+  type MppAuthenticatedCredential,
+} from './mpp-payment'
 
-/** Return the canonical opaque nonce key used by the final payment claim. */
+export interface VerifiedMppCredential extends MppAuthenticatedCredential {
+  /** Opaque replay key. BlueprinTEVM shares the x402 nonce namespace. */
+  replayKey: string
+}
+
+/** Return the legacy opaque nonce key used by older consumers. */
 export function mppReplayNonceKey(authHeader: string): string | undefined {
   const decoded = decodeMppCredential(authHeader)
   return decoded ? canonicalMppNonceKey(decoded.method, decoded.payload, decoded.credential) : undefined
@@ -10,6 +19,11 @@ export function mppReplayNonceKey(authHeader: string): string | undefined {
 /** Return the decoded MPP payload for a durable payment claim. */
 export function mppPaymentPayload(authHeader: string): Record<string, unknown> | undefined {
   return decodeMppCredential(authHeader)?.payload
+}
+
+/** Return the decoded method credential for the post-guard charge lifecycle. */
+export function mppPaymentCredential(authHeader: string): string | undefined {
+  return decodeMppCredential(authHeader)?.credential
 }
 
 interface DecodedMppCredential {
@@ -50,18 +64,31 @@ function canonicalMppNonceKey(
   credential: string,
 ): string {
   if (payload.nonce === undefined) {
-    // Generic MPP methods may not expose a numeric nonce. The signed receipt
-    // itself is still the replay identity and must be claimed exactly once.
     return `mpp:${method.toLowerCase()}:receipt:${Buffer.from(credential).toString('base64url')}`
   }
   const nonce = BigInt(String(payload.nonce)).toString()
   const commitment = payload.commitment
-  // BlueprinTEVM carries the same SpendAuth identity as x402. Keep one
-  // namespace so a credential cannot cross the two HTTP transports.
   if (method.toLowerCase() === 'blueprintevm' && typeof commitment === 'string' && commitment.length > 0) {
     return `${commitment.toLowerCase()}:${nonce}`
   }
   return `mpp:${method.toLowerCase()}:${String(payload.commitment ?? payload.from ?? 'unknown').toLowerCase()}:${nonce}`
+}
+
+function blueprintevmNonceKey(payload: Record<string, unknown>): string | undefined {
+  if (payload.nonce === undefined) return undefined
+  const nonce = BigInt(String(payload.nonce)).toString()
+  const identity = payload.commitment ?? payload.from
+  if (typeof identity !== 'string' || identity.length === 0) return undefined
+  return `${identity.toLowerCase()}:${nonce}`
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 /** Pure capability checks shared by discovery and every request protocol. */
@@ -71,17 +98,17 @@ export function isApiKeyAuthEnabled(
   return config.verifyApiKey !== undefined || config.x402.demoMode === true
 }
 
-/** MPP is enabled only when a real verifier or explicit demo mode exists. */
+/** MPP is enabled only when authentication and method settlement are complete. */
 export function isMppAuthEnabled(
   config: Pick<GatewayConfig, 'mpp' | 'x402'>,
 ): boolean {
   const method = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
-  return Boolean(
-    config.mpp &&
-      (config.mpp.verifySigner !== undefined ||
-        (method === 'blueprintevm' && config.x402.verifySigner !== undefined) ||
-        config.x402.demoMode === true),
-  )
+  if (!config.mpp) return false
+  const authenticated = config.mpp.authenticateCredential !== undefined ||
+    (method === 'blueprintevm' && config.x402.verifySigner !== undefined) ||
+    (method === 'blueprintevm' && config.x402.demoMode === true)
+  if (!authenticated) return false
+  return method === 'blueprintevm' || config.mpp.charge !== undefined
 }
 
 /**
@@ -150,11 +177,11 @@ export async function verifyX402(
  * Verify MPP (Machine Payments Protocol) Authorization: Payment header.
  *
  * MPP uses `Authorization: Payment <method> <credential>` format. The
- * credential is method-specific; `MppConfig.verifySigner` owns verification
- * and returns the consumer identity. The built-in `blueprintevm` path can
+ * credential is method-specific; `MppConfig.authenticateCredential` owns authentication
+ * and returns the consumer plus stable payment identity. The built-in `blueprintevm` path can
  * reuse the x402 verifier for credentials with the compatible payload shape.
  *
- * Returns the signer address if valid, null otherwise.
+ * Returns authenticated identity if valid, null otherwise.
  * In demo mode, accepts any well-formed Payment header with an identity.
  */
 export async function verifyMpp(
@@ -164,23 +191,23 @@ export async function verifyMpp(
   nonceStore?: NonceStore,
   minimumAmount = 1n,
   markNonce = true,
-): Promise<string | null> {
+): Promise<VerifiedMppCredential | null> {
   // MPP format: "Payment <method> <base64url-credential>"
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
   if (!match) return null
 
   const [, rawMethod] = match
   const method = rawMethod.toLowerCase()
-  if (config.method && method !== config.method.toLowerCase()) return null
+  if (method !== (config.method ?? 'blueprintevm').toLowerCase()) return null
 
   try {
     const decodedCredential = decodeMppCredential(authHeader)
     if (!decodedCredential) return null
     const { credential: decoded, payload } = decodedCredential
 
-    // Validate common EVM fields before a production verifier can reserve or
-    // settle funds. BlueprinTEVM carries x402-equivalent token amounts and
-    // must cover the same request ceiling as the X-Payment-Signature path.
+    // Validate common EVM fields before pure credential authentication.
+    // BlueprinTEVM carries x402-equivalent token amounts and must cover the
+    // same request ceiling as the X-Payment-Signature path.
     const operator = payload.operator ?? payload.to
     if (operator !== undefined) {
       if (typeof operator !== 'string' || operator.toLowerCase() !== x402Config.operatorAddress.toLowerCase()) {
@@ -199,25 +226,49 @@ export async function verifyMpp(
       return null
     }
 
-    const nonceKey = canonicalMppNonceKey(method, payload, decoded)
-    if (nonceStore?.hasSeen && await nonceStore.hasSeen(nonceKey)) return null
+    const blueprintevmKey = method === 'blueprintevm'
+      ? blueprintevmNonceKey(payload)
+      : undefined
+    if (markNonce && blueprintevmKey && nonceStore?.hasSeen && await nonceStore.hasSeen(blueprintevmKey)) {
+      return null
+    }
 
-    let consumerId: string | null = null
-    if (config.verifySigner) {
-      consumerId = await config.verifySigner(payload, { method, credential: decoded })
+    let authenticated: MppAuthenticatedCredential | null = null
+    if (config.authenticateCredential) {
+      authenticated = await config.authenticateCredential(payload, { method, credential: decoded })
     } else if (method === 'blueprintevm' && x402Config.verifySigner && payload.commitment) {
       const verified = await x402Config.verifySigner(payload, {
         protocolVersion: x402Config.paymentProtocolVersion ?? (x402Config.paymentOperations ? 2 : 1),
       })
-      consumerId = verified ? String(payload.commitment) : null
+      const paymentIdentity = blueprintevmNonceKey(payload) ?? stableJson(payload)
+      authenticated = verified
+        ? { consumerId: String(payload.commitment), paymentIdentity }
+        : null
     } else if (x402Config.demoMode) {
       const identity = payload.commitment ?? payload.from
       if (typeof identity !== 'string' || identity.length === 0) return null
-      consumerId = identity
+      const paymentIdentity = method === 'blueprintevm'
+        ? blueprintevmNonceKey(payload) ?? stableJson(payload)
+        : ''
+      if (!paymentIdentity) return null
+      authenticated = { consumerId: identity, paymentIdentity }
     } else {
       return null
     }
-    if (!consumerId) return null
+    if (
+      !authenticated ||
+      typeof authenticated.consumerId !== 'string' ||
+      authenticated.consumerId.length === 0 ||
+      typeof authenticated.paymentIdentity !== 'string' ||
+      authenticated.paymentIdentity.length === 0
+    ) return null
+
+    const replayKey = method === 'blueprintevm'
+      ? blueprintevmKey ??
+        await mppPaymentOperationId(method, authenticated.paymentIdentity)
+      : await mppPaymentOperationId(method, authenticated.paymentIdentity)
+    if (!replayKey) return null
+    if (markNonce && !blueprintevmKey && nonceStore?.hasSeen && await nonceStore.hasSeen(replayKey)) return null
 
     if (nonceStore && markNonce) {
       const expiry = payload.expiry === undefined
@@ -225,11 +276,11 @@ export async function verifyMpp(
         : BigInt(String(payload.expiry))
       const ttl = nonceTtlSeconds(expiry)
       if (ttl === undefined) return null
-      const claimed = await claimStoredNonce(nonceStore, nonceKey, ttl)
+      const claimed = await claimStoredNonce(nonceStore, replayKey, ttl)
       if (!claimed) return null
     }
 
-    return consumerId
+    return { ...authenticated, replayKey }
   } catch {
     return null
   }

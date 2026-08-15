@@ -5,6 +5,7 @@ import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryPaymentOperations, type PaymentOperation } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 import type { AgentMeta, GatewayConfig, SandboxBox, SandboxUsageReceipt } from '../src/types'
 import type { Artifact, Task } from '../src/a2a/types'
 
@@ -274,6 +275,7 @@ describe('A2A task atomicity and restart recovery', () => {
         paymentOperations: operations,
       },
       nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
       a2a: {
         taskStore,
         authorizeTaskAccess: async () => true,
@@ -385,6 +387,7 @@ describe('A2A task atomicity and restart recovery', () => {
         paymentOperations: operations,
       },
       nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()

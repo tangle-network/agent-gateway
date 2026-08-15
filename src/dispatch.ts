@@ -11,10 +11,26 @@
 import type { Context } from 'hono'
 
 import { filterConsumerMessagesStrict, redactSystemPromptFromOutput } from './filter'
+import {
+  assertMppChargeOperation,
+  mppPaymentOperationId,
+  type MppChargeOperation,
+} from './mpp-payment'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import { type RateLimitStore, checkRateLimit } from './rate-limit'
 import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
-import type { PaymentOperation } from './payment-operations'
+import { paymentNonceKey, type PaymentOperation } from './payment-operations'
+import {
+  PAYMENT_RECOVERY_VERSION,
+  PaymentRecoveryFenceError,
+  PaymentRecoveryReplayError,
+  recoveryTiming,
+  serializePaymentOperation,
+  updateOwnedPaymentRecovery,
+  type PaymentRecoveryRecord,
+  type PaymentRecoveryTarget,
+  type PaymentSettlementBasis,
+} from './payment-recovery'
 import type {
   AgentMeta,
   ApiKeyInfo,
@@ -30,7 +46,7 @@ import {
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
   mppPaymentPayload,
-  mppReplayNonceKey,
+  mppPaymentCredential,
   verifyMpp,
   verifyX402,
 } from './verify'
@@ -67,8 +83,21 @@ export interface AuthorizedRequest {
   paymentPayload: Record<string, unknown> | null
   paymentNonceKey?: string
   mppMethod?: string
+  /** Live generic MPP credential. Never written to the recovery store. */
+  mppCredential?: string
+  /** Stable method identity. The gateway persists only its digest. */
+  mppPaymentIdentity?: string
+  mppChargeOperation?: MppChargeOperation
   paymentOperation?: PaymentOperation
   paymentOperationAcquired?: boolean
+  paymentRecoveryId?: string
+  /** Unique ownership fence for live or recovery transitions. */
+  paymentRecoveryFence?: string
+}
+
+export interface PaymentClaimHooks {
+  /** Persist the recovery identity before the provider can mutate payment state. */
+  onRecoveryPrepared?: (recoveryId: string) => Promise<void>
 }
 
 function decimalFraction(value: number): { numerator: bigint; denominator: bigint } {
@@ -245,6 +274,8 @@ export async function authenticateAndGuard(
   let x402Payload: Record<string, unknown> | null = null
   let paymentNonceKey: string | undefined
   let mppMethod: string | undefined
+  let mppCredential: string | undefined
+  let mppPaymentIdentity: string | undefined
 
   if (spendAuthHeader) {
     const signer = await verifyX402(
@@ -281,7 +312,7 @@ export async function authenticateAndGuard(
     consumerId = signer
     paymentMethod = 'x402'
   } else if (isMppAuthEnabled(config) && authHeader.toLowerCase().startsWith('payment ')) {
-    const signer = await verifyMpp(
+    const authenticated = await verifyMpp(
       authHeader,
       config.mpp!,
       config.x402,
@@ -289,7 +320,7 @@ export async function authenticateAndGuard(
       requiredPaymentAmount,
       false,
     )
-    if (!signer) {
+    if (!authenticated) {
       const realm = config.mpp!.realm
       const method = config.mpp!.method ?? 'blueprintevm'
       await state.obs?.onAuthFailure?.(ctx, {
@@ -314,11 +345,13 @@ export async function authenticateAndGuard(
         },
       )
     }
-    consumerId = signer
+    consumerId = authenticated.consumerId
     paymentMethod = 'mpp'
     mppMethod = authHeader.match(/^Payment\s+(\S+)\s+/i)?.[1]?.toLowerCase()
+    mppCredential = mppPaymentCredential(authHeader)
+    mppPaymentIdentity = authenticated.paymentIdentity
     x402Payload = mppPaymentPayload(authHeader) ?? null
-    paymentNonceKey = mppReplayNonceKey(authHeader)
+    paymentNonceKey = authenticated.replayKey
   } else if (authHeader.startsWith('Bearer ')) {
     const verify = config.verifyApiKey ?? (config.x402.demoMode ? defaultVerifyApiKey : null)
     if (!verify || !isApiKeyAuthEnabled(config)) {
@@ -498,6 +531,8 @@ export async function authenticateAndGuard(
     paymentPayload: x402Payload,
     paymentNonceKey,
     mppMethod,
+    mppCredential,
+    mppPaymentIdentity,
   }
 }
 
@@ -506,14 +541,15 @@ export async function claimPayment(
   authz: AuthorizedRequest,
   config: GatewayConfig,
   state: GatewayState,
+  hooks: PaymentClaimHooks = {},
 ): Promise<void> {
   if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
-    const context = {
-      requestId: authz.requestId,
-      agentId: authz.agent.id,
-      requiredAmount: authz.requiredPaymentAmount,
-      maxOutputTokens: authz.maxOutputTokens,
-      executionBudget: authz.executionBudget,
+    const context = paymentAuthorizationContext(authz)
+    if (config.x402.paymentProtocolVersion === 2) {
+      await preparePaymentRecovery(authz, config, {
+        kind: 'x402',
+        operationId: `x402:${paymentNonceKey(authz.paymentPayload)}`,
+      }, hooks)
     }
     let operation: PaymentOperation | undefined
     if (config.x402.authorizePayment) {
@@ -559,6 +595,7 @@ export async function claimPayment(
       // Attach owned state before the shared nonce claim. If that claim fails,
       // the caller can persist release recovery after an ambiguous refund.
       authz.paymentOperation = operation
+      await markRecoveryClaimed(authz, config)
     }
     if (operation && authz.paymentNonceKey) {
       const claimed = await claimPaymentNonce(
@@ -569,7 +606,7 @@ export async function claimPayment(
       )
       if (!claimed) {
         try {
-          await config.x402.paymentOperations!.releasePayment(operation, 'shared payment nonce was already owned')
+          await releasePayment(authz, config, 'shared payment nonce was already owned')
         } catch (releaseError) {
           console.error(
             `[agent-gateway] payment release failed for ${authz.requestId}:`,
@@ -585,16 +622,14 @@ export async function claimPayment(
     }
     const mppMethod = (authz.mppMethod ?? config.mpp?.method ?? 'blueprintevm').toLowerCase()
     const durablePayload = durableMppPaymentPayload(authz.paymentPayload)
-    // Only BlueprinTEVM carries x402 authorization fields; other MPP methods
-    // must stay on their verifier and method-specific settlement path.
+    // Only BlueprinTEVM carries x402 authorization fields. Other MPP methods
+    // use the isolated immediate-charge lifecycle below.
     if (mppMethod === 'blueprintevm' && durablePayload && config.x402.paymentOperations) {
-      const context = {
-        requestId: authz.requestId,
-        agentId: authz.agent.id,
-        requiredAmount: authz.requiredPaymentAmount,
-        maxOutputTokens: authz.maxOutputTokens,
-        executionBudget: authz.executionBudget,
-      }
+      const context = paymentAuthorizationContext(authz)
+      await preparePaymentRecovery(authz, config, {
+        kind: 'x402',
+        operationId: `x402:${paymentNonceKey(durablePayload)}`,
+      }, hooks)
       const operation = await config.x402.paymentOperations.claimPayment(durablePayload, context)
       if (operation.protocolVersion !== 2) throw new Error('payment operation protocol version mismatch')
       if (operation.acquiredByRequestId !== context.requestId) {
@@ -603,6 +638,7 @@ export async function claimPayment(
       authz.paymentPayload = durablePayload
       authz.paymentOperation = operation
       authz.paymentOperationAcquired = true
+      await markRecoveryClaimed(authz, config)
       const claimed = await claimPaymentNonce(
         state.nonceStore,
         authz.paymentNonceKey,
@@ -611,7 +647,7 @@ export async function claimPayment(
       )
       if (!claimed) {
         try {
-          await config.x402.paymentOperations.releasePayment(operation, 'shared payment nonce was already owned')
+          await releasePayment(authz, config, 'shared payment nonce was already owned')
         } catch (releaseError) {
           console.error(
             `[agent-gateway] payment release failed for ${authz.requestId}:`,
@@ -620,9 +656,55 @@ export async function claimPayment(
         }
         throw new Error('payment nonce was already consumed')
       }
-    } else {
+    } else if (mppMethod === 'blueprintevm') {
       const claimed = await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload ?? {})
       if (!claimed) throw new Error('payment nonce was already consumed')
+    } else {
+      const lifecycle = config.mpp?.charge
+      if (!lifecycle || lifecycle.protocolVersion !== 1) {
+        throw new Error('MPP charge lifecycle is not configured')
+      }
+      if (!authz.mppCredential) throw new Error('MPP payment credential is unavailable')
+      if (!authz.mppPaymentIdentity) throw new Error('MPP payment identity is unavailable')
+      const operationId = await mppPaymentOperationId(mppMethod, authz.mppPaymentIdentity)
+      await preparePaymentRecovery(authz, config, {
+        kind: 'mpp-charge',
+        method: mppMethod,
+        operationId,
+      }, hooks)
+      const claimed = await claimPaymentNonce(
+        state.nonceStore,
+        authz.paymentNonceKey,
+        authz.paymentPayload ?? {},
+        `${operationId}:${authz.requestId}`,
+      )
+      if (!claimed) {
+        await markRecoveryReconciled(authz, config)
+        throw new Error('payment nonce was already consumed')
+      }
+      const operation = await lifecycle.confirmPayment({
+        operationId,
+        requestId: authz.requestId,
+        agentId: authz.agent.id,
+        consumerId: authz.consumerId,
+        method: mppMethod,
+        credential: authz.mppCredential,
+        amount: authz.requiredPaymentAmount,
+        currencyDecimals: config.x402.currencyDecimals ?? 6,
+      })
+      assertMppChargeOperation(
+        operation,
+        { operationId, requestId: authz.requestId, method: mppMethod },
+        ['confirmed'],
+        false,
+      )
+      authz.mppChargeOperation = operation
+      await markRecoveryClaimed(authz, config)
+      assertMppChargeOperation(
+        operation,
+        { operationId, requestId: authz.requestId, method: mppMethod },
+        ['confirmed'],
+      )
     }
   }
 
@@ -648,14 +730,153 @@ export async function claimPayment(
   }
 }
 
+function paymentAuthorizationContext(authz: AuthorizedRequest) {
+  return {
+    requestId: authz.requestId,
+    agentId: authz.agent.id,
+    requiredAmount: authz.requiredPaymentAmount,
+    maxOutputTokens: authz.maxOutputTokens,
+    executionBudget: authz.executionBudget,
+  }
+}
+
+async function preparePaymentRecovery(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  payment: PaymentRecoveryTarget,
+  hooks: PaymentClaimHooks,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery) throw new Error('durable payment recovery is not configured')
+  const now = Date.now()
+  const fenceId = globalThis.crypto.randomUUID()
+  const leaseExpiresAt = now + recoveryTiming(recovery).staleRequestMs
+  const record: PaymentRecoveryRecord = {
+    version: PAYMENT_RECOVERY_VERSION,
+    id: payment.operationId,
+    revision: 0,
+    state: 'claiming',
+    payment,
+    attribution: {
+      requestId: authz.requestId,
+      agentId: authz.agent.id,
+      agentSlug: authz.agent.slug,
+      consumerId: authz.consumerId,
+      paymentMethod: authz.paymentMethod,
+      startMs: authz.startMs,
+      pricePerTokenUsd: authz.agent.pricePerTokenUsd,
+      platformFeePercent: authz.agent.platformFeePercent,
+      requiredAmount: authz.requiredPaymentAmount.toString(),
+      currencyDecimals: config.x402.currencyDecimals ?? 6,
+      maxOutputTokens: authz.maxOutputTokens,
+      executionBudget: authz.executionBudget,
+    },
+    workStarted: false,
+    usageRecorded: false,
+    attempts: 0,
+    nextAttemptAt: leaseExpiresAt,
+    lease: { id: fenceId, expiresAt: leaseExpiresAt },
+    createdAt: now,
+    updatedAt: now,
+  }
+  if (!await recovery.store.createIfAbsent(record)) {
+    if ((await recovery.store.get(record.id))?.state === 'reconciled') {
+      throw new PaymentRecoveryReplayError(record.id)
+    }
+    throw new Error('payment recovery identity was already claimed')
+  }
+  authz.paymentRecoveryId = record.id
+  authz.paymentRecoveryFence = fenceId
+  await hooks.onRecoveryPrepared?.(record.id)
+}
+
+async function markRecoveryClaimed(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId) return
+  const fenceId = requirePaymentRecoveryFence(authz)
+  const now = Date.now()
+  const leaseExpiresAt = now + recoveryTiming(recovery).staleRequestMs
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    state: 'claimed',
+    payment: recoveryTarget(authz, record.payment),
+    lease: { id: fenceId, expiresAt: leaseExpiresAt },
+    nextAttemptAt: leaseExpiresAt,
+  }), now)
+}
+
+function requirePaymentRecoveryFence(authz: AuthorizedRequest): string {
+  if (!authz.paymentRecoveryFence) {
+    throw new Error('payment recovery fence is unavailable')
+  }
+  return authz.paymentRecoveryFence
+}
+
+function recoveryTarget(
+  authz: AuthorizedRequest,
+  current: PaymentRecoveryTarget,
+): PaymentRecoveryTarget {
+  if (authz.paymentOperation) {
+    return {
+      kind: 'x402',
+      operationId: authz.paymentOperation.operationId,
+      operation: serializePaymentOperation(authz.paymentOperation),
+    }
+  }
+  if (authz.mppChargeOperation) {
+    return {
+      kind: 'mpp-charge',
+      method: authz.mppChargeOperation.method,
+      operationId: authz.mppChargeOperation.operationId,
+      operation: authz.mppChargeOperation,
+    }
+  }
+  return current
+}
+
 /** Release an owned operation when execution cannot produce a valid receipt. */
 export async function releasePayment(
   authz: AuthorizedRequest,
   config: GatewayConfig,
   reason: string,
 ): Promise<void> {
-  if (!authz.paymentOperation || authz.paymentOperationAcquired !== true || !config.x402.paymentOperations) return
-  await config.x402.paymentOperations.releasePayment(authz.paymentOperation, reason)
+  const ownsX402 = authz.paymentOperation &&
+    authz.paymentOperationAcquired === true &&
+    config.x402.paymentOperations
+  const ownsMpp = authz.mppChargeOperation && config.mpp?.charge
+  if (!ownsX402 && !ownsMpp) {
+    await relinquishPaymentRecovery(authz, config, Date.now())
+    return
+  }
+  await markRecoveryReleasing(authz, config, reason)
+  try {
+    if (ownsX402) {
+      authz.paymentOperation = await config.x402.paymentOperations!.releasePayment(
+        authz.paymentOperation!,
+        reason,
+      )
+    } else {
+      const operation = await config.mpp!.charge!.releasePayment(authz.mppChargeOperation!, reason)
+      assertMppChargeOperation(
+        operation,
+        {
+          operationId: authz.mppChargeOperation!.operationId,
+          requestId: authz.requestId,
+          method: authz.mppChargeOperation!.method,
+        },
+        ['released'],
+        false,
+      )
+      authz.mppChargeOperation = operation
+    }
+  } catch (error) {
+    await relinquishPaymentRecovery(authz, config, Date.now())
+    throw error
+  }
+  await markRecoveryReconciled(authz, config)
 }
 
 /** Mark a durable reservation active immediately before sandbox execution. */
@@ -663,8 +884,29 @@ export async function beginPaymentExecution(
   authz: AuthorizedRequest,
   config: GatewayConfig,
 ): Promise<void> {
-  if (!authz.paymentOperation || authz.paymentOperationAcquired !== true || !config.x402.paymentOperations) return
-  authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
+  if (!authz.paymentRecoveryId) {
+    if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
+      authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
+    }
+    return
+  }
+  const recovery = config.paymentRecovery
+  if (!recovery) throw new Error('durable payment recovery is not configured')
+  const fenceId = requirePaymentRecoveryFence(authz)
+  const now = Date.now()
+  const fallbackAt = now + recoveryTiming(recovery).receiptTimeoutMs
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    state: 'executing',
+    payment: recoveryTarget(authz, record.payment),
+    workStarted: true,
+    fallbackAt,
+    lease: { id: fenceId, expiresAt: fallbackAt },
+    nextAttemptAt: fallbackAt,
+  }), now)
+  if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
+    authz.paymentOperation = await config.x402.paymentOperations.beginPaymentExecution(authz.paymentOperation)
+  }
 }
 
 /**
@@ -678,6 +920,27 @@ export async function releasePaymentAfterFailure(
   workObserved: boolean,
 ): Promise<void> {
   if (workObserved) {
+    const recovery = config.paymentRecovery
+    if (recovery && authz.paymentRecoveryId) {
+      const fenceId = requirePaymentRecoveryFence(authz)
+      await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => {
+        if (record.state === 'settling' && record.usage) {
+          return { ...record, lease: undefined, nextAttemptAt: Date.now() }
+        }
+        const fallbackAt = record.fallbackAt ??
+          Date.now() + recoveryTiming(recovery).receiptTimeoutMs
+        return {
+          ...record,
+          state: 'retained',
+          payment: recoveryTarget(authz, record.payment),
+          workStarted: true,
+          fallbackAt,
+          reason,
+          lease: undefined,
+          nextAttemptAt: fallbackAt,
+        }
+      })
+    }
     if (authz.paymentOperation && authz.paymentOperationAcquired === true && config.x402.paymentOperations) {
       authz.paymentOperation = await config.x402.paymentOperations.retainPayment(authz.paymentOperation, reason)
     }
@@ -687,6 +950,61 @@ export async function releasePaymentAfterFailure(
     return
   }
   await releasePayment(authz, config, reason)
+}
+
+async function relinquishPaymentRecovery(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  nextAttemptAt: number,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId || !authz.paymentRecoveryFence) return
+  try {
+    await updateOwnedPaymentRecovery(
+      recovery.store,
+      authz.paymentRecoveryId,
+      authz.paymentRecoveryFence,
+      (record) => ({ ...record, lease: undefined, nextAttemptAt }),
+    )
+  } catch (error) {
+    if (!(error instanceof PaymentRecoveryFenceError)) throw error
+  }
+}
+
+async function markRecoveryReleasing(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  reason: string,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId) return
+  const fenceId = requirePaymentRecoveryFence(authz)
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    state: 'releasing',
+    payment: recoveryTarget(authz, record.payment),
+    reason,
+    nextAttemptAt: Date.now(),
+  }))
+}
+
+async function markRecoveryReconciled(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId) return
+  const fenceId = requirePaymentRecoveryFence(authz)
+  const now = Date.now()
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    state: 'reconciled',
+    payment: recoveryTarget(authz, record.payment),
+    lease: undefined,
+    lastError: undefined,
+    nextAttemptAt: Number.MAX_SAFE_INTEGER,
+    reconciledAt: now,
+  }), now)
 }
 
 export async function reclaimPayment(
@@ -835,6 +1153,8 @@ export async function* dispatchSandboxStreamRich(
   if (signal?.aborted) return
   await onExecutionStart?.()
   if (signal?.aborted) return
+  // A stream adapter can start paid work synchronously during this call.
+  onSandboxStart?.()
   const promptStream = box.streamPrompt(userMessage, {
     sessionId: sessionId ?? `consumer:${consumerId}`,
     systemPrompt: agent.systemPrompt,
@@ -842,7 +1162,6 @@ export async function* dispatchSandboxStreamRich(
     executionBudget,
     signal,
   })
-  onSandboxStart?.()
   const iterator = promptStream[Symbol.asyncIterator]()
   try {
     while (true) {
@@ -981,6 +1300,10 @@ export interface SettleAndRecordOptions {
   usageAlreadyRecorded?: boolean
   /** Persist the caller's recovery marker after attribution succeeds. */
   onUsageRecorded?: () => Promise<void>
+  /** Recovery uses the original quoted ceiling when no receipt arrives. */
+  settlementBasis?: PaymentSettlementBasis
+  /** Exact base-unit charge selected by the recovery policy. */
+  paymentAmount?: bigint
 }
 
 export async function settleAndRecord(
@@ -991,6 +1314,9 @@ export async function settleAndRecord(
   obs: GatewayObserver | undefined,
   options: SettleAndRecordOptions = {},
 ): Promise<void> {
+  const settlementBasis = options.settlementBasis ?? 'usage-receipt'
+  await markRecoverySettling(authz, usage, settlementBasis, config)
+  if (options.usageAlreadyRecorded) await markRecoveryUsageRecorded(authz, config)
   const tokenCost = (
     usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens
   ) * agent.pricePerTokenUsd
@@ -1013,6 +1339,7 @@ export async function settleAndRecord(
     ownerEarnedUsd: ownerEarned,
     platformFeeUsd: platformFee,
     durationMs: Date.now() - authz.startMs,
+    settlementBasis,
   }
   const ctx: RequestContext = {
     requestId: authz.requestId,
@@ -1021,7 +1348,7 @@ export async function settleAndRecord(
   }
   try {
     if (authz.paymentOperation && config.x402.paymentOperations) {
-      const amount = actualX402Amount(
+      const amount = options.paymentAmount ?? actualX402Amount(
         agent.pricePerTokenUsd,
         usage.inputTokens,
         usage.outputTokens,
@@ -1032,13 +1359,22 @@ export async function settleAndRecord(
       )
       authz.paymentOperation = await config.x402.paymentOperations.settlePayment(
         authz.paymentOperation,
-        { amount, totalCostUsd: totalCost, usage },
+        { amount, totalCostUsd: totalCost, usage, basis: settlementBasis },
       )
       // Durable settlement happens first. If attribution storage is
       // unavailable, recovery must never refund delivered work.
       if (!options.usageAlreadyRecorded) {
         await config.recordUsage(usageEvent)
         await options.onUsageRecorded?.()
+        await markRecoveryUsageRecorded(authz, config)
+      }
+    } else if (authz.mppChargeOperation) {
+      // Generic MPP charge methods confirm before the response. Finalization
+      // records attribution only; it never invokes the legacy settlement hook.
+      if (!options.usageAlreadyRecorded) {
+        await config.recordUsage(usageEvent)
+        await options.onUsageRecorded?.()
+        await markRecoveryUsageRecorded(authz, config)
       }
     } else {
       // Legacy adapters retain attribution-before-charge because their
@@ -1058,7 +1394,7 @@ export async function settleAndRecord(
         )
       }
     }
-    await obs?.onRequestComplete?.(ctx, usageEvent)
+    await markRecoveryReconciled(authz, config)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[agent-gateway] settlement failed for ${authz.consumerId}: ${msg}`)
@@ -1069,6 +1405,49 @@ export async function settleAndRecord(
     })
     throw err
   }
+  try {
+    await obs?.onRequestComplete?.(ctx, usageEvent)
+  } catch (error) {
+    console.error(
+      `[agent-gateway] completion observer failed for ${authz.requestId}:`,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+}
+
+async function markRecoverySettling(
+  authz: AuthorizedRequest,
+  usage: SandboxUsageReceipt,
+  settlementBasis: PaymentSettlementBasis,
+  config: GatewayConfig,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId) return
+  const fenceId = requirePaymentRecoveryFence(authz)
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => {
+    return {
+      ...record,
+      state: 'settling',
+      payment: recoveryTarget(authz, record.payment),
+      workStarted: true,
+      usage,
+      settlementBasis,
+      nextAttemptAt: Date.now(),
+    }
+  })
+}
+
+async function markRecoveryUsageRecorded(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+): Promise<void> {
+  const recovery = config.paymentRecovery
+  if (!recovery || !authz.paymentRecoveryId) return
+  const fenceId = requirePaymentRecoveryFence(authz)
+  await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => ({
+    ...record,
+    usageRecorded: true,
+  }))
 }
 
 function mergeUsage(

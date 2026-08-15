@@ -25,6 +25,12 @@ import {
   settleAndRecord,
 } from '../dispatch'
 import type { PaymentOperation } from '../payment-operations'
+import {
+  deserializePaymentOperation,
+  serializePaymentOperation,
+  type SerializedPaymentOperation,
+} from '../payment-recovery'
+import { recoverPayment as recoverDurablePayment } from '../payment-recovery-worker'
 import type {
   GatewayConfig,
   PaymentMethod,
@@ -61,21 +67,6 @@ export interface A2AHandlerDeps {
   pushStore?: PushNotificationStore
 }
 
-interface SerializedPaymentOperation {
-  protocolVersion: 2
-  operationId: string
-  acquiredByRequestId: string
-  executionStartedAt?: number
-  retentionReason?: string
-  nonceKey: string
-  authorizationId: string
-  reservedAmount: string
-  settledAmount: string
-  refundAmount: string
-  expiresAt: number
-  state: PaymentOperation['state']
-}
-
 type FinalizationState = 'completed' | 'input-required' | 'canceled'
 
 interface FinalizationRecord {
@@ -110,6 +101,11 @@ interface PaymentReleaseRecord {
   reason: string
   recoveryAttempts?: number
   recoveryError?: string
+}
+
+interface TaskPaymentRecoveryMarker {
+  version: 1
+  id: string
 }
 
 /** Terminal task states — fire-once push delivery occurs on these transitions. */
@@ -247,6 +243,7 @@ async function handleMessageSend(
   const guard = await guardMessageRequest(c, slug, req, deps)
   if (guard instanceof Response) return guard
   const { authz, task } = guard
+  setPaymentResponseHeaders(c, authz)
   const controller = cancels.register(task.id)
   try {
     return await executeMessageSend(c, req, deps, authz, task, controller.signal)
@@ -285,6 +282,7 @@ async function executeMessageSend(
   let inputRequiredSeen = false
   let finalizationLeaseId: string | undefined
   try {
+    await beginPaymentExecution(authz, deps.config)
     for await (const event of dispatchSandboxStreamRich(
       authz.agent,
       authz.userMessage,
@@ -293,10 +291,8 @@ async function executeMessageSend(
       signal,
       task.id,
       authz.maxOutputTokens,
-      async () => {
-        await beginPaymentExecution(authz, deps.config)
-      },
-      authz.paymentOperation !== undefined,
+      undefined,
+      authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
       () => {
         workObserved = true
       },
@@ -395,7 +391,7 @@ async function executeMessageSend(
       },
     })
     usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
-    const settledBase = clearFinalizationMarker(usageRecordedTask)
+    const settledBase = clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask))
     const result = inputRequiredSeen
       ? withStatus(
           settledBase,
@@ -464,8 +460,49 @@ async function handleMessageStream(
   const guard = await guardMessageRequest(c, slug, req, deps)
   if (guard instanceof Response) return guard
   const { authz, task } = guard
+  setPaymentResponseHeaders(c, authz)
 
   const controller = cancels.register(task.id)
+  const workingStatus: TaskStatusUpdateEvent = {
+    kind: 'status-update',
+    taskId: task.id,
+    contextId: task.contextId,
+    status: { state: 'working', timestamp: nowIso() },
+    final: false,
+  }
+  const workingTask: Task = task.status.state === 'working'
+    ? task
+    : { ...task, status: workingStatus.status }
+  if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
+    cancels.clear(task.id)
+    const current = await releaseTaskPayment(
+      authz,
+      await deps.taskStore.get(task.id) ?? task,
+      deps,
+      'A2A task changed before execution started',
+      false,
+    )
+    if (current.status.state === 'canceled') return c.json(ok(req.id, current))
+    return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' changed before execution`))
+  }
+  try {
+    await beginPaymentExecution(authz, deps.config)
+  } catch (error) {
+    cancels.clear(task.id)
+    await releaseTaskPayment(
+      authz,
+      workingTask,
+      deps,
+      error instanceof Error ? error.message : String(error),
+      false,
+    )
+    return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment execution authorization failed'))
+  }
+  if (controller.signal.aborted) {
+    cancels.clear(task.id)
+    const canceled = await completeCanceledTask(authz, workingTask, '', undefined, false, deps)
+    return c.json(ok(req.id, canceled))
+  }
   let responseText = ''
   let usage: SandboxUsageReceipt | undefined
   let workObserved = false
@@ -477,24 +514,10 @@ async function handleMessageStream(
         ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(ok(req.id, event))}\n\n`))
       }
 
-      // Status: working
-      const workingStatus: TaskStatusUpdateEvent = {
-        kind: 'status-update',
-        taskId: task.id,
-        contextId: task.contextId,
-        status: { state: 'working', timestamp: nowIso() },
-        final: false,
-      }
-      const workingTask: Task = task.status.state === 'working'
-        ? task
-        : { ...task, status: workingStatus.status }
       let inputRequiredPrompt: string | undefined
       let inputRequiredSeen = false
       let finalizationLeaseId: string | undefined
       try {
-        if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
-          throw new Error('A2A task changed before execution started')
-        }
         send(workingStatus)
 
         for await (const event of dispatchSandboxStreamRich(
@@ -505,10 +528,8 @@ async function handleMessageStream(
           controller.signal,
           task.id,
           authz.maxOutputTokens,
-          async () => {
-            await beginPaymentExecution(authz, deps.config)
-          },
-          authz.paymentOperation !== undefined,
+          undefined,
+          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
           () => {
             workObserved = true
           },
@@ -616,7 +637,7 @@ async function handleMessageStream(
 
         if (inputRequiredSeen) {
           const paused = withStatus(
-            clearFinalizationMarker(usageRecordedTask),
+            clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
             'input-required',
             inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
             responseText
@@ -648,7 +669,7 @@ async function handleMessageStream(
         }
 
         // Final: persist the terminal task before emitting terminal events.
-        const completed = withStatus(clearFinalizationMarker(usageRecordedTask), 'completed', undefined, [
+        const completed = withStatus(clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)), 'completed', undefined, [
           responseTextToArtifact(responseText, `${task.id}-artifact-0`),
         ])
         if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, completed)) {
@@ -762,6 +783,12 @@ async function handleMessageStream(
       'X-Request-Id': authz.requestId,
       'X-Agent-Slug': authz.agent.slug,
       'X-Task-Id': task.id,
+      ...(authz.mppChargeOperation
+        ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
+        : {}),
+      ...(authz.paymentRecoveryId
+        ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
+        : {}),
     },
   })
 }
@@ -1104,9 +1131,9 @@ async function guardMessageRequest(
           fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${existing.id}' changed before continuation`),
         )
       }
-      const claimError = await claimTaskPayment(c, req, continued, authz, deps, existing)
-      if (claimError) return claimError
-      return { authz, task: continued }
+      const claimedTask = await claimTaskPayment(c, req, continued, authz, deps, existing)
+      if (claimedTask instanceof Response) return claimedTask
+      return { authz, task: claimedTask }
     }
     // Unknown taskId in params: fall through and mint a fresh task with that
     // exact id so callers that pre-allocate ids (idempotency) get them.
@@ -1131,9 +1158,9 @@ async function guardMessageRequest(
       fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' already exists`),
     )
   }
-  const claimError = await claimTaskPayment(c, req, task, authz, deps)
-  if (claimError) return claimError
-  return { authz, task }
+  const claimedTask = await claimTaskPayment(c, req, task, authz, deps)
+  if (claimedTask instanceof Response) return claimedTask
+  return { authz, task: claimedTask }
 }
 
 async function claimTaskPayment(
@@ -1143,20 +1170,49 @@ async function claimTaskPayment(
   authz: AuthorizedRequest,
   deps: A2AHandlerDeps,
   paymentFailureTask?: Task,
-): Promise<Response | undefined> {
+): Promise<Response | Task> {
+  let paymentTask = task
   try {
-    await claimPayment(authz, deps.config, deps.state)
-    return undefined
+    await claimPayment(authz, deps.config, deps.state, {
+      onRecoveryPrepared: async (recoveryId) => {
+        paymentTask = await attachPaymentRecoveryMarker(
+          deps.taskStore,
+          paymentTask,
+          recoveryId,
+        )
+      },
+    })
   } catch {
-    const releasedTask = await releaseTaskPayment(authz, task, deps, 'payment authorization failed', false)
+    let recoveryTask = paymentTask
+    try {
+      recoveryTask = await retainPaymentRecoveryMarker(
+        deps.taskStore,
+        paymentTask,
+        authz.paymentRecoveryId,
+      )
+    } catch (error) {
+      console.error(
+        `[a2a] failed to attach payment recovery to ${task.id}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+    const releasedTask = await releaseTaskPayment(
+      authz,
+      recoveryTask,
+      deps,
+      'payment authorization failed',
+      false,
+    )
     const releaseRecord = releasedTask.metadata?.[PAYMENT_RELEASE_METADATA_KEY]
     const failed = releaseRecord !== undefined
       ? isTerminal(releasedTask.status.state)
         ? releasedTask
         : withStatus(releasedTask, 'failed')
-      : paymentFailureTask ?? (isTerminal(releasedTask.status.state)
-        ? releasedTask
-        : withStatus(releasedTask, 'failed'))
+      : paymentFailureTask
+        ? preservePaymentRecoveryMarker(paymentFailureTask, releasedTask)
+        : isTerminal(releasedTask.status.state)
+          ? releasedTask
+          : withStatus(releasedTask, 'failed')
     try {
       if (await compareAndSetTask(deps.taskStore, releasedTask, failed) && isTerminal(failed.status.state)) {
         await maybeDeliverPush(failed, deps)
@@ -1169,6 +1225,38 @@ async function claimTaskPayment(
     }
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))
   }
+
+  const current = await deps.taskStore.get(task.id)
+  if (current && JSON.stringify(current) === JSON.stringify(paymentTask)) {
+    return paymentTask
+  }
+  {
+    const changedTask = current ?? paymentTask
+    let recoveryTask = changedTask
+    try {
+      recoveryTask = await retainPaymentRecoveryMarker(
+        deps.taskStore,
+        changedTask,
+        authz.paymentRecoveryId,
+      )
+    } catch (error) {
+      console.error(
+        `[a2a] failed to retain payment recovery after task race for ${task.id}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+    const released = await releaseTaskPayment(
+      authz,
+      recoveryTask,
+      deps,
+      'A2A task changed during payment confirmation',
+      false,
+    )
+    if (released.status.state === 'canceled') return c.json(ok(req.id, released))
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' changed during payment confirmation`),
+    )
+  }
 }
 
 async function releaseTaskPayment(
@@ -1179,7 +1267,12 @@ async function releaseTaskPayment(
   workObserved: boolean,
 ): Promise<Task> {
   // Store the operation before release because the adapter acknowledgement can be ambiguous.
-  if (!workObserved && authz.paymentOperation && deps.config.x402.paymentOperations) {
+  if (
+    !workObserved &&
+    !authz.paymentRecoveryId &&
+    authz.paymentOperation &&
+    deps.config.x402.paymentOperations
+  ) {
     let marked: Task
     try {
       marked = await beginPaymentReleaseRecovery(deps.taskStore, task, authz, reason) ?? task
@@ -1218,7 +1311,10 @@ async function releaseTaskPayment(
       releaseError instanceof Error ? releaseError.message : String(releaseError),
     )
   }
-  return await deps.taskStore.get(task.id) ?? task
+  const current = await deps.taskStore.get(task.id) ?? task
+  return workObserved
+    ? current
+    : clearReconciledPaymentRecoveryMarker(current, deps)
 }
 
 /** Keep an owned finalization record durable when settlement acknowledgement is lost. */
@@ -1292,6 +1388,12 @@ async function completeCanceledTask(
       })
       usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
     } catch (settlementError) {
+      await releasePaymentAfterFailure(
+        authz,
+        deps.config,
+        settlementError instanceof Error ? settlementError.message : String(settlementError),
+        true,
+      )
       const retained = await retainFinalizationForRecovery(
         deps.taskStore,
         task.id,
@@ -1308,7 +1410,7 @@ async function completeCanceledTask(
     }
 
     const canceled = withStatus(
-      clearFinalizationMarker(usageRecordedTask),
+      clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
       'canceled',
       undefined,
       responseText
@@ -1341,8 +1443,18 @@ async function completeCanceledTask(
 
 const FINALIZING_METADATA_KEY = 'gatewayFinalizing'
 const PAYMENT_RELEASE_METADATA_KEY = 'gatewayPaymentRelease'
+const PAYMENT_RECOVERY_METADATA_KEY = 'gatewayPaymentRecovery'
 const FINALIZATION_LEASE_MS = 5 * 60 * 1000
 const PAYMENT_RELEASE_LEASE_MS = 5 * 60 * 1000
+
+function setPaymentResponseHeaders(c: Context, authz: AuthorizedRequest): void {
+  if (authz.mppChargeOperation) {
+    c.header('Payment-Receipt', authz.mppChargeOperation.receipt)
+  }
+  if (authz.paymentRecoveryId) {
+    c.header('X-Payment-Operation-Id', authz.paymentRecoveryId)
+  }
+}
 
 async function authorizeTaskAccess(
   c: Context,
@@ -1399,6 +1511,86 @@ async function compareAndSetTask(taskStore: TaskStore, expected: Task, next: Tas
   return taskStore.compareAndSet(expected, next)
 }
 
+async function attachPaymentRecoveryMarker(
+  taskStore: TaskStore,
+  task: Task,
+  recoveryId: string | undefined,
+): Promise<Task> {
+  if (!recoveryId) return task
+  const existing = readPaymentRecoveryMarker(task)
+  if (existing) {
+    if (existing.id !== recoveryId) {
+      throw new Error('A2A task already has a different payment recovery identity')
+    }
+    return task
+  }
+  const next = withPaymentRecoveryMarker(task, recoveryId)
+  if (await compareAndSetTask(taskStore, task, next)) return next
+  throw new Error('A2A task changed while payment recovery was attached')
+}
+
+/** Attach only as a retention marker. The returned task must never execute. */
+async function retainPaymentRecoveryMarker(
+  taskStore: TaskStore,
+  task: Task,
+  recoveryId: string | undefined,
+): Promise<Task> {
+  if (!recoveryId) return task
+  let current = await taskStore.get(task.id) ?? task
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const existing = readPaymentRecoveryMarker(current)
+    if (existing) {
+      if (existing.id !== recoveryId) {
+        throw new Error('A2A task already has a different payment recovery identity')
+      }
+      return current
+    }
+    const next = withPaymentRecoveryMarker(current, recoveryId)
+    if (await compareAndSetTask(taskStore, current, next)) return next
+    const latest = await taskStore.get(task.id)
+    if (!latest) throw new Error('A2A task disappeared while payment recovery was retained')
+    current = latest
+  }
+  throw new Error('A2A task changed too many times while payment recovery was retained')
+}
+
+function withPaymentRecoveryMarker(task: Task, recoveryId: string): Task {
+  return {
+    ...task,
+    metadata: {
+      ...(task.metadata ?? {}),
+      [PAYMENT_RECOVERY_METADATA_KEY]: { version: 1, id: recoveryId },
+    },
+  }
+}
+
+function preservePaymentRecoveryMarker(base: Task, source: Task): Task {
+  const marker = readPaymentRecoveryMarker(source)
+  return marker ? withPaymentRecoveryMarker(base, marker.id) : base
+}
+
+function readPaymentRecoveryMarker(task: Task): TaskPaymentRecoveryMarker | undefined {
+  const raw = task.metadata?.[PAYMENT_RECOVERY_METADATA_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const marker = raw as Partial<TaskPaymentRecoveryMarker>
+  if (marker.version !== 1 || typeof marker.id !== 'string' || marker.id.length === 0) {
+    return undefined
+  }
+  return marker as TaskPaymentRecoveryMarker
+}
+
+function clearPaymentRecoveryMarker(task: Task): Task {
+  if (!task.metadata || !(PAYMENT_RECOVERY_METADATA_KEY in task.metadata)) return task
+  const metadata = { ...task.metadata }
+  delete metadata[PAYMENT_RECOVERY_METADATA_KEY]
+  return Object.keys(metadata).length > 0
+    ? { ...task, metadata }
+    : (() => {
+        const { metadata: _metadata, ...withoutMetadata } = task
+        return withoutMetadata
+      })()
+}
+
 function normalizeTaskStore(taskStore: TaskStore, allowUnsafeFallback: boolean): TaskStore {
   if (typeof taskStore.createIfAbsent === 'function' && typeof taskStore.compareAndSet === 'function') {
     return taskStore
@@ -1453,46 +1645,6 @@ function buildFinalizationRecord(
     maxOutputTokens: authz.maxOutputTokens,
     executionBudget: authz.executionBudget,
     usageRecorded: false,
-  }
-}
-
-function serializePaymentOperation(operation: PaymentOperation): SerializedPaymentOperation {
-  return {
-    protocolVersion: 2,
-    operationId: operation.operationId,
-    acquiredByRequestId: operation.acquiredByRequestId,
-    ...(operation.executionStartedAt !== undefined
-      ? { executionStartedAt: operation.executionStartedAt }
-      : {}),
-    ...(operation.retentionReason ? { retentionReason: operation.retentionReason } : {}),
-    nonceKey: operation.nonceKey,
-    authorizationId: operation.authorizationId,
-    reservedAmount: operation.reservedAmount.toString(),
-    settledAmount: operation.settledAmount.toString(),
-    refundAmount: operation.refundAmount.toString(),
-    expiresAt: operation.expiresAt,
-    state: operation.state,
-  }
-}
-
-function deserializePaymentOperation(value: SerializedPaymentOperation): PaymentOperation {
-  if (value.protocolVersion !== 2) throw new Error('unsupported A2A payment operation version')
-  if (!value.operationId || !value.acquiredByRequestId || !value.nonceKey || !value.authorizationId) {
-    throw new Error('incomplete A2A payment operation recovery record')
-  }
-  return {
-    protocolVersion: 2,
-    operationId: value.operationId,
-    acquiredByRequestId: value.acquiredByRequestId,
-    ...(value.executionStartedAt !== undefined ? { executionStartedAt: value.executionStartedAt } : {}),
-    ...(value.retentionReason ? { retentionReason: value.retentionReason } : {}),
-    nonceKey: value.nonceKey,
-    authorizationId: value.authorizationId,
-    reservedAmount: BigInt(value.reservedAmount),
-    settledAmount: BigInt(value.settledAmount),
-    refundAmount: BigInt(value.refundAmount),
-    expiresAt: value.expiresAt,
-    state: value.state,
   }
 }
 
@@ -1636,7 +1788,7 @@ async function clearPaymentReleaseRecovery(
   const current = await taskStore.get(task.id) ?? task
   const record = readPaymentReleaseRecord(current)
   if (!record || record.lease.id !== leaseId) return current
-  const cleared = clearPaymentReleaseRecord(current)
+  const cleared = clearPaymentRecoveryMarker(clearPaymentReleaseRecord(current))
   if (await compareAndSetTask(taskStore, current, cleared)) return cleared
   return await taskStore.get(task.id) ?? cleared
 }
@@ -1692,6 +1844,12 @@ async function recoverPaymentReleaseIfNeeded(
     }
     const operation = deserializePaymentOperation(renewed.paymentOperation)
     await deps.config.x402.paymentOperations.releasePayment(operation, renewed.reason)
+    if (deps.config.paymentRecovery) {
+      const recovered = await recoverDurablePayment(renewed.operationId, deps.config, { force: true })
+      if (recovered && recovered.state !== 'reconciled') {
+        throw new Error('durable payment release is still pending')
+      }
+    }
     const recovered = clearPaymentReleaseRecord(leasedTask)
     if (!await compareAndSetTask(deps.taskStore, leasedTask, recovered)) {
       return await deps.taskStore.get(task.id) ?? recovered
@@ -1744,6 +1902,24 @@ async function recoverFinalizationIfNeeded(
     const agent = await deps.config.resolveAgent(agentSlug)
     if (!agent || !agent.enabled) throw new Error('A2A recovery agent is unavailable')
 
+    const paymentRecovery = readPaymentRecoveryMarker(leasedTask)
+    if (paymentRecovery && deps.config.paymentRecovery) {
+      const recovery = await recoverDurablePayment(paymentRecovery.id, deps.config, {
+        force: true,
+        usage: renewed.receipt,
+      })
+      if (recovery?.state !== 'reconciled') {
+        throw new Error('durable payment finalization is still pending')
+      }
+      const usageRecordedTask = await markUsageRecorded(deps.taskStore, leasedTask)
+      const recoveredTask = finalizationResultTask(usageRecordedTask, renewed)
+      if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, recoveredTask)) {
+        return await deps.taskStore.get(task.id) ?? recoveredTask
+      }
+      await maybeDeliverPush(recoveredTask, deps)
+      return recoveredTask
+    }
+
     let paymentOperation: PaymentOperation | undefined
     if (renewed.operationId || renewed.paymentOperation) {
       if (!renewed.operationId || !renewed.paymentOperation) {
@@ -1773,6 +1949,9 @@ async function recoverFinalizationIfNeeded(
       executionBudget: renewed.executionBudget,
       requiredPaymentAmount: 0n,
       paymentPayload: null,
+      ...(readPaymentRecoveryMarker(leasedTask)
+        ? { paymentRecoveryId: readPaymentRecoveryMarker(leasedTask)!.id }
+        : {}),
       ...(paymentOperation
         ? { paymentOperation, paymentOperationAcquired: true }
         : {}),
@@ -1805,7 +1984,10 @@ async function recoverFinalizationIfNeeded(
       `[a2a] finalization recovery failed for ${task.id}:`,
       recoveryError.message,
     )
-    if (renewed.operationId && renewed.paymentOperation) {
+    if (
+      (readPaymentRecoveryMarker(leasedTask) && deps.config.paymentRecovery) ||
+      (renewed.operationId && renewed.paymentOperation)
+    ) {
       const retained = await retainFinalizationForRecovery(
         deps.taskStore,
         task.id,
@@ -1824,11 +2006,44 @@ async function recoverTaskIfNeeded(
   requestedAgentSlug: string,
 ): Promise<Task> {
   const released = await recoverPaymentReleaseIfNeeded(task, deps)
-  return recoverFinalizationIfNeeded(released, deps, requestedAgentSlug)
+  const finalized = await recoverFinalizationIfNeeded(released, deps, requestedAgentSlug)
+  return recoverPaymentMarkerIfNeeded(finalized, deps)
+}
+
+async function recoverPaymentMarkerIfNeeded(
+  task: Task,
+  deps: A2AHandlerDeps,
+): Promise<Task> {
+  const marker = readPaymentRecoveryMarker(task)
+  if (!marker || !deps.config.paymentRecovery) return task
+  try {
+    const record = await recoverDurablePayment(marker.id, deps.config)
+    if (record?.state !== 'reconciled') return task
+    return clearReconciledPaymentRecoveryMarker(task, deps)
+  } catch (error) {
+    console.error(
+      `[a2a] durable payment recovery failed for ${task.id}:`,
+      error instanceof Error ? error.message : String(error),
+    )
+    return task
+  }
+}
+
+async function clearReconciledPaymentRecoveryMarker(
+  task: Task,
+  deps: A2AHandlerDeps,
+): Promise<Task> {
+  const marker = readPaymentRecoveryMarker(task)
+  if (!marker || !deps.config.paymentRecovery) return task
+  const record = await deps.config.paymentRecovery.store.get(marker.id)
+  if (record?.state !== 'reconciled') return task
+  const cleared = clearPaymentRecoveryMarker(task)
+  if (await compareAndSetTask(deps.taskStore, task, cleared)) return cleared
+  return await deps.taskStore.get(task.id) ?? cleared
 }
 
 function finalizationResultTask(task: Task, record: FinalizationRecord): Task {
-  const cleanTask = clearFinalizationMarker(task)
+  const cleanTask = clearPaymentRecoveryMarker(clearFinalizationMarker(task))
   const finalState = record.finalState ?? (
     task.status.state === 'canceled'
       ? 'canceled'
@@ -1917,12 +2132,7 @@ function clearFinalizationMarker(task: Task): Task {
 }
 
 function isTerminal(state: Task['status']['state']): boolean {
-  return (
-    state === 'completed' ||
-    state === 'canceled' ||
-    state === 'failed' ||
-    state === 'rejected'
-  )
+  return TERMINAL_STATES.has(state)
 }
 
 function asError(error: unknown): Error {

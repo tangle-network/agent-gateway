@@ -194,7 +194,10 @@ describe('A2A — AgentCard discovery', () => {
       mpp: {
         realm: 'agents.tangle.tools',
         method: 'blueprintevm',
-        verifySigner: async () => 'mpp-signer',
+        authenticateCredential: async () => ({
+          consumerId: 'mpp-signer',
+          paymentIdentity: 'mpp-signer-payment',
+        }),
       },
     })
     const res = await app.request('/v1/agents/test-agent/.well-known/agent.json')

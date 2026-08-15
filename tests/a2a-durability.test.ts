@@ -69,7 +69,10 @@ function makeTaskAdapter(): SqlAdapter & { rows: Map<string, FakeTaskRow> } {
         return { rowsAffected: 1 }
       }
       if (s.startsWith('DELETE')) {
-        const [id] = params as [string]
+        const [id, expectedPayload] = params as [string, string | undefined]
+        if (expectedPayload !== undefined && rows.get(id)?.payload !== expectedPayload) {
+          return { rowsAffected: 0 }
+        }
         const had = rows.delete(id)
         return { rowsAffected: had ? 1 : 0 }
       }
@@ -155,12 +158,43 @@ describe('SqlTaskStore', () => {
     expect(await store.get('t1')).toBeUndefined()
   })
 
+  it.each([
+    'gatewayFinalizing',
+    'gatewayPaymentRelease',
+    'gatewayPaymentRecovery',
+  ])('does not expire a task while %s reconciliation is pending', async (key) => {
+    const db = makeTaskAdapter()
+    const store = new SqlTaskStore(db, { ttlMs: 1 })
+    const task = { ...makeTask('t1'), metadata: { [key]: { version: 1 } } }
+    await store.put(task)
+    db.rows.get('t1')!.updated_at = Date.now() - 100
+
+    expect(await store.get('t1')).toEqual(task)
+    expect(db.rows.has('t1')).toBe(true)
+
+    await store.put({ ...task, metadata: undefined })
+    db.rows.get('t1')!.updated_at = Date.now() - 100
+    expect(await store.get('t1')).toBeUndefined()
+  })
+
   it('delete removes the row', async () => {
     const db = makeTaskAdapter()
     const store = new SqlTaskStore(db)
     await store.put(makeTask('t1'))
     await store.delete('t1')
     expect(await store.get('t1')).toBeUndefined()
+  })
+
+  it('does not delete a task while payment reconciliation is pending', async () => {
+    const db = makeTaskAdapter()
+    const store = new SqlTaskStore(db)
+    const task = {
+      ...makeTask('t1'),
+      metadata: { gatewayPaymentRecovery: { version: 1, id: 'payment-1' } },
+    }
+    await store.put(task)
+    await store.delete(task.id)
+    expect(await store.get(task.id)).toEqual(task)
   })
 
   it('listByContext returns most-recent-first for tasks sharing a context', async () => {
