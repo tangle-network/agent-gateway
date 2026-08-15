@@ -50,6 +50,7 @@ The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox s
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
 Requests with a version 2 payment operation reject missing receipts; API-key and MPP requests keep the legacy visible-token estimate path.
+recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.
 Older custom A2A task stores remain source-compatible through a process-safe fallback.
 Use an atomic task store for multi-worker production deployments.
 

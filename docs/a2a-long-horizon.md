@@ -26,6 +26,10 @@ After a restart, the first task read after lease expiry resumes settlement with 
 If settlement acknowledgement fails, the gateway keeps the operation and retries after the lease expires.
 Cancellation stores the recovery record before it completes the canceled task.
 The canceled task therefore keeps a retryable lease when settlement acknowledgement fails.
+If cancellation must release an unused durable operation, the gateway stores a separate release record before calling the release adapter.
+An ambiguous release acknowledgement is retried after its five-minute lease, and the record is cleared only after release acknowledgement.
+Usage attribution must atomically upsert by `requestId`.
+The finalization record stores whether attribution was acknowledged, so recovery does not repeat an acknowledged usage event.
 If the record is malformed or has no recoverable operation, the gateway expires the task as failed.
 
 Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.

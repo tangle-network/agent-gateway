@@ -603,6 +603,47 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(operations.get('x402:0xcommitmentalice:901')?.state).toBe('settled')
   })
 
+  it('keeps a generic Stripe MPP receipt on its method-specific path', async () => {
+    const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
+    const credential = Buffer.from(JSON.stringify({
+      from: 'stripe-customer',
+      amount: fundedRequestAmount,
+      nonce: '902',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+      receiptId: 'stripe-receipt-902',
+    })).toString('base64url')
+    const { app, settlements, usage } = buildHarness({
+      mpp: {
+        realm: 'agents.tangle.tools',
+        verifySigner: async () => 'mpp:stripe-customer',
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const streamed = await readSse(response)
+
+    expect(response.status).toBe(200)
+    expect(streamed.combinedText).toBe('Hello, world!')
+    expect(streamed.done).toBe(true)
+    expect(operations.get('x402:stripe-customer:902')).toBeUndefined()
+    expect(settlements).toHaveLength(1)
+    expect(settlements[0]?.method).toBe('mpp')
+    expect(usage).toHaveLength(1)
+  })
+
   it('claims an identical generic MPP receipt without a payload nonce only once', async () => {
     let executions = 0
     const credential = Buffer.from(JSON.stringify({ receiptId: 'receipt-1' })).toString('base64url')

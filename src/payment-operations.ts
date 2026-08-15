@@ -71,6 +71,10 @@ export interface PaymentOperations {
     operation: PaymentOperation,
     input: PaymentSettlementInput,
   ): Promise<PaymentOperation>
+  /**
+   * Release an unused authorization.
+   * Repeated calls must recover an ambiguous acknowledgement by operationId.
+   */
   releasePayment(operation: PaymentOperation, reason: string): Promise<PaymentOperation>
   reclaimPayment(operationId: string): Promise<PaymentOperation>
 }

@@ -66,6 +66,7 @@ export interface AuthorizedRequest {
   requiredPaymentAmount: bigint
   paymentPayload: Record<string, unknown> | null
   paymentNonceKey?: string
+  mppMethod?: string
   paymentOperation?: PaymentOperation
   paymentOperationAcquired?: boolean
 }
@@ -243,6 +244,7 @@ export async function authenticateAndGuard(
   let keyInfo: ApiKeyInfo | null = null
   let x402Payload: Record<string, unknown> | null = null
   let paymentNonceKey: string | undefined
+  let mppMethod: string | undefined
 
   if (spendAuthHeader) {
     const signer = await verifyX402(
@@ -314,6 +316,7 @@ export async function authenticateAndGuard(
     }
     consumerId = signer
     paymentMethod = 'mpp'
+    mppMethod = authHeader.match(/^Payment\s+(\S+)\s+/i)?.[1]?.toLowerCase()
     x402Payload = mppPaymentPayload(authHeader) ?? null
     paymentNonceKey = mppReplayNonceKey(authHeader)
   } else if (authHeader.startsWith('Bearer ')) {
@@ -494,6 +497,7 @@ export async function authenticateAndGuard(
     requiredPaymentAmount,
     paymentPayload: x402Payload,
     paymentNonceKey,
+    mppMethod,
   }
 }
 
@@ -577,8 +581,11 @@ export async function claimPayment(
     if (!authz.paymentNonceKey) {
       throw new Error('MPP payment has no replay identity')
     }
+    const mppMethod = (authz.mppMethod ?? config.mpp?.method ?? 'blueprintevm').toLowerCase()
     const durablePayload = durableMppPaymentPayload(authz.paymentPayload)
-    if (durablePayload && config.x402.paymentOperations) {
+    // Only BlueprinTEVM carries x402 authorization fields; other MPP methods
+    // must stay on their verifier and method-specific settlement path.
+    if (mppMethod === 'blueprintevm' && durablePayload && config.x402.paymentOperations) {
       const context = {
         requestId: authz.requestId,
         agentId: authz.agent.id,
@@ -967,12 +974,20 @@ async function closeSandboxIterator(iterator: AsyncIterator<SandboxStreamEvent>)
  * formats call this once their stream has drained, so settlement happens
  * exactly once per request regardless of protocol.
  */
+export interface SettleAndRecordOptions {
+  /** Skip attribution after a durable finalization marker confirms it ran. */
+  usageAlreadyRecorded?: boolean
+  /** Persist the caller's recovery marker after attribution succeeds. */
+  onUsageRecorded?: () => Promise<void>
+}
+
 export async function settleAndRecord(
   agent: AgentMeta,
   authz: AuthorizedRequest,
   usage: SandboxUsageReceipt,
   config: GatewayConfig,
   obs: GatewayObserver | undefined,
+  options: SettleAndRecordOptions = {},
 ): Promise<void> {
   const tokenCost = (
     usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens
@@ -1019,11 +1034,17 @@ export async function settleAndRecord(
       )
       // Durable settlement happens first. If attribution storage is
       // unavailable, recovery must never refund delivered work.
-      await config.recordUsage(usageEvent)
+      if (!options.usageAlreadyRecorded) {
+        await config.recordUsage(usageEvent)
+        await options.onUsageRecorded?.()
+      }
     } else {
       // Legacy adapters retain attribution-before-charge because their
       // settlement callback may resolve that usage row.
-      await config.recordUsage(usageEvent)
+      if (!options.usageAlreadyRecorded) {
+        await config.recordUsage(usageEvent)
+        await options.onUsageRecorded?.()
+      }
       if (config.settlePayment) {
         await config.settlePayment(
           {

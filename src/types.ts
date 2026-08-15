@@ -273,7 +273,12 @@ export interface GatewayConfig {
     consumer: { method: PaymentMethod; consumerId: string; keyId?: string; requestId: string },
   ) => Promise<{ allow: true } | { allow: false; reason: string; code: string }>
 
-  /** Record a usage event after request completes. */
+  /**
+   * Record a usage event after request completes.
+   * The implementation must atomically upsert by requestId and return
+   * success when the row already exists. Recovery may retry after an
+   * acknowledgement is lost, so one request ID must produce one usage row.
+   */
   recordUsage: (event: GatewayUsageEvent) => Promise<void>
 
   /** x402 payment configuration */

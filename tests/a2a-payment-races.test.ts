@@ -750,4 +750,222 @@ describe('A2A payment ownership races', () => {
     expect(recoveryAttempts).toBe(1)
     expect(records).toBe(1)
   })
+
+  it('persists and recovers an ambiguous release acknowledgement', async () => {
+    const taskStore = new InMemoryTaskStore()
+    let executionStarted!: () => void
+    const executionReady = new Promise<void>((resolve) => { executionStarted = resolve })
+    let releaseExecution!: () => void
+    const executionReleased = new Promise<void>((resolve) => { releaseExecution = resolve })
+    let sandboxStarted = false
+    let releaseCalls = 0
+    let recoveryCalls = 0
+
+    class BlockingExecutionOperations extends MemoryPaymentOperations {
+      override async beginPaymentExecution(operation: PaymentOperation): Promise<PaymentOperation> {
+        const executing = await super.beginPaymentExecution(operation)
+        executionStarted()
+        await executionReleased
+        return executing
+      }
+    }
+
+    const operations = new BlockingExecutionOperations({
+      onRelease: async () => {
+        releaseCalls += 1
+        throw new Error('release acknowledgement lost after refund')
+      },
+      onReclaim: async () => { recoveryCalls += 1 },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        streamPrompt() {
+          sandboxStarted = true
+          return (async function* () {
+            yield { type: 'sandbox.usage', data: { usage: usage() } }
+          })()
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+
+    const send = app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('84') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-release-recovery') },
+      }),
+    })
+    await executionReady
+
+    const cancel = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'task-release-recovery' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    releaseExecution()
+
+    const response = await send
+    const body = await response.json() as { result?: { status?: { state?: string } }; error?: unknown }
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status?.state).toBe('canceled')
+    expect(sandboxStarted).toBe(false)
+    expect(operations.get(`x402:${commitment}:84`)?.state).toBe('releasing')
+    expect(releaseCalls).toBe(1)
+
+    const retained = await taskStore.get('task-release-recovery')
+    const marker = retained?.metadata?.gatewayPaymentRelease as {
+      lease: { id: string; expiresAt: number }
+      operationId: string
+      recoveryAttempts?: number
+    }
+    expect(retained?.status.state).toBe('canceled')
+    expect(marker.operationId).toBe(`x402:${commitment}:84`)
+    expect(marker.lease.expiresAt).toBeGreaterThan(Date.now())
+    expect(marker.recoveryAttempts).toBe(1)
+
+    await taskStore.put({
+      ...retained!,
+      metadata: {
+        ...retained!.metadata,
+        gatewayPaymentRelease: {
+          ...marker,
+          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+    const recovered = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tasks/get',
+        params: { id: 'task-release-recovery' },
+      }),
+    })
+    const recoveredBody = await recovered.json() as {
+      result?: { status?: { state?: string } }
+    }
+    expect(recoveredBody.result?.status?.state).toBe('canceled')
+    expect((await taskStore.get('task-release-recovery'))?.metadata?.gatewayPaymentRelease).toBeUndefined()
+    expect(operations.get(`x402:${commitment}:84`)?.state).toBe('released')
+    expect(releaseCalls).toBe(1)
+    expect(recoveryCalls).toBe(1)
+  })
+
+  it('records usage once when an inserted acknowledgement is lost', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
+    const usageRequestIds = new Set<string>()
+    let recordCalls = 0
+    let rows = 0
+    let firstCall = true
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'paid output' } }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async (event) => {
+        recordCalls += 1
+        if (!usageRequestIds.has(event.requestId)) {
+          usageRequestIds.add(event.requestId)
+          rows += 1
+        }
+        if (firstCall) {
+          firstCall = false
+          throw new Error('usage acknowledgement lost after insert')
+        }
+      },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+
+    const send = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('85') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-usage-recovery') },
+      }),
+    })
+    const body = await send.json() as { error?: { code?: number } }
+    expect(body.error?.code).toBe(-32603)
+    expect(recordCalls).toBe(1)
+    expect(rows).toBe(1)
+    expect(operations.get(`x402:${commitment}:85`)?.state).toBe('settled')
+
+    const retained = await taskStore.get('task-usage-recovery')
+    const marker = retained?.metadata?.gatewayFinalizing as {
+      lease: { id: string; expiresAt: number }
+      usageRecorded: boolean
+    }
+    expect(retained?.status.state).toBe('working')
+    expect(marker.usageRecorded).toBe(false)
+    await taskStore.put({
+      ...retained!,
+      metadata: {
+        ...retained!.metadata,
+        gatewayFinalizing: {
+          ...marker,
+          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+
+    const recovered = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/get',
+        params: { id: 'task-usage-recovery' },
+      }),
+    })
+    const recoveredBody = await recovered.json() as {
+      result?: { status?: { state?: string } }
+    }
+    expect(recoveredBody.result?.status?.state).toBe('completed')
+    expect(recordCalls).toBe(2)
+    expect(rows).toBe(1)
+    expect(usageRequestIds.size).toBe(1)
+    expect((await taskStore.get('task-usage-recovery'))?.metadata?.gatewayFinalizing).toBeUndefined()
+    expect(operations.get(`x402:${commitment}:85`)?.state).toBe('settled')
+  })
 })
