@@ -44,7 +44,7 @@ import {
   type PushNotificationStore,
   type TaskPushNotificationConfig,
 } from './push-notifications'
-import type { TaskStore } from './task-store'
+import { hasPendingPaymentRecovery, type TaskStore } from './task-store'
 import { extractTextFromMessage, responseTextToArtifact } from './translate'
 import {
   A2A_ERROR_CODES,
@@ -108,6 +108,21 @@ interface TaskPaymentRecoveryMarker {
   id: string
 }
 
+interface TaskOriginBinding {
+  version: 1
+  agentId: string
+  agentSlug: string
+}
+
+interface TaskSubmissionRecord {
+  version: 1
+  lease: { id: string; expiresAt: number }
+  agentId: string
+  agentSlug: string
+  requestId: string
+  consumerId: string
+}
+
 /** Terminal task states — fire-once push delivery occurs on these transitions. */
 const TERMINAL_STATES: ReadonlySet<Task['status']['state']> = new Set([
   'completed',
@@ -115,6 +130,11 @@ const TERMINAL_STATES: ReadonlySet<Task['status']['state']> = new Set([
   'failed',
   'rejected',
 ])
+
+const TASK_ORIGIN_METADATA_KEY = 'gatewayOrigin'
+const TASK_SUBMISSION_METADATA_KEY = 'gatewaySubmission'
+const TASK_SUBMISSION_RECOVERY_METADATA_KEY = 'gatewaySubmissionRecovery'
+const TASK_SUBMISSION_LEASE_MS = 5 * 60 * 1000
 
 /**
  * Per-gateway in-process registry of cancellable runs. Keyed by task id;
@@ -245,9 +265,11 @@ async function handleMessageSend(
   const { authz, task } = guard
   setPaymentResponseHeaders(c, authz)
   const controller = cancels.register(task.id)
+  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   try {
     return await executeMessageSend(c, req, deps, authz, task, controller.signal)
   } finally {
+    detachRequestAbort()
     cancels.clear(task.id)
   }
 }
@@ -260,6 +282,7 @@ async function executeMessageSend(
   task: Task,
   signal: AbortSignal,
 ): Promise<Response> {
+  if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
   const workingTask: Task = task.status.state === 'working'
     ? task
     : { ...task, status: { state: 'working', timestamp: nowIso() } }
@@ -319,12 +342,12 @@ async function executeMessageSend(
       workObserved || usage !== undefined,
     )
     const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
-    const failed = isTerminal(currentTask.status.state)
+    const failed = shouldPreserveTask(currentTask)
       ? currentTask
-      : withStatus(currentTask, 'failed')
+      : withStatus(clearTaskSubmission(currentTask), 'failed')
     try {
-      await deps.taskStore.put(failed)
-      await maybeDeliverPush(failed, deps)
+      const persisted = await persistTaskIfCurrent(deps.taskStore, currentTask, failed)
+      await maybeDeliverPush(persisted, deps)
     } catch (taskError) {
       console.error(
         `[a2a] failed to persist failed task ${task.id}:`,
@@ -432,12 +455,12 @@ async function executeMessageSend(
       return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment settlement failed'))
     }
     const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
-    const failed = isTerminal(currentTask.status.state)
+    const failed = shouldPreserveTask(currentTask)
       ? currentTask
-      : withStatus(currentTask, 'failed')
+      : withStatus(clearTaskSubmission(currentTask), 'failed')
     try {
-      await deps.taskStore.put(failed)
-      await maybeDeliverPush(failed, deps)
+      const persisted = await persistTaskIfCurrent(deps.taskStore, currentTask, failed)
+      await maybeDeliverPush(persisted, deps)
     } catch (taskError) {
       console.error(
         `[a2a] failed to persist failed task ${task.id}:`,
@@ -463,6 +486,7 @@ async function handleMessageStream(
   setPaymentResponseHeaders(c, authz)
 
   const controller = cancels.register(task.id)
+  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const workingStatus: TaskStatusUpdateEvent = {
     kind: 'status-update',
     taskId: task.id,
@@ -470,10 +494,16 @@ async function handleMessageStream(
     status: { state: 'working', timestamp: nowIso() },
     final: false,
   }
+  if (isTerminal(task.status.state)) {
+    detachRequestAbort()
+    cancels.clear(task.id)
+    return c.json(ok(req.id, task))
+  }
   const workingTask: Task = task.status.state === 'working'
     ? task
     : { ...task, status: workingStatus.status }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
+    detachRequestAbort()
     cancels.clear(task.id)
     const current = await releaseTaskPayment(
       authz,
@@ -488,6 +518,7 @@ async function handleMessageStream(
   try {
     await beginPaymentExecution(authz, deps.config)
   } catch (error) {
+    detachRequestAbort()
     cancels.clear(task.id)
     await releaseTaskPayment(
       authz,
@@ -499,6 +530,7 @@ async function handleMessageStream(
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment execution authorization failed'))
   }
   if (controller.signal.aborted) {
+    detachRequestAbort()
     cancels.clear(task.id)
     const canceled = await completeCanceledTask(authz, workingTask, '', undefined, false, deps)
     return c.json(ok(req.id, canceled))
@@ -508,100 +540,71 @@ async function handleMessageStream(
   let workObserved = false
 
   const stream = new ReadableStream({
-    async start(ctrl) {
-      const encoder = new TextEncoder()
-      const send = (event: StreamingEvent) => {
-        ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(ok(req.id, event))}\n\n`))
-      }
-
-      let inputRequiredPrompt: string | undefined
-      let inputRequiredSeen = false
-      let finalizationLeaseId: string | undefined
-      try {
-        send(workingStatus)
-
-        for await (const event of dispatchSandboxStreamRich(
-          authz.agent,
-          authz.userMessage,
-          authz.consumerId,
-          deps.config,
-          controller.signal,
-          task.id,
-          authz.maxOutputTokens,
-          undefined,
-          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-          () => {
-            workObserved = true
-          },
-        )) {
-          if (event.kind === 'text') {
-            responseText += event.delta
-            workObserved = true
-            const artifactEvent: TaskArtifactUpdateEvent = {
-              kind: 'artifact-update',
-              taskId: task.id,
-              contextId: task.contextId,
-              artifact: {
-                artifactId: `${task.id}-artifact-0`,
-                name: 'response',
-                parts: [{ kind: 'text', text: event.delta }],
-              },
-              append: true,
-            }
-            send(artifactEvent)
-          } else if (event.kind === 'activity') {
-            workObserved = true
-          } else if (event.kind === 'usage') {
-            usage = event.usage
-          } else {
-            inputRequiredSeen = true
-            inputRequiredPrompt = event.prompt
-            workObserved = true
+    start(ctrl) {
+      void (async () => {
+        const encoder = new TextEncoder()
+        const send = (event: StreamingEvent) => {
+          if (ctrl.desiredSize === null) return
+          try {
+            ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(ok(req.id, event))}\n\n`))
+          } catch {
+            // The client can cancel between the desiredSize check and enqueue.
           }
         }
 
-        // Caller aborted via tasks/cancel. Charge a complete receipt if one
-        // exists; otherwise retain ownership when output or hidden work was
-        // observed because releasing would make paid work free.
-        if (controller.signal.aborted) {
-          const canceled = await completeCanceledTask(
-            authz,
-            workingTask,
-            responseText,
-            usage,
-            workObserved,
-            deps,
-          )
-          send({
-            kind: 'status-update',
-            taskId: task.id,
-            contextId: task.contextId,
-            status: canceled.status,
-            final: true,
-          })
-          return
-        }
+        let inputRequiredPrompt: string | undefined
+        let inputRequiredSeen = false
+        let finalizationLeaseId: string | undefined
+        try {
+          send(workingStatus)
 
-        // Settle once for whatever the sandbox produced (full or partial).
-        if (!usage) throw new Error('sandbox did not provide a usage receipt')
-        const finalizationArtifact = responseTextToArtifact(responseText, `${task.id}-artifact-0`)
-        const finalization = buildFinalizationRecord(
-          authz,
-          usage,
-          finalizationArtifact,
-          inputRequiredSeen,
-          inputRequiredPrompt,
-        )
-        // Let the durable task-store CAS decide the cancellation race. Mark
-        // the local registry only after that CAS wins, so cancel can replace a
-        // still-pending finalization instead of being rejected prematurely.
-        const finalizingTask = withFinalizationRecord(workingTask, finalization)
-        if (!await compareAndSetTask(deps.taskStore, workingTask, finalizingTask)) {
-          const currentTask = await deps.taskStore.get(task.id)
-          if (currentTask?.status.state === 'canceled') {
+          for await (const event of dispatchSandboxStreamRich(
+            authz.agent,
+            authz.userMessage,
+            authz.consumerId,
+            deps.config,
+            controller.signal,
+            task.id,
+            authz.maxOutputTokens,
+            undefined,
+            authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
+            () => {
+              workObserved = true
+            },
+          )) {
+            if (event.kind === 'text') {
+              responseText += event.delta
+              workObserved = true
+              const artifactEvent: TaskArtifactUpdateEvent = {
+                kind: 'artifact-update',
+                taskId: task.id,
+                contextId: task.contextId,
+                artifact: {
+                  artifactId: `${task.id}-artifact-0`,
+                  name: 'response',
+                  parts: [{ kind: 'text', text: event.delta }],
+                },
+                append: true,
+              }
+              send(artifactEvent)
+            } else if (event.kind === 'activity') {
+              workObserved = true
+            } else if (event.kind === 'usage') {
+              usage = event.usage
+            } else {
+              inputRequiredSeen = true
+              inputRequiredPrompt = event.prompt
+              workObserved = true
+            }
+          }
+
+          // Caller aborted via tasks/cancel. Charge a complete receipt if one
+          // exists; otherwise retain ownership when output or hidden work was
+          // observed because releasing would make paid work free.
+          if (controller.signal.aborted) {
             const canceled = await completeCanceledTask(
               authz,
-              currentTask,
+              workingTask,
               responseText,
               usage,
               workObserved,
@@ -616,35 +619,98 @@ async function handleMessageStream(
             })
             return
           }
-          await releaseTaskPayment(
-            authz,
-            task,
-            deps,
-            'A2A task changed before payment settlement',
-            workObserved || usage !== undefined,
-          )
-          return
-        }
-        finalizationLeaseId = finalization.lease.id
-        cancels.beginFinalization(task.id)
-        let usageRecordedTask = finalizingTask
-        await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs, {
-          onUsageRecorded: async () => {
-            usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
-          },
-        })
-        usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
 
-        if (inputRequiredSeen) {
-          const paused = withStatus(
-            clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
-            'input-required',
-            inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
-            responseText
-              ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
-              : task.artifacts,
+          // Settle once for whatever the sandbox produced (full or partial).
+          if (!usage) throw new Error('sandbox did not provide a usage receipt')
+          const finalizationArtifact = responseTextToArtifact(responseText, `${task.id}-artifact-0`)
+          const finalization = buildFinalizationRecord(
+            authz,
+            usage,
+            finalizationArtifact,
+            inputRequiredSeen,
+            inputRequiredPrompt,
           )
-          if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, paused)) {
+          // Let the durable task-store CAS decide the cancellation race. Mark
+          // the local registry only after that CAS wins, so cancel can replace a
+          // still-pending finalization instead of being rejected prematurely.
+          const finalizingTask = withFinalizationRecord(workingTask, finalization)
+          if (!await compareAndSetTask(deps.taskStore, workingTask, finalizingTask)) {
+            const currentTask = await deps.taskStore.get(task.id)
+            if (currentTask?.status.state === 'canceled') {
+              const canceled = await completeCanceledTask(
+                authz,
+                currentTask,
+                responseText,
+                usage,
+                workObserved,
+                deps,
+              )
+              send({
+                kind: 'status-update',
+                taskId: task.id,
+                contextId: task.contextId,
+                status: canceled.status,
+                final: true,
+              })
+              return
+            }
+            await releaseTaskPayment(
+              authz,
+              task,
+              deps,
+              'A2A task changed before payment settlement',
+              workObserved || usage !== undefined,
+            )
+            return
+          }
+          finalizationLeaseId = finalization.lease.id
+          cancels.beginFinalization(task.id)
+          let usageRecordedTask = finalizingTask
+          await settleAndRecord(authz.agent, authz, usage, deps.config, deps.state.obs, {
+            onUsageRecorded: async () => {
+              usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
+            },
+          })
+          usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
+
+          if (inputRequiredSeen) {
+            const paused = withStatus(
+              clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+              'input-required',
+              inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
+              responseText
+                ? [responseTextToArtifact(responseText, `${task.id}-artifact-0`)]
+                : task.artifacts,
+            )
+            if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, paused)) {
+              const currentTask = await deps.taskStore.get(task.id)
+              if (currentTask) {
+                send({
+                  kind: 'status-update',
+                  taskId: task.id,
+                  contextId: task.contextId,
+                  status: currentTask.status,
+                  final: isTerminal(currentTask.status.state) || currentTask.status.state === 'input-required',
+                })
+              }
+              return
+            }
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: paused.status,
+              final: true,
+            })
+            // input-required is non-terminal — do NOT deliver push notifications.
+            return
+          }
+
+          // Final: persist the terminal task before emitting terminal events.
+          const completed = withStatus(clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)), 'completed', undefined, [
+            responseTextToArtifact(responseText, `${task.id}-artifact-0`),
+          ])
+          if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, completed)) {
             const currentTask = await deps.taskStore.get(task.id)
             if (currentTask) {
               send({
@@ -658,121 +724,102 @@ async function handleMessageStream(
             return
           }
           send({
-            kind: 'status-update',
+            kind: 'artifact-update',
             taskId: task.id,
             contextId: task.contextId,
-            status: paused.status,
-            final: true,
+            artifact: {
+              artifactId: `${task.id}-artifact-0`,
+              name: 'response',
+              parts: [{ kind: 'text', text: '' }],
+            },
+            append: true,
+            lastChunk: true,
           })
-          // input-required is non-terminal — do NOT deliver push notifications.
-          return
-        }
-
-        // Final: persist the terminal task before emitting terminal events.
-        const completed = withStatus(clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)), 'completed', undefined, [
-          responseTextToArtifact(responseText, `${task.id}-artifact-0`),
-        ])
-        if (!await compareAndSetTask(deps.taskStore, usageRecordedTask, completed)) {
-          const currentTask = await deps.taskStore.get(task.id)
-          if (currentTask) {
-            send({
-              kind: 'status-update',
-              taskId: task.id,
-              contextId: task.contextId,
-              status: currentTask.status,
-              final: isTerminal(currentTask.status.state) || currentTask.status.state === 'input-required',
-            })
-          }
-          return
-        }
-        send({
-          kind: 'artifact-update',
-          taskId: task.id,
-          contextId: task.contextId,
-          artifact: {
-            artifactId: `${task.id}-artifact-0`,
-            name: 'response',
-            parts: [{ kind: 'text', text: '' }],
-          },
-          append: true,
-          lastChunk: true,
-        })
-        send({
-          kind: 'status-update',
-          taskId: task.id,
-          contextId: task.contextId,
-          status: completed.status,
-          final: true,
-        })
-        await maybeDeliverPush(completed, deps)
-      } catch (err) {
-        const releasedTask = await releaseTaskPayment(
-          authz,
-          task,
-          deps,
-          err instanceof Error ? err.message : String(err),
-          workObserved || usage !== undefined,
-        )
-        if (finalizationLeaseId) {
-          const retained = await retainFinalizationForRecovery(
-            deps.taskStore,
-            task.id,
-            finalizationLeaseId,
-            asError(err),
-          )
-          if (retained) {
-            send({
-              kind: 'status-update',
-              taskId: task.id,
-              contextId: task.contextId,
-              status: retained.status,
-              final: false,
-            })
-          }
-          return
-        }
-        const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
-        const failed = isTerminal(currentTask.status.state)
-          ? currentTask
-          : withStatus(currentTask, 'failed')
-        try {
-          await deps.taskStore.put(failed)
           send({
             kind: 'status-update',
             taskId: task.id,
             contextId: task.contextId,
-            status: failed.status,
+            status: completed.status,
             final: true,
           })
-          await maybeDeliverPush(failed, deps)
-        } catch (taskError) {
-          console.error(
-            `[a2a] failed to persist failed task ${task.id}:`,
-            taskError instanceof Error ? taskError.message : String(taskError),
+          await maybeDeliverPush(completed, deps)
+        } catch (err) {
+          const releasedTask = await releaseTaskPayment(
+            authz,
+            task,
+            deps,
+            err instanceof Error ? err.message : String(err),
+            workObserved || usage !== undefined,
           )
+          if (finalizationLeaseId) {
+            const retained = await retainFinalizationForRecovery(
+              deps.taskStore,
+              task.id,
+              finalizationLeaseId,
+              asError(err),
+            )
+            if (retained) {
+              send({
+                kind: 'status-update',
+                taskId: task.id,
+                contextId: task.contextId,
+                status: retained.status,
+                final: false,
+              })
+            }
+            return
+          }
+          const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
+          const failed = shouldPreserveTask(currentTask)
+            ? currentTask
+            : withStatus(clearTaskSubmission(currentTask), 'failed')
+          try {
+            const persisted = await persistTaskIfCurrent(deps.taskStore, currentTask, failed)
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: persisted.status,
+              final: true,
+            })
+            await maybeDeliverPush(persisted, deps)
+          } catch (taskError) {
+            console.error(
+              `[a2a] failed to persist failed task ${task.id}:`,
+              taskError instanceof Error ? taskError.message : String(taskError),
+            )
+          }
+          try {
+            await deps.state.obs?.onStreamError?.(
+              {
+                requestId: authz.requestId,
+                agentSlug: authz.agent.slug,
+                startMs: authz.startMs,
+              },
+              {
+                consumerId: authz.consumerId,
+                errorMessage: err instanceof Error ? err.message : String(err),
+              },
+            )
+          } catch (observerError) {
+            console.error(
+              `[a2a] stream observer failed for ${authz.requestId}:`,
+              observerError instanceof Error ? observerError.message : String(observerError),
+            )
+          }
+        } finally {
+          detachRequestAbort()
+          cancels.clear(task.id)
+          try {
+            if (ctrl.desiredSize !== null) ctrl.close()
+          } catch {
+            // The response may already be closed by client cancellation.
+          }
         }
-        try {
-          await deps.state.obs?.onStreamError?.(
-            {
-              requestId: authz.requestId,
-              agentSlug: authz.agent.slug,
-              startMs: authz.startMs,
-            },
-            {
-              consumerId: authz.consumerId,
-              errorMessage: err instanceof Error ? err.message : String(err),
-            },
-          )
-        } catch (observerError) {
-          console.error(
-            `[a2a] stream observer failed for ${authz.requestId}:`,
-            observerError instanceof Error ? observerError.message : String(observerError),
-          )
-        }
-      } finally {
-        cancels.clear(task.id)
-        ctrl.close()
-      }
+      })()
+    },
+    cancel() {
+      controller.abort()
     },
   })
 
@@ -1125,6 +1172,7 @@ async function guardMessageRequest(
         ...existing,
         status: { state: 'submitted', timestamp: nowIso() },
         history: [...(existing.history ?? []), appendedMessage],
+        metadata: withTaskSubmission(existing.metadata, authz),
       }
       if (!await compareAndSetTask(deps.taskStore, existing, continued)) {
         return c.json(
@@ -1152,6 +1200,7 @@ async function guardMessageRequest(
     contextId,
     status: { state: 'submitted', timestamp: nowIso() },
     history: [initialMessage],
+    metadata: withTaskSubmission(withTaskOrigin(undefined, authz.agent), authz),
   }
   if (!await createTask(deps.taskStore, task)) {
     return c.json(
@@ -1203,16 +1252,17 @@ async function claimTaskPayment(
       'payment authorization failed',
       false,
     )
-    const releaseRecord = releasedTask.metadata?.[PAYMENT_RELEASE_METADATA_KEY]
+    const cleanedReleasedTask = clearTaskSubmission(releasedTask)
+    const releaseRecord = cleanedReleasedTask.metadata?.[PAYMENT_RELEASE_METADATA_KEY]
     const failed = releaseRecord !== undefined
-      ? isTerminal(releasedTask.status.state)
-        ? releasedTask
-        : withStatus(releasedTask, 'failed')
+      ? isTerminal(cleanedReleasedTask.status.state)
+        ? cleanedReleasedTask
+        : withStatus(cleanedReleasedTask, 'failed')
       : paymentFailureTask
-        ? preservePaymentRecoveryMarker(paymentFailureTask, releasedTask)
-        : isTerminal(releasedTask.status.state)
-          ? releasedTask
-          : withStatus(releasedTask, 'failed')
+        ? preservePaymentRecoveryMarker(paymentFailureTask, cleanedReleasedTask)
+        : isTerminal(cleanedReleasedTask.status.state)
+          ? cleanedReleasedTask
+          : withStatus(cleanedReleasedTask, 'failed')
     try {
       if (await compareAndSetTask(deps.taskStore, releasedTask, failed) && isTerminal(failed.status.state)) {
         await maybeDeliverPush(failed, deps)
@@ -1226,6 +1276,8 @@ async function claimTaskPayment(
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))
   }
 
+  const submissionClear = await clearTaskSubmissionMarker(deps.taskStore, paymentTask)
+  if (submissionClear.applied) paymentTask = submissionClear.task
   const current = await deps.taskStore.get(task.id)
   if (current && JSON.stringify(current) === JSON.stringify(paymentTask)) {
     return paymentTask
@@ -1434,9 +1486,9 @@ async function completeCanceledTask(
         artifacts: [responseTextToArtifact(responseText, `${task.id}-artifact-0`)],
       }
     : canceledBase
-  await deps.taskStore.put(canceled)
-  await maybeDeliverPush(canceled, deps)
-  return canceled
+  const persisted = await persistTaskIfCurrent(deps.taskStore, currentTask ?? task, canceled)
+  await maybeDeliverPush(persisted, deps)
+  return persisted
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1462,6 +1514,19 @@ async function authorizeTaskAccess(
   task: Task,
   deps: A2AHandlerDeps,
 ): Promise<Response | undefined> {
+  const requestedAgentSlug = c.req.param('slug') ?? ''
+  const origin = readTaskOrigin(task)
+  if (origin) {
+    if (origin.agentSlug !== requestedAgentSlug) {
+      return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task belongs to a different agent'), 403)
+    }
+    const requestedAgent = await deps.config.resolveAgent(requestedAgentSlug)
+    if (!requestedAgent || requestedAgent.id !== origin.agentId) {
+      return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task belongs to a different agent'), 403)
+    }
+  } else if (!deps.config.x402.demoMode) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task origin is not recorded'), 403)
+  }
   const authorize = deps.config.a2a?.authorizeTaskAccess
   if (!authorize && deps.config.x402.demoMode) return undefined
   if (!authorize) {
@@ -1474,7 +1539,7 @@ async function authorizeTaskAccess(
   try {
     allowed = await authorize(task, {
       method: req.method,
-      agentSlug: c.req.param('slug') ?? '',
+      agentSlug: requestedAgentSlug,
       authorization: c.req.header('Authorization') ?? '',
       paymentSignature: c.req.header('X-Payment-Signature') ?? '',
     })
@@ -1495,6 +1560,134 @@ function isHttpsUrl(value: string): boolean {
   } catch {
     return false
   }
+}
+
+function bindRequestAbort(requestSignal: AbortSignal, controller: AbortController): () => void {
+  const abort = () => controller.abort()
+  if (requestSignal.aborted) abort()
+  else requestSignal.addEventListener('abort', abort, { once: true })
+  return () => requestSignal.removeEventListener('abort', abort)
+}
+
+function withTaskOrigin(
+  metadata: Record<string, unknown> | undefined,
+  agent: { id: string; slug: string },
+): Record<string, unknown> {
+  return {
+    ...(metadata ?? {}),
+    [TASK_ORIGIN_METADATA_KEY]: {
+      version: 1,
+      agentId: agent.id,
+      agentSlug: agent.slug,
+    } satisfies TaskOriginBinding,
+  }
+}
+
+function withTaskSubmission(
+  metadata: Record<string, unknown> | undefined,
+  authz: AuthorizedRequest,
+): Record<string, unknown> {
+  const origin = metadata?.[TASK_ORIGIN_METADATA_KEY]
+  return {
+    ...(metadata ?? {}),
+    ...(origin === undefined
+      ? {
+          [TASK_ORIGIN_METADATA_KEY]: {
+            version: 1,
+            agentId: authz.agent.id,
+            agentSlug: authz.agent.slug,
+          } satisfies TaskOriginBinding,
+        }
+      : {}),
+    [TASK_SUBMISSION_METADATA_KEY]: {
+      version: 1,
+      lease: { id: cryptoRandomId(), expiresAt: Date.now() + TASK_SUBMISSION_LEASE_MS },
+      agentId: authz.agent.id,
+      agentSlug: authz.agent.slug,
+      requestId: authz.requestId,
+      consumerId: authz.consumerId,
+    } satisfies TaskSubmissionRecord,
+  }
+}
+
+function readTaskOrigin(task: Task): TaskOriginBinding | undefined {
+  const raw = task.metadata?.[TASK_ORIGIN_METADATA_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const origin = raw as Partial<TaskOriginBinding>
+  if (
+    origin.version !== 1 ||
+    typeof origin.agentId !== 'string' ||
+    origin.agentId.length === 0 ||
+    typeof origin.agentSlug !== 'string' ||
+    origin.agentSlug.length === 0
+  ) {
+    return undefined
+  }
+  return origin as TaskOriginBinding
+}
+
+function readTaskSubmission(task: Task): TaskSubmissionRecord | undefined {
+  const raw = task.metadata?.[TASK_SUBMISSION_METADATA_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const submission = raw as Partial<TaskSubmissionRecord>
+  if (
+    submission.version !== 1 ||
+    !submission.lease ||
+    typeof submission.lease.id !== 'string' ||
+    submission.lease.id.length === 0 ||
+    typeof submission.lease.expiresAt !== 'number' ||
+    !Number.isFinite(submission.lease.expiresAt) ||
+    typeof submission.agentId !== 'string' ||
+    submission.agentId.length === 0 ||
+    typeof submission.agentSlug !== 'string' ||
+    submission.agentSlug.length === 0 ||
+    typeof submission.requestId !== 'string' ||
+    submission.requestId.length === 0 ||
+    typeof submission.consumerId !== 'string'
+  ) {
+    return undefined
+  }
+  return submission as TaskSubmissionRecord
+}
+
+function clearTaskSubmission(task: Task): Task {
+  if (!task.metadata || !(TASK_SUBMISSION_METADATA_KEY in task.metadata)) return task
+  const metadata = { ...task.metadata }
+  delete metadata[TASK_SUBMISSION_METADATA_KEY]
+  return Object.keys(metadata).length > 0
+    ? { ...task, metadata }
+    : (() => {
+        const { metadata: _metadata, ...withoutMetadata } = task
+        return withoutMetadata
+      })()
+}
+
+async function clearTaskSubmissionMarker(
+  taskStore: TaskStore,
+  expected: Task,
+): Promise<{ task: Task; applied: boolean }> {
+  const current = await taskStore.get(expected.id)
+  if (!current || JSON.stringify(current) !== JSON.stringify(expected)) {
+    return { task: current ?? expected, applied: false }
+  }
+  const cleared = clearTaskSubmission(current)
+  if (cleared === current) return { task: current, applied: true }
+  if (await compareAndSetTask(taskStore, current, cleared)) return { task: cleared, applied: true }
+  return { task: await taskStore.get(expected.id) ?? expected, applied: false }
+}
+
+function shouldPreserveTask(task: Task): boolean {
+  return isTerminal(task.status.state) || hasPendingPaymentRecovery(task)
+}
+
+async function persistTaskIfCurrent(
+  taskStore: TaskStore,
+  expected: Task,
+  next: Task,
+): Promise<Task> {
+  if (expected === next || JSON.stringify(expected) === JSON.stringify(next)) return expected
+  if (await compareAndSetTask(taskStore, expected, next)) return next
+  return await taskStore.get(expected.id) ?? expected
 }
 
 async function createTask(taskStore: TaskStore, task: Task): Promise<boolean> {
@@ -1932,8 +2125,6 @@ async function recoverFinalizationIfNeeded(
         throw new Error('A2A payment operation recovery is not configured')
       }
       paymentOperation = deserializePaymentOperation(renewed.paymentOperation)
-    } else if (!deps.config.x402.demoMode) {
-      throw new Error('A2A production recovery requires a durable payment operation')
     }
 
     const authz: AuthorizedRequest = {
@@ -2007,7 +2198,36 @@ async function recoverTaskIfNeeded(
 ): Promise<Task> {
   const released = await recoverPaymentReleaseIfNeeded(task, deps)
   const finalized = await recoverFinalizationIfNeeded(released, deps, requestedAgentSlug)
-  return recoverPaymentMarkerIfNeeded(finalized, deps)
+  const paymentRecovered = await recoverPaymentMarkerIfNeeded(finalized, deps)
+  return recoverSubmissionIfNeeded(paymentRecovered, deps)
+}
+
+async function recoverSubmissionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
+  const raw = task.metadata?.[TASK_SUBMISSION_METADATA_KEY]
+  if (raw === undefined) return task
+  const submission = readTaskSubmission(task)
+  if (submission && submission.lease.expiresAt > Date.now()) return task
+  if (task.status.state !== 'submitted') {
+    return (await clearTaskSubmissionMarker(deps.taskStore, task)).task
+  }
+
+  const cleanTask = clearTaskSubmission(task)
+  const failed: Task = {
+    ...withStatus(cleanTask, 'failed'),
+    metadata: {
+      ...(cleanTask.metadata ?? {}),
+      [TASK_SUBMISSION_RECOVERY_METADATA_KEY]: {
+        error: submission
+          ? 'A2A task submission lease expired before payment authorization completed'
+          : 'A2A task submission lease is invalid',
+      },
+    },
+  }
+  if (await compareAndSetTask(deps.taskStore, task, failed)) {
+    await maybeDeliverPush(failed, deps)
+    return failed
+  }
+  return await deps.taskStore.get(task.id) ?? task
 }
 
 async function recoverPaymentMarkerIfNeeded(

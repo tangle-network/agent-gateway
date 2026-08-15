@@ -243,6 +243,7 @@ describe('A2A task atomicity and restart recovery', () => {
       status: { state: 'working', timestamp: new Date().toISOString() },
       artifacts: [artifact],
       metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
         gatewayFinalizing: {
           version: 1,
           lease: { id: 'crashed-lease', expiresAt: Date.now() - 1 },
@@ -357,6 +358,7 @@ describe('A2A task atomicity and restart recovery', () => {
       contextId: 'ctx-retry',
       status: { state: 'working', timestamp: new Date().toISOString() },
       metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
         gatewayFinalizing: {
           version: 1,
           lease: { id: 'retry-lease', expiresAt: Date.now() - 1 },

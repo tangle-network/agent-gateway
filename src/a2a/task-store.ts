@@ -23,6 +23,7 @@ const PAYMENT_RECOVERY_KEYS = [
   'gatewayFinalizing',
   'gatewayPaymentRelease',
   'gatewayPaymentRecovery',
+  'gatewaySubmission',
 ] as const
 
 /** Recovery-bearing tasks must remain readable until reconciliation clears the marker. */
