@@ -144,6 +144,14 @@ export interface MppConfig {
     payload: Record<string, unknown>,
     context: { method: string; credential: string },
   ) => Promise<MppAuthenticatedCredential | null>
+  /**
+   * @deprecated Use authenticateCredential and return a stable payment identity.
+   * This 0.7.1 callback remains supported through an explicit compatibility adapter.
+   */
+  verifySigner?: (
+    payload: Record<string, unknown>,
+    context: { method: string; credential: string },
+  ) => Promise<string | null>
   /** Required immediate-charge lifecycle for every non-BlueprinTEVM method. */
   charge?: MppChargeLifecycle
 }

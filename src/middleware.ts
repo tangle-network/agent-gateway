@@ -13,7 +13,7 @@ import {
   releasePaymentAfterFailure,
   settleAndRecord,
 } from './dispatch'
-import { MemoryNonceStore } from './nonce-store'
+import { isAtomicNonceStore, MemoryNonceStore } from './nonce-store'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
 import {
   MemoryPaymentRecoveryStore,
@@ -93,23 +93,43 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
     throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
   }
   const mppMethod = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
+  if (config.mpp?.authenticateCredential !== undefined &&
+      typeof config.mpp.authenticateCredential !== 'function') {
+    throw new Error('createAgentGateway: mpp.authenticateCredential must be a function')
+  }
+  if (config.mpp?.verifySigner !== undefined && typeof config.mpp.verifySigner !== 'function') {
+    throw new Error('createAgentGateway: mpp.verifySigner must be a function')
+  }
+  const mppAuthenticator = typeof config.mpp?.authenticateCredential === 'function'
+    ? config.mpp.authenticateCredential
+    : typeof config.mpp?.verifySigner === 'function'
+      ? config.mpp.verifySigner
+      : undefined
   if (config.mpp?.charge && config.mpp.charge.protocolVersion !== 1) {
     throw new Error('createAgentGateway: unsupported MPP charge lifecycle version')
   }
   if (
     config.mpp?.charge &&
     mppMethod !== 'blueprintevm' &&
-    !config.mpp.authenticateCredential
+    !mppAuthenticator
   ) {
-    throw new Error('createAgentGateway: generic MPP methods require pure credential authentication')
+    throw new Error('createAgentGateway: generic MPP methods require credential authentication')
   }
   if (
     config.mpp &&
     mppMethod !== 'blueprintevm' &&
-    config.mpp.authenticateCredential &&
+    mppAuthenticator &&
     !config.mpp.charge
   ) {
     throw new Error('createAgentGateway: generic MPP methods require a charge lifecycle')
+  }
+  if (config.mpp && mppMethod !== 'blueprintevm' && !mppAuthenticator) {
+    throw new Error('createAgentGateway: generic MPP methods require credential authentication')
+  }
+  const needsAtomicNonce = config.x402.paymentProtocolVersion === 2 ||
+    (mppMethod !== 'blueprintevm' && config.mpp?.charge !== undefined)
+  if (needsAtomicNonce && config.nonceStore && !isAtomicNonceStore(config.nonceStore)) {
+    throw new Error('createAgentGateway: durable payment ownership requires an atomic nonce store')
   }
   const needsRecovery = config.x402.paymentProtocolVersion === 2 ||
     (mppMethod !== 'blueprintevm' && config.mpp?.charge !== undefined)

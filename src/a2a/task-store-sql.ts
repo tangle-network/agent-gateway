@@ -138,13 +138,11 @@ export class SqlTaskStore implements TaskStore {
     if (!row) return undefined
     const task = JSON.parse(row.payload) as Task
     if (Date.now() - row.updated_at > this.ttlMs && !hasPendingPaymentRecovery(task)) {
-      // Lazy GC. If the delete loses a race with another reader, that reader
-      // observes either the stale-then-deleted task (returning undefined here)
-      // or, after this delete commits, observes undefined directly — either
-      // way callers see consistent "expired" semantics.
+      // Delete only the version that was observed as stale. A refresh can reuse
+      // the same payload, so payload equality alone does not protect the row.
       void this.db.exec(
-        `DELETE FROM ${this.table} WHERE id = ? AND payload = ?`,
-        [id, row.payload],
+        `DELETE FROM ${this.table} WHERE id = ? AND payload = ? AND updated_at = ?`,
+        [id, row.payload, row.updated_at],
       )
       return undefined
     }

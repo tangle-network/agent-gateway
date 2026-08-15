@@ -19,6 +19,7 @@ import type {
 import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import { MemoryPaymentOperations } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 import type { MppChargeLifecycle } from '../src/mpp-payment'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
@@ -257,8 +258,8 @@ describe('GET /:slug/chat/completions (discovery)', () => {
     expect(response.status).toBe(401)
   })
 
-  it('does not advertise an MPP method without a compatible verifier', async () => {
-    const { app } = buildHarness({
+  it('rejects an MPP method without a compatible verifier at gateway construction', () => {
+    expect(() => buildHarness({
       mpp: { realm: 'agents.tangle.tools', method: 'stripe' },
       x402: {
         operatorAddress,
@@ -266,10 +267,69 @@ describe('GET /:slug/chat/completions (discovery)', () => {
         demoMode: false,
         verifySigner: async () => true,
       },
-    })
-    const discovery = await app.request('/v1/agents/test-agent/chat/completions')
-    const body = await discovery.json() as { payment_methods: Array<{ type: string }> }
-    expect(body.payment_methods.map((method) => method.type)).not.toContain('mpp')
+    })).toThrow('credential authentication')
+  })
+
+  it('rejects malformed MPP callback values at gateway construction', () => {
+    expect(() => buildHarness({
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        authenticateCredential: 'not-a-function' as unknown as NonNullable<GatewayConfig['mpp']>['authenticateCredential'],
+      },
+    })).toThrow('must be a function')
+  })
+
+  it('rejects an old generic MPP verifier without a charge lifecycle instead of silently disabling MPP', () => {
+    expect(() => buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:legacy',
+      },
+    })).toThrow('charge lifecycle')
+  })
+
+  it('accepts the old generic MPP verifier when its charge lifecycle is explicit', () => {
+    expect(() => buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:legacy',
+        charge: mppChargeLifecycle(),
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    })).not.toThrow()
+  })
+
+  it('rejects a legacy nonce store for version 2 payment ownership', () => {
+    expect(() => buildHarness({
+      nonceStore: {
+        hasSeen: async () => false,
+        markSeen: async () => undefined,
+      } as unknown as NonceStore,
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    })).toThrow('atomic nonce')
   })
 
   it('does not serve an agent whose resolver marks it disabled', async () => {
@@ -586,6 +646,7 @@ describe('POST /:slug/chat/completions — auth paths', () => {
   it('durably claims an x402-compatible MPP receipt and rejects its replay', async () => {
     const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
     const nonceStore: NonceStore = {
+      hasSeen: async () => false,
       claim: async () => true,
     }
     const credential = Buffer.from(JSON.stringify({

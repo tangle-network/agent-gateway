@@ -98,6 +98,7 @@ describe('verifyX402', () => {
   it('retains a nonce until its signed expiry, beyond the old one-hour cap', async () => {
     const ttls: number[] = []
     const nonceStore: NonceStore = {
+      hasSeen: async () => false,
       claim: async (_nonce, ttlSeconds) => {
         ttls.push(ttlSeconds)
         return true
@@ -115,13 +116,16 @@ describe('verifyX402', () => {
     expect(ttls[0]).toBeLessThanOrEqual(7200)
   })
 
-  it('fails closed for a custom nonce store without an atomic claim', async () => {
+  it('keeps 0.7.1 custom nonce stores working on the legacy path', async () => {
+    const seen = new Set<string>()
     const nonceStore = {
-      hasSeen: async () => false,
-      markSeen: async () => undefined,
+      hasSeen: async (nonce: string) => seen.has(nonce),
+      markSeen: async (nonce: string) => { seen.add(nonce) },
     } as unknown as NonceStore
 
-    expect(await verifyX402(buildSpendAuth({ nonce: '101' }), baseConfig, nonceStore)).toBeNull()
+    const payload = buildSpendAuth({ nonce: '101' })
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBe('0xCommitmentAlice')
+    expect(await verifyX402(payload, baseConfig, nonceStore)).toBeNull()
   })
 
   it('isolates nonces per commitment — regression: commitment-less nonce tracking lets Alice replay Bob\'s nonce', async () => {
@@ -219,6 +223,34 @@ describe('verifyMpp', () => {
     expect(seen).toHaveLength(1)
     expect(seen[0].method).toBe('blueprintevm')
     expect(seen[0].credential).toContain('commitment')
+  })
+
+  it('adapts the 0.7.1 mpp.verifySigner contract to a stable payment identity', async () => {
+    const header = buildCredential({
+      commitment: '0xAlice',
+      operator: operatorAddress,
+      amount: '1000',
+      nonce: '7',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+    }).replace('Payment blueprintevm ', 'Payment stripe ')
+    const legacyConfig = {
+      ...mppConfig,
+      method: 'stripe',
+      verifySigner: async (_payload: Record<string, unknown>, context: { method: string; credential: string }) => {
+        expect(context.method).toBe('stripe')
+        expect(context.credential).toContain('commitment')
+        return 'mpp:alice'
+      },
+    }
+
+    await expect(verifyMpp(
+      header,
+      legacyConfig,
+      { ...baseConfig, demoMode: false },
+    )).resolves.toMatchObject({
+      consumerId: 'mpp:alice',
+      replayKey: expect.stringMatching(/^mpp:stripe:[0-9a-f]{64}$/),
+    })
   })
 
   it('shares the x402 nonce authority with equivalent BlueprinTEVM credentials', async () => {

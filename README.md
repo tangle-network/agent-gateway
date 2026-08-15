@@ -89,6 +89,10 @@ The live credential is passed to `confirmPayment` only on the original request.
 The nonce and recovery stores persist only the SHA-256 digest of `paymentIdentity`.
 `Payment-Receipt` values must contain visible ASCII only.
 
+`NonceStore` remains source-compatible with 0.7.1 `hasSeen`/`markSeen` stores.
+That legacy path is limited to non-owner payment claims; version 2 and MPP charge lifecycles require an atomic `claim` method.
+The 0.7.1 `mpp.verifySigner` callback is also supported; the gateway derives a stable identity until the integration moves to `authenticateCredential`.
+
 The same authentication, authorization, rate-limit, filtering, sandbox, settlement, and usage-recording pipeline is used by the OpenAI-compatible and A2A endpoints.
 Wire protocol handlers only translate their request and response shapes.
 

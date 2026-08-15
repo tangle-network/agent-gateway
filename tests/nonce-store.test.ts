@@ -67,13 +67,25 @@ describe('MemoryNonceStore', () => {
 })
 
 describe('claimStoredNonce', () => {
-  it('fails closed for a store without an atomic claim method', async () => {
+  it('keeps the 0.7.1 check-and-mark store contract for legacy claims', async () => {
+    const seen = new Set<string>()
+    const legacyStore: NonceStore = {
+      hasSeen: async (nonce) => seen.has(nonce),
+      markSeen: async (nonce) => { seen.add(nonce) },
+    }
+
+    expect(await claimStoredNonce(legacyStore, 'legacy', 60)).toBe(true)
+    expect(await claimStoredNonce(legacyStore, 'legacy', 60)).toBe(false)
+    await expect(claimStoredNonce(legacyStore, 'legacy', 60, 'operation-1'))
+      .rejects.toThrow('atomic payment ownership')
+  })
+
+  it('fails closed for a store without either replay contract', async () => {
     const legacyStore = {
       hasSeen: async () => false,
-      markSeen: async () => undefined,
     } as unknown as NonceStore
 
-    await expect(claimStoredNonce(legacyStore, 'legacy', 60)).rejects.toThrow('payment replay')
+    await expect(claimStoredNonce(legacyStore, 'legacy', 60)).rejects.toThrow('markSeen')
   })
 })
 

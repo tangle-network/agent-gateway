@@ -75,6 +75,8 @@ export {
 export {
   MemoryNonceStore,
   KvNonceStore,
+  isAtomicNonceStore,
+  type AtomicNonceStore,
   type NonceStore,
 } from './nonce-store'
 export {

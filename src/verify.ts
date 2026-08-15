@@ -91,6 +91,16 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value)
 }
 
+function legacyMppPaymentIdentity(
+  method: string,
+  payload: Record<string, unknown>,
+  credential: string,
+): string {
+  const canonicalPayload = stableJson(payload)
+  if (canonicalPayload !== '{}') return `legacy:${method}:${canonicalPayload}`
+  return `legacy:${method}:credential:${Buffer.from(credential).toString('base64url')}`
+}
+
 /** Pure capability checks shared by discovery and every request protocol. */
 export function isApiKeyAuthEnabled(
   config: Pick<GatewayConfig, 'verifyApiKey' | 'x402'>,
@@ -104,7 +114,8 @@ export function isMppAuthEnabled(
 ): boolean {
   const method = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
   if (!config.mpp) return false
-  const authenticated = config.mpp.authenticateCredential !== undefined ||
+  const authenticated = typeof config.mpp.authenticateCredential === 'function' ||
+    typeof config.mpp.verifySigner === 'function' ||
     (method === 'blueprintevm' && config.x402.verifySigner !== undefined) ||
     (method === 'blueprintevm' && config.x402.demoMode === true)
   if (!authenticated) return false
@@ -236,6 +247,14 @@ export async function verifyMpp(
     let authenticated: MppAuthenticatedCredential | null = null
     if (config.authenticateCredential) {
       authenticated = await config.authenticateCredential(payload, { method, credential: decoded })
+    } else if (config.verifySigner) {
+      const consumerId = await config.verifySigner(payload, { method, credential: decoded })
+      authenticated = typeof consumerId === 'string' && consumerId.length > 0
+        ? {
+            consumerId,
+            paymentIdentity: legacyMppPaymentIdentity(method, payload, decoded),
+          }
+        : null
     } else if (method === 'blueprintevm' && x402Config.verifySigner && payload.commitment) {
       const verified = await x402Config.verifySigner(payload, {
         protocolVersion: x402Config.paymentProtocolVersion ?? (x402Config.paymentOperations ? 2 : 1),

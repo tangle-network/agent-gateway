@@ -32,7 +32,9 @@ interface FakePushRow {
   authentication: string | null
 }
 
-function makeTaskAdapter(): SqlAdapter & { rows: Map<string, FakeTaskRow> } {
+function makeTaskAdapter(
+  beforeDelete?: () => Promise<void>,
+): SqlAdapter & { rows: Map<string, FakeTaskRow> } {
   const rows = new Map<string, FakeTaskRow>()
   return {
     rows,
@@ -69,8 +71,12 @@ function makeTaskAdapter(): SqlAdapter & { rows: Map<string, FakeTaskRow> } {
         return { rowsAffected: 1 }
       }
       if (s.startsWith('DELETE')) {
-        const [id, expectedPayload] = params as [string, string | undefined]
+        await beforeDelete?.()
+        const [id, expectedPayload, expectedUpdatedAt] = params as [string, string | undefined, number | undefined]
         if (expectedPayload !== undefined && rows.get(id)?.payload !== expectedPayload) {
+          return { rowsAffected: 0 }
+        }
+        if (expectedUpdatedAt !== undefined && rows.get(id)?.updated_at !== expectedUpdatedAt) {
           return { rowsAffected: 0 }
         }
         const had = rows.delete(id)
@@ -156,6 +162,29 @@ describe('SqlTaskStore', () => {
     await store.put(makeTask('t1'))
     await new Promise((r) => setTimeout(r, 5))
     expect(await store.get('t1')).toBeUndefined()
+  })
+
+  it('does not let lazy GC delete a row refreshed with the same payload', async () => {
+    let deleteStarted!: () => void
+    const deleteStartedPromise = new Promise<void>((resolve) => { deleteStarted = resolve })
+    let releaseDelete!: () => void
+    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve })
+    const db = makeTaskAdapter(async () => {
+      deleteStarted()
+      await deleteGate
+    })
+    const store = new SqlTaskStore(db, { ttlMs: 1 })
+    const task = makeTask('t1')
+    await store.put(task)
+    db.rows.get('t1')!.updated_at = Date.now() - 100
+
+    const staleRead = store.get('t1')
+    await deleteStartedPromise
+    await store.put(task)
+    releaseDelete()
+    expect(await staleRead).toBeUndefined()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(db.rows.has('t1')).toBe(true)
   })
 
   it.each([

@@ -4,13 +4,19 @@
  */
 
 export interface NonceStore {
-  /** Optional observation. This method never grants ownership. */
-  hasSeen?(nonce: string): Promise<boolean>
+  /** Check if nonce has been seen. This method never grants ownership. */
+  hasSeen(nonce: string): Promise<boolean>
   /**
    * Atomically claim a nonce. An owner id makes a retry by the same payment
-   * operation idempotent. Calls without an owner id use first-writer-wins
-   * semantics for legacy payment authorization.
+   * operation idempotent. This is optional only for the 0.7.1 check-and-mark
+   * compatibility contract; durable owner claims require this method.
    */
+  claim?(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
+  /** @deprecated Use claim() for atomic ownership in new stores. */
+  markSeen?(nonce: string, ttlSeconds: number): Promise<void>
+}
+
+export interface AtomicNonceStore extends NonceStore {
   claim(nonce: string, ttlSeconds: number, ownerId?: string): Promise<boolean>
 }
 
@@ -135,15 +141,26 @@ export class KvNonceStore implements NonceStore {
   }
 }
 
-/** Claim through the single atomic nonce-ownership contract. */
+/** Claim through the atomic contract or the explicit 0.7.1 legacy path. */
 export async function claimStoredNonce(
   store: NonceStore,
   nonce: string,
   ttlSeconds: number,
   ownerId?: string,
 ): Promise<boolean> {
-  if (typeof store.claim !== 'function') {
-    throw new Error('NonceStore.claim is required for payment replay protection')
+  if (typeof store.claim === 'function') return store.claim(nonce, ttlSeconds, ownerId)
+  if (ownerId !== undefined) {
+    throw new Error('NonceStore.claim is required for atomic payment ownership')
   }
-  return store.claim(nonce, ttlSeconds, ownerId)
+  if (typeof store.markSeen !== 'function') {
+    throw new Error('NonceStore.markSeen is required for legacy payment replay protection')
+  }
+  if (await store.hasSeen(nonce)) return false
+  await store.markSeen(nonce, ttlSeconds)
+  return true
+}
+
+/** Durable payment paths must use a store with a single atomic claim operation. */
+export function isAtomicNonceStore(store: NonceStore): store is AtomicNonceStore {
+  return typeof store.claim === 'function'
 }
