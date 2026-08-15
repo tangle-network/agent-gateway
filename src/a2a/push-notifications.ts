@@ -142,10 +142,9 @@ function isPrivatePushHostname(value: string): boolean {
     ipv6.startsWith('fe9') ||
     ipv6.startsWith('fea') ||
     ipv6.startsWith('feb') ||
-    ipv6.startsWith('::ffff:127.') ||
-    ipv6.startsWith('::ffff:10.') ||
-    ipv6.startsWith('::ffff:192.168.') ||
-    ipv6.startsWith('::ffff:169.254.')
+    // WHATWG URL normalizes dotted IPv4-mapped IPv6 literals to hexadecimal.
+    // Reject the whole mapped range instead of matching only dotted forms.
+    ipv6.startsWith('::ffff:')
   ) return true
   return hostname === 'localhost' ||
     hostname === 'localhost.localdomain' ||

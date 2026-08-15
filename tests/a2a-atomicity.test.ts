@@ -312,6 +312,41 @@ describe('A2A task atomicity and restart recovery', () => {
     expect(operations.get(executing.operationId)?.state).toBe('settled')
     expect(counters.records).toBe(1)
     expect(counters.settlements).toBe(1)
+
+    // Simulate the provider commit succeeding immediately before the task
+    // finalization write was lost. The durable task still contains the
+    // pre-settlement operation snapshot, so recovery must inspect the current
+    // provider state instead of charging the operation again.
+    await taskStore.put({
+      ...task,
+      id: 'task-settled-finalization',
+      contextId: 'ctx-settled-finalization',
+      metadata: {
+        ...task.metadata,
+        gatewayFinalizing: {
+          ...(task.metadata?.gatewayFinalizing as Record<string, unknown>),
+          lease: { id: 'settled-replay-lease', expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+    const replayed = await app.request(`/v1/agents/${agent.slug}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/get',
+        params: { id: 'task-settled-finalization' },
+      }),
+    })
+    const replayedBody = await replayed.json() as { result?: Task; error?: unknown }
+
+    expect(replayedBody.error).toBeUndefined()
+    expect(replayedBody.result?.status.state).toBe('completed')
+    expect((await taskStore.get('task-settled-finalization'))?.metadata?.gatewayFinalizing)
+      .toBeUndefined()
+    expect(counters.records).toBe(2)
+    expect(counters.settlements).toBe(1)
   })
 
   it('keeps a settling payment recoverable after a lost settlement acknowledgement', async () => {

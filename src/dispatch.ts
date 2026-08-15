@@ -1408,6 +1408,8 @@ async function closeSandboxIterator(iterator: AsyncIterator<SandboxStreamEvent>)
 export interface SettleAndRecordOptions {
   /** Skip attribution after a durable finalization marker confirms it ran. */
   usageAlreadyRecorded?: boolean
+  /** Skip provider settlement only after an authoritative read found it settled. */
+  paymentAlreadySettled?: boolean
   /** Persist the caller's recovery marker after attribution succeeds. */
   onUsageRecorded?: () => Promise<void>
   /** Recovery uses the original quoted ceiling when no receipt arrives. */
@@ -1467,10 +1469,19 @@ export async function settleAndRecord(
         config.x402.currencyDecimals,
         usage.providerCostUsd,
       )
-      authz.paymentOperation = await config.x402.paymentOperations.settlePayment(
-        authz.paymentOperation,
-        { amount, totalCostUsd: totalCost, usage, basis: settlementBasis },
-      )
+      if (options.paymentAlreadySettled) {
+        if (
+          authz.paymentOperation.state !== 'settled' ||
+          authz.paymentOperation.settledAmount !== amount
+        ) {
+          throw new Error('authoritative payment state does not match finalization')
+        }
+      } else {
+        authz.paymentOperation = await config.x402.paymentOperations.settlePayment(
+          authz.paymentOperation,
+          { amount, totalCostUsd: totalCost, usage, basis: settlementBasis },
+        )
+      }
       // Durable settlement happens first. If attribution storage is
       // unavailable, recovery must never refund delivered work.
       if (!options.usageAlreadyRecorded) {

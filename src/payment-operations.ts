@@ -84,6 +84,12 @@ export interface PaymentOperations {
     input: PaymentSettlementInput,
   ): Promise<PaymentOperation>
   /**
+   * Read the authoritative durable operation without changing its state.
+   * Recovery uses this to avoid repeating a provider settlement after the
+   * provider committed but the task finalization write lost its acknowledgement.
+   */
+  getPaymentOperation(operationId: string): Promise<PaymentOperationRecoveryResult>
+  /**
    * Release an unused authorization.
    * Repeated calls must recover an ambiguous acknowledgement by operationId.
    */
@@ -425,6 +431,15 @@ export class MemoryPaymentOperations implements PaymentOperations {
   get(operationId: string): PaymentOperation | undefined {
     const operation = this.operations.get(operationId)
     return operation ? { ...operation } : undefined
+  }
+
+  async getPaymentOperation(operationId: string): Promise<PaymentOperationRecoveryResult> {
+    const operation = this.get(operationId)
+    return operation ?? {
+      protocolVersion: PAYMENT_PROTOCOL_VERSION,
+      operationId,
+      state: 'not-found',
+    }
   }
 
   private requireCurrent(operation: PaymentOperation): PaymentOperation {

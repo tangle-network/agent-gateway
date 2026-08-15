@@ -53,6 +53,8 @@ Run `recoverPayments(config)` from a private scheduled worker.
 Every live request and worker uses a unique durable fence token.
 A stale request or worker cannot update a row after another worker takes its lease.
 Provider settlement, recovery, and release methods must still use the operation ID idempotently.
+`paymentOperations.getPaymentOperation` must read the authoritative provider state by operation ID without changing it.
+This read is required for recovery of older A2A finalization records that predate the shared payment outbox.
 The operation store owns claim, execution start, receipt retention, partial settle, release, and expiry reclaim.
 An executing or retained operation cannot expire into a refund.
 A retained operation settles from its receipt when one exists.

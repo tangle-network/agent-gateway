@@ -2186,6 +2186,21 @@ async function recoverFinalizationIfNeeded(
       paymentOperation = deserializePaymentOperation(renewed.paymentOperation)
     }
 
+    let paymentAlreadySettled = false
+    if (paymentOperation && deps.config.x402.paymentOperations) {
+      const currentOperation = await deps.config.x402.paymentOperations.getPaymentOperation(
+        paymentOperation.operationId,
+      )
+      if (currentOperation.state === 'not-found') {
+        throw new Error('A2A payment operation disappeared during finalization recovery')
+      }
+      if (currentOperation.operationId !== paymentOperation.operationId) {
+        throw new Error('A2A payment operation recovery returned a different operation')
+      }
+      paymentOperation = currentOperation
+      paymentAlreadySettled = currentOperation.state === 'settled'
+    }
+
     const authz: AuthorizedRequest = {
       agent,
       consumerId: renewed.consumerId,
@@ -2215,6 +2230,7 @@ async function recoverFinalizationIfNeeded(
       deps.state.obs,
       {
         usageAlreadyRecorded: renewed.usageRecorded === true,
+        paymentAlreadySettled,
         onUsageRecorded: async () => {
           usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
         },
@@ -2468,7 +2484,7 @@ function agentMessage(task: Task, text: string): Message {
     kind: 'message',
     role: 'agent',
     parts: [{ kind: 'text', text }],
-    messageId: `${task.id}-status-${task.status.state}-${stableMessageDigest(text)}`,
+    messageId: `${task.id}-input-required-${stableMessageDigest(text)}`,
     taskId: task.id,
     contextId: task.contextId,
   }

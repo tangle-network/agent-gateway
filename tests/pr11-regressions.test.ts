@@ -863,4 +863,37 @@ describe('PR #11 production regressions', () => {
     expect(results[0]?.error).toContain('safe HTTPS destination')
     expect(fetcher).not.toHaveBeenCalled()
   })
+
+  it('rejects IPv4-mapped IPv6 private push destinations before fetch', async () => {
+    const { deliverPushNotifications } = await import('../src/a2a/push-notifications')
+    const fetcher = vi.fn(async () => new Response('unexpected', { status: 200 }))
+    const urls = [
+      'https://[::ffff:169.254.169.254]/metadata',
+      'https://[::ffff:a9fe:a9fe]/metadata',
+    ]
+
+    for (const [index, url] of urls.entries()) {
+      const results = await deliverPushNotifications({
+        task: {
+          kind: 'task',
+          id: `mapped-private-task-${index}`,
+          contextId: 'private-context',
+          status: { state: 'completed', timestamp: new Date().toISOString() },
+        },
+        store: {
+          list: async () => [{ id: `mapped-private-${index}`, url }],
+          set: async () => undefined,
+          get: async () => undefined,
+          delete: async () => undefined,
+        },
+        webhookSecret: undefined,
+        fetcher: fetcher as unknown as typeof fetch,
+      })
+
+      expect(results[0]?.ok).toBe(false)
+      expect(results[0]?.error).toContain('safe HTTPS destination')
+    }
+
+    expect(fetcher).not.toHaveBeenCalled()
+  })
 })
