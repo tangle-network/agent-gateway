@@ -250,6 +250,87 @@ describe('PR #11 production regressions', () => {
     expect((await taskStore.get('pr11-cancel-race'))?.status.state).toBe('canceled')
   })
 
+  it('cancels an execution already fenced by another worker', async () => {
+    const taskStore = new InMemoryTaskStore()
+    let executionClaimed!: () => void
+    const executionReady = new Promise<void>((resolve) => { executionClaimed = resolve })
+    let releaseExecution!: () => void
+    const executionReleased = new Promise<void>((resolve) => { releaseExecution = resolve })
+
+    const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          if (worker === 'runner') {
+            executionClaimed()
+            await executionReleased
+          }
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 1,
+        authorizePayment: async () => true,
+      },
+      nonceStore: new MemoryNonceStore(),
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    })
+
+    const runner = new Hono()
+    runner.route('/v1/agents', createAgentGateway(makeConfig('runner')))
+    const canceler = new Hono()
+    canceler.route('/v1/agents', createAgentGateway(makeConfig('canceler')))
+
+    const running = runner.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9002'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: 'pr11-active-cancel-race',
+            contextId: 'pr11-active-cancel-context',
+            messageId: 'pr11-active-cancel-message',
+            parts: [{ kind: 'text', text: 'run' }],
+          },
+        },
+      }),
+    })
+    await executionReady
+
+    const cancel = await canceler.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'pr11-active-cancel-race' },
+      }),
+    })
+    const cancelBody = await cancel.json() as { result?: { status?: { state?: string } } }
+    expect(cancel.status).toBe(200)
+    expect(cancelBody.result?.status?.state).toBe('canceled')
+
+    releaseExecution()
+    const runningResponse = await running
+    const runningBody = await runningResponse.json() as { result?: { status?: { state?: string } } }
+    expect(runningBody.result?.status?.state).toBe('canceled')
+    expect((await taskStore.get('pr11-active-cancel-race'))?.metadata?.gatewayExecution)
+      .toBeUndefined()
+  })
+
   it('quotes retained A2A history before charging a continuation', async () => {
     const taskStore = new InMemoryTaskStore()
     let invocations = 0
@@ -407,9 +488,11 @@ describe('PR #11 production regressions', () => {
       },
     })
 
-    const recovered = await recoverPayment(id, config, { force: true })
+    const recoveryNow = now + 10_000
+    const recovered = await recoverPayment(id, config, { force: true, now: recoveryNow })
 
     expect(recovered?.state).toBe('reconciled')
+    expect((await store.get(id))?.reconciledAt).toBe(recoveryNow)
   })
 
   it('does not leave an abandoned working A2A task after payment recovery', async () => {
@@ -706,7 +789,7 @@ describe('PR #11 production regressions', () => {
         return (row ? [{ payload: row.payload, updated_at: row.updated_at }] : []) as TRow[]
       },
     }
-    const store = new SqlTaskStore(db, { ttlMs: 10 })
+    const store = new SqlTaskStore(db, { ttlMs: 1_000 })
     const oldTask: Task = {
       kind: 'task',
       id: 'sql-expired-task',
@@ -714,7 +797,7 @@ describe('PR #11 production regressions', () => {
       status: { state: 'submitted', timestamp: new Date().toISOString() },
     }
     expect(await store.createIfAbsent(oldTask)).toBe(true)
-    rows.get(oldTask.id)!.updated_at = Date.now() - 100
+    rows.get(oldTask.id)!.updated_at = Date.now() - 10_000
     const replacement: Task = {
       ...oldTask,
       status: { state: 'failed', timestamp: new Date().toISOString() },
@@ -754,5 +837,30 @@ describe('PR #11 production regressions', () => {
     expect(results[0]).toMatchObject({ ok: false, status: 302 })
     expect(results[0]?.error).toContain('redirect')
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ redirect: 'manual' })
+  })
+
+  it('rejects direct private push destinations before fetch', async () => {
+    const { deliverPushNotifications } = await import('../src/a2a/push-notifications')
+    const fetcher = vi.fn(async () => new Response('unexpected', { status: 200 }))
+    const results = await deliverPushNotifications({
+      task: {
+        kind: 'task',
+        id: 'private-task',
+        contextId: 'private-context',
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      },
+      store: {
+        list: async () => [{ id: 'private', url: 'https://127.0.0.1/internal' }],
+        set: async () => undefined,
+        get: async () => undefined,
+        delete: async () => undefined,
+      },
+      webhookSecret: undefined,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    expect(results[0]?.ok).toBe(false)
+    expect(results[0]?.error).toContain('safe HTTPS destination')
+    expect(fetcher).not.toHaveBeenCalled()
   })
 })

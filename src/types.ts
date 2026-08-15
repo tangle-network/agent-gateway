@@ -423,6 +423,11 @@ export interface GatewayConfig {
      * `fetch`. Override for tests or to wire a queue-backed sender.
      */
     pushFetcher?: typeof fetch
+    /**
+     * DNS-aware policy for push destinations. Required when production
+     * push delivery is enabled so private DNS names cannot receive task data.
+     */
+    pushUrlValidator?: (url: URL) => boolean | Promise<boolean>
   }
 }
 

@@ -44,12 +44,12 @@ import { buildAgentCard } from './agent-card'
 import {
   claimTaskExecution,
   clearTaskExecution,
-  hasActiveTaskExecution,
   renewTaskExecution,
 } from './execution-fence'
 import { fail, ok, parseEnvelope } from './jsonrpc'
 import {
   deliverPushNotifications,
+  validatePushNotificationUrl,
   type PushNotificationStore,
   type TaskPushNotificationConfig,
 } from './push-notifications'
@@ -178,11 +178,6 @@ class CancelRegistry {
 
   isFinalizing(taskId: string): boolean {
     return this.finalizing.has(taskId)
-  }
-
-  hasController(taskId: string): boolean {
-    const controller = this.controllers.get(taskId)
-    return controller !== undefined && !controller.signal.aborted
   }
 
   cancel(taskId: string): boolean {
@@ -922,8 +917,7 @@ async function handleTasksCancel(
 
   if (
     isTaskFinalizing(task) ||
-    cancels.isFinalizing(task.id) ||
-    (hasActiveTaskExecution(task) && !cancels.hasController(task.id))
+    cancels.isFinalizing(task.id)
   ) {
     return c.json(
       fail(
@@ -933,10 +927,7 @@ async function handleTasksCancel(
       ),
     )
   }
-  const canceled: Task = {
-    ...task,
-    status: { state: 'canceled', timestamp: nowIso() },
-  }
+  const canceled = withStatus(task, 'canceled')
   const transitioned = await compareAndSetTask(deps.taskStore, task, canceled)
   if (!transitioned) {
     const current = await deps.taskStore.get(task.id)
@@ -1047,8 +1038,30 @@ async function handlePushSet(
   }
   const accessError = await authorizeTaskAccess(c, req, task, deps)
   if (accessError) return accessError
-  if (!isHttpsUrl(params.pushNotificationConfig.url)) {
-    return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'pushNotificationConfig.url must use https'))
+  const pushUrl = validatePushNotificationUrl(params.pushNotificationConfig.url)
+  if (!pushUrl) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'pushNotificationConfig.url is not a safe HTTPS destination'),
+    )
+  }
+  const urlValidator = deps.config.a2a?.pushUrlValidator
+  if (!deps.config.x402.demoMode && !urlValidator) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'production push URL validation is not configured'),
+    )
+  }
+  let allowedByHostPolicy = true
+  try {
+    if (urlValidator) allowedByHostPolicy = await urlValidator(pushUrl)
+  } catch (error) {
+    allowedByHostPolicy = false
+    console.error(
+      `[a2a] push URL policy failed for task ${task.id}:`,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+  if (!allowedByHostPolicy) {
+    return c.json(fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, 'pushNotificationConfig.url was rejected'))
   }
   await deps.pushStore.set(params.taskId, params.pushNotificationConfig)
   const stored = await deps.pushStore.get(params.taskId, params.pushNotificationConfig.id)
@@ -1595,15 +1608,6 @@ async function authorizeTaskAccess(
   }
   if (allowed) return undefined
   return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task access denied'), 403)
-}
-
-function isHttpsUrl(value: string): boolean {
-  try {
-    const url = new URL(value)
-    return url.protocol === 'https:' && url.username === '' && url.password === ''
-  } catch {
-    return false
-  }
 }
 
 function bindRequestAbort(requestSignal: AbortSignal, controller: AbortController): () => void {
@@ -2523,6 +2527,8 @@ async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void>
       store: deps.pushStore,
       webhookSecret: deps.config.a2a?.webhookSecret,
       fetcher: deps.config.a2a?.pushFetcher,
+      urlValidator: deps.config.a2a?.pushUrlValidator,
+      requireUrlValidator: !deps.config.x402.demoMode,
       onDelivery: (result) => {
         if (!result.ok) {
           deps.state.obs?.onStreamError?.(

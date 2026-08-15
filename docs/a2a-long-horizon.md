@@ -49,6 +49,8 @@ Explicit `x402.demoMode` permits these methods without the hook for local tests 
 This is a fail-closed upgrade boundary.
 Tasks stored before this release do not have a `gatewayOrigin` binding and cannot pass the default ownership check.
 Migrate those records with a verified owner binding, or allow them to expire before enabling production control methods.
+Push registration rejects reserved IP literals and private hostname suffixes.
+Production push delivery also requires `a2a.pushUrlValidator`, which should apply the deployment's DNS-aware private-network policy.
 
 ### D1 (Cloudflare Workers)
 

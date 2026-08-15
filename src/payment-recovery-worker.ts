@@ -81,7 +81,7 @@ export async function recoverPayment(
   const current = await recovery.store.get(recoveryId)
   if (!current || current.state === 'reconciled') return current
   if (!options.force && current.nextAttemptAt > scanNow) return current
-  const now = recoveryNow(options)
+  const now = options.now ?? recoveryNow(options)
 
   const leased = await acquireLease(
     current.id,
@@ -99,7 +99,7 @@ export async function recoverPayment(
     await reconcileLeased(ready, config, now)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    const failedAt = recoveryNow(options)
+    const failedAt = options.now ?? recoveryNow(options)
     try {
       await updateOwnedPaymentRecovery(recovery.store, recoveryId, fenceId, (record) => ({
         ...record,
@@ -126,7 +126,7 @@ async function reconcileLeased(
   now: number,
 ): Promise<void> {
   if (record.payment.kind === 'mpp-charge' && !record.payment.operation) {
-    record = await recoverUnknownMppCharge(record, config)
+    record = await recoverUnknownMppCharge(record, config, now)
   }
   if (record.state === 'reconciled') return
 
@@ -140,25 +140,25 @@ async function reconcileLeased(
         if (recovered.operationId !== record.payment.operationId) {
           throw new Error('x402 recovery operation id mismatch')
         }
-        await completeRecord(record, config)
+        await completeRecord(record, config, now)
         return
       }
       if (recovered.state !== 'released' && recovered.state !== 'reclaimed') {
         throw new Error(`ambiguous x402 claim recovered in state ${recovered.state}`)
       }
-      await completeRecord(record, config)
+      await completeRecord(record, config, now)
       return
     }
     throw new Error('MPP charge confirmation remains unresolved')
   }
 
   if (record.state === 'claimed' && !record.workStarted) {
-    await releaseRecoveredPayment(record, config, 'request ended before sandbox execution')
+    await releaseRecoveredPayment(record, config, 'request ended before sandbox execution', now)
     return
   }
 
   if (record.state === 'releasing') {
-    await releaseRecoveredPayment(record, config, record.reason ?? 'payment recovery release')
+    await releaseRecoveredPayment(record, config, record.reason ?? 'payment recovery release', now)
     return
   }
 
@@ -192,6 +192,7 @@ async function reconcileLeased(
 async function recoverUnknownMppCharge(
   record: PaymentRecoveryRecord,
   config: GatewayConfig,
+  now: number,
 ): Promise<PaymentRecoveryRecord> {
   if (record.payment.kind !== 'mpp-charge') return record
   const method = record.payment.method
@@ -206,7 +207,7 @@ async function recoverUnknownMppCharge(
       throw new Error('MPP recovery operation id mismatch')
     }
     if (result.state === 'not-found') {
-      await completeRecord(record, config)
+      await completeRecord(record, config, now)
       return requireRecord(record.id, config)
     }
     throw new Error('MPP charge confirmation is still pending')
@@ -236,9 +237,10 @@ async function recoverUnknownMppCharge(
             : 'claimed',
       payment: { kind: 'mpp-charge', method, operationId, operation: result },
       ...(result.state === 'released'
-        ? { reconciledAt: Date.now(), nextAttemptAt: Number.MAX_SAFE_INTEGER, lease: undefined }
+        ? { reconciledAt: now, nextAttemptAt: Number.MAX_SAFE_INTEGER, lease: undefined }
         : {}),
     }),
+    now,
   )
 }
 
@@ -246,6 +248,7 @@ async function releaseRecoveredPayment(
   record: PaymentRecoveryRecord,
   config: GatewayConfig,
   reason: string,
+  now: number,
 ): Promise<void> {
   const authz = authorizedRequest(record)
   if (record.payment.kind === 'x402') {
@@ -256,13 +259,13 @@ async function releaseRecoveredPayment(
         if (recovered.operationId !== record.payment.operationId) {
           throw new Error('x402 recovery operation id mismatch')
         }
-        await completeRecord(record, config)
+        await completeRecord(record, config, now)
         return
       }
       if (recovered.state !== 'released' && recovered.state !== 'reclaimed') {
         throw new Error(`x402 release recovered in state ${recovered.state}`)
       }
-      await completeRecord(record, config)
+      await completeRecord(record, config, now)
       return
     }
     authz.paymentOperation = deserializePaymentOperation(record.payment.operation)
@@ -288,8 +291,11 @@ async function settleRecoveredPayment(
     authz.mppChargeOperation = record.payment.operation
   }
 
-  const fallback = !record.usage
+  const fallback = record.settlementBasis === 'quoted-ceiling' || !record.usage
   const usage = record.usage ?? quotedCeilingUsage(record)
+  const settlementBasis = fallback
+    ? 'quoted-ceiling'
+    : record.settlementBasis ?? 'usage-receipt'
   await settleAndRecord(
     recoveryAgent(record),
     authz,
@@ -298,8 +304,8 @@ async function settleRecoveredPayment(
     config.observer,
     {
       usageAlreadyRecorded: record.usageRecorded,
-      settlementBasis: fallback ? 'quoted-ceiling' : record.settlementBasis ?? 'usage-receipt',
-      ...(fallback && record.payment.kind === 'x402'
+      settlementBasis,
+      ...(settlementBasis === 'quoted-ceiling' && record.payment.kind === 'x402'
         ? { paymentAmount: BigInt(record.attribution.requiredAmount) }
         : {}),
     },
@@ -387,8 +393,11 @@ async function acquireLease(
   throw new Error(`payment recovery record ${id} changed too many times`)
 }
 
-async function completeRecord(record: PaymentRecoveryRecord, config: GatewayConfig): Promise<void> {
-  const now = Date.now()
+async function completeRecord(
+  record: PaymentRecoveryRecord,
+  config: GatewayConfig,
+  now: number,
+): Promise<void> {
   await updateOwnedPaymentRecovery(
     config.paymentRecovery!.store,
     record.id,

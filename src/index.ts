@@ -133,6 +133,7 @@ export {
 export {
   deliverPushNotifications,
   InMemoryPushNotificationStore,
+  validatePushNotificationUrl,
   type PushDeliveryResult,
   type PushNotificationAuthentication,
   type PushNotificationConfig,

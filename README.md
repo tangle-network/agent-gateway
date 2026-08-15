@@ -114,6 +114,7 @@ The short-lived `gatewaySubmission` marker is not a payment recovery record and 
 The bundled memory and SQL stores enforce this rule even after the normal task TTL.
 Push destinations must use HTTPS without URL credentials.
 Push delivery does not follow redirects.
+Production push delivery also requires `a2a.pushUrlValidator` to reject private DNS destinations.
 Tasks created before this release have no recorded origin and fail closed; migrate them with a verified owner binding or let them expire.
 
 ## Tier

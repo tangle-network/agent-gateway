@@ -90,6 +90,83 @@ export interface PushNotificationStore {
   delete(taskId: string, configId: string): Promise<void>
 }
 
+/**
+ * Validate a push destination before the gateway sends task data to it.
+ *
+ * The default policy rejects URL credentials, non-HTTPS schemes, IP literals
+ * in reserved ranges, and common private hostnames. Production deployments
+ * should also provide `GatewayConfig.a2a.pushUrlValidator` for DNS policy.
+ */
+export function validatePushNotificationUrl(value: string): URL | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    isPrivatePushHostname(url.hostname)
+  ) {
+    return undefined
+  }
+  return url
+}
+
+function isPrivatePushHostname(value: string): boolean {
+  const hostname = value.toLowerCase().replace(/\.$/, '')
+  const ipv4 = parseIpv4(hostname)
+  if (ipv4) {
+    const [first, second] = ipv4
+    return first === 0 ||
+      first === 10 ||
+      first === 127 ||
+      (first === 100 && second >= 64 && second <= 127) ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 0) ||
+      (first === 192 && second === 168) ||
+      (first === 198 && (second === 18 || second === 19)) ||
+      (first === 203 && second === 0) ||
+      first >= 224
+  }
+  const ipv6 = hostname.replace(/^\[|\]$/g, '')
+  if (
+    ipv6 === '::' ||
+    ipv6 === '::1' ||
+    ipv6.startsWith('fc') ||
+    ipv6.startsWith('fd') ||
+    ipv6.startsWith('fe8') ||
+    ipv6.startsWith('fe9') ||
+    ipv6.startsWith('fea') ||
+    ipv6.startsWith('feb') ||
+    ipv6.startsWith('::ffff:127.') ||
+    ipv6.startsWith('::ffff:10.') ||
+    ipv6.startsWith('::ffff:192.168.') ||
+    ipv6.startsWith('::ffff:169.254.')
+  ) return true
+  return hostname === 'localhost' ||
+    hostname === 'localhost.localdomain' ||
+    hostname === 'metadata' ||
+    hostname === 'metadata.google.internal' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal') ||
+    hostname.endsWith('.intranet') ||
+    hostname.endsWith('.lan') ||
+    hostname.endsWith('.home')
+}
+
+function parseIpv4(value: string): [number, number, number, number] | undefined {
+  const parts = value.split('.')
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return undefined
+  const numbers = parts.map(Number)
+  if (numbers.some((part) => part > 255)) return undefined
+  return numbers as [number, number, number, number]
+}
+
 export class InMemoryPushNotificationStore implements PushNotificationStore {
   private readonly byTask = new Map<string, Map<string, PushNotificationConfig>>()
 
@@ -222,6 +299,10 @@ export async function deliverPushNotifications(args: {
   webhookSecret: string | undefined
   /** Inject for tests. Defaults to global `fetch`. */
   fetcher?: typeof fetch
+  /** Optional DNS-aware host policy for production deployments. */
+  urlValidator?: (url: URL) => boolean | Promise<boolean>
+  /** Require `urlValidator` before sending from a production gateway. */
+  requireUrlValidator?: boolean
   /** Optional callback so the gateway's observer can log delivery outcomes. */
   onDelivery?: (result: PushDeliveryResult) => void
 }): Promise<PushDeliveryResult[]> {
@@ -249,8 +330,14 @@ export async function deliverPushNotifications(args: {
     let result: PushDeliveryResult
     try {
       const url = new URL(config.url)
-      if (url.protocol !== 'https:' || url.username !== '' || url.password !== '') {
-        throw new Error('push notification URL must use https without credentials')
+      if (!validatePushNotificationUrl(config.url)) {
+        throw new Error('push notification URL is not a safe HTTPS destination')
+      }
+      if (args.requireUrlValidator && !args.urlValidator) {
+        throw new Error('push notification URL validation is not configured')
+      }
+      if (args.urlValidator && !await args.urlValidator(url)) {
+        throw new Error('push notification URL was rejected by host policy')
       }
       const res = await fetcher(config.url, {
         method: 'POST',

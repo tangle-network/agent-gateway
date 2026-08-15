@@ -15,6 +15,7 @@ import {
 } from '../src/payment-operations'
 import {
   MemoryPaymentRecoveryStore,
+  serializePaymentOperation,
   type PaymentRecoveryRecord,
 } from '../src/payment-recovery'
 import { recoverPayment, recoverPayments } from '../src/payment-recovery-worker'
@@ -967,6 +968,106 @@ describe('durable OpenAI recovery', () => {
     expect(usage).toHaveLength(2)
     expect(usage.every((event) => event.settlementBasis === 'quoted-ceiling')).toBe(true)
     expect(usage.every((event) => event.inputTokens === 0 && event.outputTokens === 0)).toBe(true)
+  })
+
+  it('reuses the exact quoted ceiling after attribution fails post-settlement', async () => {
+    const requiredAmount = 1234567890123456789n
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const settlements: PaymentSettlementInput[] = []
+    const operations = new MemoryPaymentOperations({
+      onSettle: async (_operation, input) => { settlements.push(input) },
+      onReclaim: async () => undefined,
+    })
+    let usageAttempts = 0
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({ async *streamPrompt() {} }),
+      recordUsage: async () => {
+        usageAttempts += 1
+        if (usageAttempts === 1) throw new Error('usage store unavailable')
+      },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: recoveryStore, retryDelayMs: 1 },
+    }
+    const executionBudget = {
+      maxInputTokens: 1,
+      maxOutputTokens: 1,
+      maxReasoningTokens: 0,
+      maxToolTokens: 0,
+      maxToolCalls: 0,
+      maxProviderCostUsd: 1,
+    }
+    const claimed = await operations.claimPayment(
+      {
+        commitment,
+        nonce: '600',
+        amount: requiredAmount.toString(),
+        expiry: String(Math.floor(Date.now() / 1000) + 600),
+      },
+      {
+        requestId: 'quoted-retry-request',
+        agentId: agent.id,
+        requiredAmount: 1n,
+        maxOutputTokens: 1,
+        executionBudget,
+      },
+    )
+    const executing = await operations.beginPaymentExecution(claimed)
+    const retained = await operations.retainPayment(executing, 'test recovery')
+    const recoveryId = retained.operationId
+    const now = Date.now()
+    await recoveryStore.createIfAbsent({
+      version: 1,
+      id: recoveryId,
+      revision: 0,
+      state: 'retained',
+      payment: {
+        kind: 'x402',
+        operationId: recoveryId,
+        operation: serializePaymentOperation(retained),
+      },
+      attribution: {
+        requestId: 'quoted-retry-request',
+        agentId: agent.id,
+        agentSlug: agent.slug,
+        consumerId: commitment,
+        paymentMethod: 'x402',
+        startMs: now,
+        pricePerTokenUsd: agent.pricePerTokenUsd,
+        platformFeePercent: agent.platformFeePercent,
+        requiredAmount: requiredAmount.toString(),
+        currencyDecimals: 18,
+        maxOutputTokens: 1,
+        executionBudget,
+      },
+      workStarted: true,
+      usageRecorded: false,
+      attempts: 0,
+      nextAttemptAt: now,
+      lease: undefined,
+      createdAt: now,
+      updatedAt: now,
+    })
+
+    await expect(recoverPayment(recoveryId, config, { force: true, now })).rejects.toThrow(
+      'usage store unavailable',
+    )
+    const settling = await recoveryStore.get(recoveryId)
+    expect(settling?.state).toBe('settling')
+    expect(settling?.settlementBasis).toBe('quoted-ceiling')
+    expect(settling?.usage).toBeUndefined()
+
+    const recovered = await recoverPayment(recoveryId, config, { force: true, now: now + 1 })
+    expect(recovered?.state).toBe('reconciled')
+    expect(settlements).toHaveLength(1)
+    expect(settlements[0]?.amount).toBe(requiredAmount)
   })
 })
 

@@ -1341,8 +1341,11 @@ export async function* dispatchSandboxStreamRich(
     yield { kind: 'usage', usage }
   } finally {
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
+    const pendingHeartbeat = heartbeatInFlight
+    if (pendingHeartbeat) await pendingHeartbeat
     signal?.removeEventListener('abort', forwardAbort)
     if (iterator) await closeSandboxIterator(iterator)
+    if (heartbeatError !== undefined && !signal?.aborted) throw heartbeatError
   }
 }
 
@@ -1532,15 +1535,23 @@ async function markRecoverySettling(
   if (!recovery || !authz.paymentRecoveryId) return
   const fenceId = requirePaymentRecoveryFence(authz)
   await updateOwnedPaymentRecovery(recovery.store, authz.paymentRecoveryId, fenceId, (record) => {
-    return {
+    const next: PaymentRecoveryRecord = {
       ...record,
       state: 'settling',
       payment: recoveryTarget(authz, record.payment),
       workStarted: true,
-      usage,
       settlementBasis,
       nextAttemptAt: Date.now(),
     }
+    // A quoted-ceiling settlement has no provider receipt. Keep the durable
+    // basis and original amount, then rebuild the synthetic accounting input
+    // on each retry instead of persisting a lossy floating-point surrogate.
+    if (settlementBasis !== 'quoted-ceiling' || record.usage !== undefined) {
+      next.usage = usage
+    } else {
+      delete next.usage
+    }
+    return next
   })
 }
 
