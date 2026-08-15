@@ -87,6 +87,16 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
   if (config.x402.paymentOperations && config.x402.paymentProtocolVersion === undefined) {
     throw new Error('createAgentGateway: paymentProtocolVersion must be explicit when durable payment operations are configured')
   }
+  if (
+    config.x402.authorizePayment &&
+    config.x402.paymentProtocolVersion !== 2 &&
+    !config.x402.demoMode
+  ) {
+    throw new Error(
+      'createAgentGateway: production x402 version 1 cannot use authorizePayment; ' +
+        'use paymentProtocolVersion: 2 with paymentOperations for durable payment ownership',
+    )
+  }
   if (config.x402.paymentProtocolVersion === 2 &&
       (!config.x402.paymentOperations || config.x402.paymentOperations.protocolVersion !== 2)) {
     throw new Error('createAgentGateway: payment protocol version 2 requires durable payment operations')

@@ -588,9 +588,16 @@ export async function claimPayment(
     }
     let operation: PaymentOperation | undefined
     if (config.x402.authorizePayment) {
+      if (config.x402.paymentProtocolVersion !== 2 && !config.x402.demoMode) {
+        throw new Error(
+          'production x402 version 1 cannot use authorizePayment; ' +
+            'use paymentProtocolVersion: 2 with paymentOperations',
+        )
+      }
       // Version 1 has no durable operation to release if another request wins
-      // the shared nonce while this callback is still running. Claim first so
-      // an external reserve or charge cannot happen for a losing request.
+      // the shared nonce while this callback is still running. This callback
+      // remains only for explicit demo-mode compatibility; production callers
+      // must use the durable version 2 operation lifecycle.
       const legacyClaimed = config.x402.paymentProtocolVersion !== 2 && authz.paymentNonceKey
         ? await claimPaymentNonce(state.nonceStore, authz.paymentNonceKey, authz.paymentPayload)
         : undefined

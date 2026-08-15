@@ -101,7 +101,7 @@ export interface X402Config {
   rpcUrl?: string
   /** Demo mode: skip signature verification (default: false). NEVER enable in production. */
   demoMode?: boolean
-  /** Protocol version for new durable payment operations. Version 1 remains supported for mixed deploys. */
+  /** Protocol version for new durable payment operations. Production version 1 is read-only. */
   paymentProtocolVersion?: 1 | 2
   /**
    * Production signature verification. This callback must not reserve, claim,
@@ -114,7 +114,9 @@ export interface X402Config {
   /**
    * Claim the verified payment after all request checks pass and immediately
    * before sandbox work starts. Version 2 returns durable operation ownership.
-   * A boolean return is the version 1 mixed-deploy compatibility path.
+   * A boolean return is the version 1 demo-only compatibility path.
+   * Production version 1 must omit this callback because it has no durable
+   * provider operation or recovery identity.
    */
   authorizePayment?: (
     payload: Record<string, unknown>,

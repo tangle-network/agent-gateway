@@ -298,6 +298,12 @@ export async function deliverPushNotifications(args: {
   task: Task
   store: PushNotificationStore
   webhookSecret: string | undefined
+  /** Atomically claim one terminal delivery before its external side effect. */
+  claimDelivery?: (
+    taskId: string,
+    configId: string,
+    terminalState: Task['status']['state'],
+  ) => Promise<boolean>
   /** Inject for tests. Defaults to global `fetch`. */
   fetcher?: typeof fetch
   /** Optional DNS-aware host policy for production deployments. */
@@ -320,6 +326,12 @@ export async function deliverPushNotifications(args: {
 
   const results: PushDeliveryResult[] = []
   for (const config of configs) {
+    if (
+      args.claimDelivery &&
+      !await args.claimDelivery(args.task.id, config.id, args.task.status.state)
+    ) {
+      continue
+    }
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (config.token) headers['X-A2A-Notification-Token'] = config.token
     if (signature) headers['X-A2A-Signature'] = signature

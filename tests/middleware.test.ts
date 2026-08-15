@@ -1117,6 +1117,7 @@ describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
       x402: {
         operatorAddress,
         chainId: 3799,
+        demoMode: true,
         verifySigner: async () => true,
         authorizePayment: async () => {
           paymentAuthorizations += 1
@@ -1145,6 +1146,7 @@ describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
       x402: {
         operatorAddress,
         chainId: 3799,
+        demoMode: true,
         verifySigner: async () => true,
         authorizePayment: async () => {
           paymentAuthorizations += 1

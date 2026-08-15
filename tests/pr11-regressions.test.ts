@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
+import { InMemoryPushNotificationStore } from '../src/a2a/push-notifications'
 import { createAgentGateway } from '../src/middleware'
 import { dispatchSandboxStreamRich, requiredX402Amount } from '../src/dispatch'
 import { MemoryNonceStore, claimStoredNonce, type NonceStore } from '../src/nonce-store'
@@ -34,14 +35,14 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-function paymentHeader(nonce: string): string {
+function paymentHeader(nonce: string, expiry = Math.floor(Date.now() / 1000) + 600): string {
   return JSON.stringify({
     commitment,
     signature: '0xsig',
     operator: operatorAddress,
     amount: '1000000000',
     nonce,
-    expiry: String(Math.floor(Date.now() / 1000) + 600),
+    expiry: String(expiry),
   })
 }
 
@@ -88,6 +89,182 @@ function durableConfig(
 }
 
 describe('PR #11 production regressions', () => {
+  it('claims one terminal webhook when cancellation races settlement on two workers', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const pushStore = new InMemoryPushNotificationStore()
+    const nonceStore = new MemoryNonceStore()
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    let settlements = 0
+    const operations = new MemoryPaymentOperations({
+      onSettle: async () => { settlements += 1 },
+      onReclaim: async () => undefined,
+    })
+    let sandboxEntered!: () => void
+    const sandboxReady = new Promise<void>((resolve) => { sandboxEntered = resolve })
+    let releaseSandbox!: () => void
+    const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+    let deliveries = 0
+    const receivedTaskIds: string[] = []
+    const webhook = new Hono()
+    webhook.post('/terminal', async (context) => {
+      deliveries += 1
+      const body = await context.req.json() as { taskId?: string }
+      if (body.taskId) receivedTaskIds.push(body.taskId)
+      return context.text('ok')
+    })
+    const pushFetcher = async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => webhook.fetch(new Request('https://receiver.local/terminal', init))
+
+    const config = (sandbox: GatewayConfig['getSandbox']): GatewayConfig => ({
+      resolveAgent: async () => agent,
+      getSandbox: sandbox,
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore,
+      paymentRecovery: { store: recoveryStore },
+      a2a: {
+        taskStore,
+        pushStore,
+        pushFetcher: pushFetcher as typeof fetch,
+        authorizeTaskAccess: async () => true,
+      },
+    })
+
+    const runner = new Hono()
+    runner.route('/v1/agents', createAgentGateway(config(async () => ({
+      async *streamPrompt() {
+        sandboxEntered()
+        yield { type: 'sandbox.usage', data: { usage: usage() } }
+        await sandboxReleased
+      },
+    }))))
+    const canceler = new Hono()
+    canceler.route('/v1/agents', createAgentGateway(config(async () => ({
+      async *streamPrompt() {
+        throw new Error('canceler must not execute the sandbox')
+      },
+    }))))
+
+    const running = runner.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9011'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: 'pr11-push-race',
+            contextId: 'pr11-push-context',
+            messageId: 'pr11-push-message',
+            parts: [{ kind: 'text', text: 'run' }],
+          },
+        },
+      }),
+    })
+    await sandboxReady
+    await pushStore.set('pr11-push-race', { id: 'terminal', url: 'https://hook.example/terminal' })
+
+    const cancel = await canceler.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/cancel',
+        params: { id: 'pr11-push-race' },
+      }),
+    })
+    expect(cancel.status).toBe(200)
+    expect((await cancel.json() as { result?: { status?: { state?: string } } })
+      .result?.status?.state).toBe('canceled')
+
+    releaseSandbox()
+    const runnerResponse = await running
+    expect(runnerResponse.status).toBe(200)
+    expect((await runnerResponse.json() as { result?: { status?: { state?: string } } })
+      .result?.status?.state).toBe('canceled')
+    expect(settlements).toBe(1)
+    expect(deliveries).toBe(1)
+    expect(receivedTaskIds).toEqual(['pr11-push-race'])
+    expect((await taskStore.get('pr11-push-race'))?.status.state).toBe('canceled')
+  })
+
+  it('rejects production v1 authorization callbacks without durable recovery', () => {
+    expect(() => createAgentGateway(durableConfig({
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 1,
+        authorizePayment: async () => true,
+      },
+    }))).toThrow(/production x402 version 1 cannot use authorizePayment/)
+  })
+
+  it('recovers a timed-out v2 reserve by operation id without consuming the nonce', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-15T12:00:00.000Z'))
+    let providerReservations = 0
+    let providerRecoveries = 0
+    const operations = new MemoryPaymentOperations({
+      onClaim: async () => {
+        providerReservations += 1
+        throw new Error('provider timeout after reserve')
+      },
+      onReclaim: async () => { providerRecoveries += 1 },
+    })
+    const nonceStore = new MemoryNonceStore()
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const config = durableConfig({
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore,
+      paymentRecovery: { store: recoveryStore, retryDelayMs: 1 },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const response = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9012', Math.floor(Date.now() / 1000) + 1),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'reserve' }] }),
+    })
+    await response.text()
+
+    const operationId = `x402:${commitment}:9012`
+    expect(response.status).toBe(402)
+    expect(providerReservations).toBe(1)
+    expect(operations.get(operationId)?.state).toBe('claiming')
+    expect(await nonceStore.hasSeen(`${commitment}:9012`)).toBe(false)
+
+    vi.advanceTimersByTime(2_000)
+    const recovered = await recoverPayment(operationId, config, { force: true })
+    expect(recovered?.state).toBe('reconciled')
+    expect(operations.get(operationId)?.state).toBe('reclaimed')
+    expect(providerRecoveries).toBe(1)
+  })
+
   it('does not mark payment execution before sandbox acquisition succeeds', async () => {
     const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
     let sandboxReady = false

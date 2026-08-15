@@ -249,7 +249,11 @@ async function verify(req: Request, secret: string): Promise<boolean> {
 
 ### Delivery semantics
 
-- **Fire-once.** No retries. If a webhook returns non-2xx or the request fails, the gateway logs and moves on. The consumer's webhook handler SHOULD idempotently re-fetch state via `tasks/get` rather than rely on at-least-once delivery.
+- **Fire-once.** The gateway claims each terminal `(task, config)` delivery with the durable task store before it sends the webhook.
+  Concurrent workers therefore produce at most one attempt for that terminal state.
+  There are no retries after a failed attempt.
+  If a webhook returns non-2xx or the request fails, the gateway logs and moves on.
+  The consumer's webhook handler SHOULD idempotently re-fetch state via `tasks/get` rather than rely on at-least-once delivery.
 - **No partial-state deliveries.** Only terminal transitions fire push. `input-required` is NOT terminal — it's a pause, not an end.
 - **Fire even on cancel + fail.** Consumers want to know the task ended for any reason, not just success.
 

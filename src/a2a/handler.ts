@@ -118,6 +118,11 @@ interface TaskPaymentRecoveryMarker {
   id: string
 }
 
+interface TaskPushDeliveryClaims {
+  version: 1
+  claims: Record<string, Task['status']['state']>
+}
+
 interface TaskOriginBinding {
   version: 1
   agentId: string
@@ -1564,6 +1569,7 @@ const FINALIZING_METADATA_KEY = 'gatewayFinalizing'
 const PAYMENT_RELEASE_METADATA_KEY = 'gatewayPaymentRelease'
 const PAYMENT_RECOVERY_METADATA_KEY = 'gatewayPaymentRecovery'
 const EXECUTION_RECOVERY_METADATA_KEY = 'gatewayExecutionRecovery'
+const PUSH_DELIVERY_METADATA_KEY = 'gatewayPushDelivery'
 const FINALIZATION_LEASE_MS = 5 * 60 * 1000
 const PAYMENT_RELEASE_LEASE_MS = 5 * 60 * 1000
 
@@ -2572,13 +2578,20 @@ async function readJsonBody(request: Request): Promise<unknown> {
 async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void> {
   if (!deps.pushStore || !TERMINAL_STATES.has(task.status.state)) return
   try {
+    const deliveryTask = clearPushDeliveryClaims(task)
     await deliverPushNotifications({
-      task,
+      task: deliveryTask,
       store: deps.pushStore,
       webhookSecret: deps.config.a2a?.webhookSecret,
       fetcher: deps.config.a2a?.pushFetcher,
       urlValidator: deps.config.a2a?.pushUrlValidator,
       requireUrlValidator: !deps.config.x402.demoMode,
+      claimDelivery: (taskId, configId, terminalState) => claimTaskPushDelivery(
+        deps.taskStore,
+        taskId,
+        configId,
+        terminalState,
+      ),
       onDelivery: (result) => {
         if (!result.ok) {
           deps.state.obs?.onStreamError?.(
@@ -2598,4 +2611,59 @@ async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void>
       `[agent-gateway] push delivery threw for task ${task.id}: ${err instanceof Error ? err.message : String(err)}`,
     )
   }
+}
+
+async function claimTaskPushDelivery(
+  taskStore: TaskStore,
+  taskId: string,
+  configId: string,
+  terminalState: Task['status']['state'],
+): Promise<boolean> {
+  if (!TERMINAL_STATES.has(terminalState)) return false
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const current = await taskStore.get(taskId)
+    if (!current || current.status.state !== terminalState) return false
+    const existing = readPushDeliveryClaims(current)
+    if (existing?.claims[configId] === terminalState) return false
+    const next: Task = {
+      ...current,
+      metadata: {
+        ...(current.metadata ?? {}),
+        [PUSH_DELIVERY_METADATA_KEY]: {
+          version: 1,
+          claims: {
+            ...(existing?.claims ?? {}),
+            [configId]: terminalState,
+          },
+        } satisfies TaskPushDeliveryClaims,
+      },
+    }
+    if (await compareAndSetTask(taskStore, current, next)) return true
+  }
+  throw new Error(`A2A push delivery claim changed too many times for task '${taskId}'`)
+}
+
+function readPushDeliveryClaims(task: Task): TaskPushDeliveryClaims | undefined {
+  const raw = task.metadata?.[PUSH_DELIVERY_METADATA_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const record = raw as Partial<TaskPushDeliveryClaims>
+  if (!record.claims || typeof record.claims !== 'object') return undefined
+  const claims = Object.fromEntries(
+    Object.entries(record.claims).filter(([, state]) =>
+      typeof state === 'string' && TERMINAL_STATES.has(state as Task['status']['state']),
+    ),
+  ) as Record<string, Task['status']['state']>
+  return record.version === 1 ? { version: 1, claims } : undefined
+}
+
+function clearPushDeliveryClaims(task: Task): Task {
+  if (!task.metadata || !(PUSH_DELIVERY_METADATA_KEY in task.metadata)) return task
+  const metadata = { ...task.metadata }
+  delete metadata[PUSH_DELIVERY_METADATA_KEY]
+  return Object.keys(metadata).length > 0
+    ? { ...task, metadata }
+    : (() => {
+        const { metadata: _metadata, ...withoutMetadata } = task
+        return withoutMetadata
+      })()
 }

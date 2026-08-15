@@ -46,9 +46,11 @@ app.route('/v1/agents', createAgentGateway({
 `x402.verifySigner` is required for production.
 Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
 Keep `verifySigner` free of side effects.
-Use `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
+Use version 2's `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
 For production version 2, set `x402.paymentProtocolVersion: 2`, provide `paymentOperations`, and return its operation from `authorizePayment`.
 Production version 2 also requires a durable `paymentRecovery.store`.
+Production version 1 is read-only and must not configure `authorizePayment`.
+Use version 2 whenever authorization can reserve, charge, or otherwise mutate external funds.
 Run `recoverPayments(config)` from a private scheduled worker.
 Every live request and worker uses a unique durable fence token.
 A stale request or worker cannot update a row after another worker takes its lease.
