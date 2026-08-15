@@ -104,6 +104,13 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
   if (config.x402.paymentProtocolVersion === 1 && config.x402.paymentOperations) {
     throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
   }
+  if (
+    config.a2a?.pushStore &&
+    !config.x402.demoMode &&
+    (!config.a2a.webhookSecret || config.a2a.webhookSecret.trim().length === 0)
+  ) {
+    throw new Error('createAgentGateway: production A2A push requires a webhookSecret')
+  }
   const mppMethod = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
   if (config.mpp?.authenticateCredential !== undefined &&
       typeof config.mpp.authenticateCredential !== 'function') {

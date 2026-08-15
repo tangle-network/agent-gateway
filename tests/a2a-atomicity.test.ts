@@ -98,11 +98,21 @@ class TwoWorkerCreateBarrier implements TaskStore {
   compareAndSet(expected: Task, next: Task): Promise<boolean> {
     return this.inner.compareAndSet(expected, next)
   }
+
+  compareAndSetExecution(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean> {
+    return this.inner.compareAndSetExecution(expected, next, requestId, now)
+  }
 }
 
 function atomicityConfig(
   taskStore: TaskStore,
   counters: { runs: number; records: number; settlements: number },
+  demoMode = false,
 ): GatewayConfig {
   const sandbox: SandboxBox = {
     async *streamPrompt() {
@@ -119,6 +129,7 @@ function atomicityConfig(
     x402: {
       operatorAddress,
       chainId: 1,
+      demoMode,
       paymentProtocolVersion: 1,
       verifySigner: async () => true,
     },
@@ -173,8 +184,8 @@ describe('A2A task atomicity and restart recovery', () => {
     const counters = { runs: 0, records: 0, settlements: 0 }
     const first = new Hono()
     const second = new Hono()
-    first.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters)))
-    second.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters)))
+    first.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters, true)))
+    second.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters, true)))
 
     const request = (app: Hono, nonce: string, text: string) => app.request(
       `/v1/agents/${agent.slug}`,

@@ -112,6 +112,7 @@ describe('A2A lifecycle recovery and ownership', () => {
         x402: {
           operatorAddress,
           chainId: 1,
+          demoMode: true,
           paymentProtocolVersion: 1,
           verifySigner: async () => true,
         },
@@ -198,6 +199,15 @@ describe('A2A lifecycle recovery and ownership', () => {
         return this.inner.compareAndSet(expected, next)
       }
 
+      compareAndSetExecution(
+        expected: Task,
+        next: Task,
+        requestId: string,
+        now: number,
+      ) {
+        return this.inner.compareAndSetExecution(expected, next, requestId, now)
+      }
+
       async delete(id: string) {
         return this.inner.delete(id)
       }
@@ -279,6 +289,9 @@ describe('A2A lifecycle recovery and ownership', () => {
       get(id: string) { return this.inner.get(id) }
       put(task: Task) { return this.inner.put(task) }
       compareAndSet(expected: Task, next: Task) { return this.inner.compareAndSet(expected, next) }
+      compareAndSetExecution(expected: Task, next: Task, requestId: string, now: number) {
+        return this.inner.compareAndSetExecution(expected, next, requestId, now)
+      }
       delete(id: string) { return this.inner.delete(id) }
 
       async createIfAbsent(task: Task) {

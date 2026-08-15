@@ -12,7 +12,7 @@ import { MemoryPaymentRecoveryStore, type PaymentRecoveryRecord } from '../src/p
 import { recoverPayment } from '../src/payment-recovery-worker'
 import { verifyMpp } from '../src/verify'
 import type { AgentMeta, GatewayConfig, SandboxStreamEvent } from '../src/types'
-import type { Task } from '../src/a2a/types'
+import { A2A_ERROR_CODES, type Task } from '../src/a2a/types'
 import type { MppConfig } from '../src/types'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
@@ -89,7 +89,7 @@ function durableConfig(
 }
 
 describe('PR #11 production regressions', () => {
-  it('claims one terminal webhook when cancellation races settlement on two workers', async () => {
+  it('claims one terminal webhook when cancellation races fenced settlement on two workers', async () => {
     const taskStore = new InMemoryTaskStore()
     const pushStore = new InMemoryPushNotificationStore()
     const nonceStore = new MemoryNonceStore()
@@ -189,18 +189,18 @@ describe('PR #11 production regressions', () => {
       }),
     })
     expect(cancel.status).toBe(200)
-    expect((await cancel.json() as { result?: { status?: { state?: string } } })
-      .result?.status?.state).toBe('canceled')
+    expect((await cancel.json() as { error?: { code?: number } }).error?.code)
+      .toBe(A2A_ERROR_CODES.TASK_NOT_CANCELABLE)
 
     releaseSandbox()
     const runnerResponse = await running
     expect(runnerResponse.status).toBe(200)
     expect((await runnerResponse.json() as { result?: { status?: { state?: string } } })
-      .result?.status?.state).toBe('canceled')
+      .result?.status?.state).toBe('completed')
     expect(settlements).toBe(1)
     expect(deliveries).toBe(1)
     expect(receivedTaskIds).toEqual(['pr11-push-race'])
-    expect((await taskStore.get('pr11-push-race'))?.status.state).toBe('canceled')
+    expect((await taskStore.get('pr11-push-race'))?.status.state).toBe('completed')
   })
 
   it('rejects production v1 authorization callbacks without durable recovery', () => {
@@ -263,6 +263,136 @@ describe('PR #11 production regressions', () => {
     expect(recovered?.state).toBe('reconciled')
     expect(operations.get(operationId)?.state).toBe('reclaimed')
     expect(providerRecoveries).toBe(1)
+  })
+
+  it('rejects production v1 settlement before nonce claim or provider mutation', async () => {
+    const nonceStore = new MemoryNonceStore()
+    let sandboxRuns = 0
+    let settlementCalls = 0
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
+      ...durableConfig({ nonceStore }),
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxRuns += 1
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      settlePayment: async () => {
+        settlementCalls += 1
+        throw new Error('provider acknowledgement lost')
+      },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 1,
+      },
+      paymentRecovery: undefined,
+    }))
+
+    const response = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9013'),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'must not run' }] }),
+    })
+
+    expect(response.status).toBe(402)
+    expect(await nonceStore.hasSeen(`${commitment}:9013`)).toBe(false)
+    expect(sandboxRuns).toBe(0)
+    expect(settlementCalls).toBe(0)
+  })
+
+  it('requires a webhook HMAC secret for production push delivery', () => {
+    expect(() => createAgentGateway(durableConfig({
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: false,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations({ onReclaim: async () => undefined }),
+      },
+      a2a: {
+        pushStore: new InMemoryPushNotificationStore(),
+        authorizeTaskAccess: async () => true,
+      },
+    }))).toThrow(/production A2A push requires a webhookSecret/)
+  })
+
+  it('does not send an unsigned webhook if a production secret disappears at runtime', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const pushStore = new InMemoryPushNotificationStore()
+    let sandboxStarted!: () => void
+    const sandboxReady = new Promise<void>((resolve) => { sandboxStarted = resolve })
+    let releaseSandbox!: () => void
+    const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+    let deliveries = 0
+    const config = durableConfig({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxStarted()
+          await sandboxReleased
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: false,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations({ onReclaim: async () => undefined }),
+      },
+      a2a: {
+        taskStore,
+        pushStore,
+        webhookSecret: 'runtime-secret',
+        pushFetcher: async () => {
+          deliveries += 1
+          return new Response('ok')
+        },
+        pushUrlValidator: async () => true,
+        authorizeTaskAccess: async () => true,
+      },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const request = app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9014'),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId: 'runtime-secret-task',
+            contextId: 'runtime-secret-context',
+            messageId: 'runtime-secret-message',
+            parts: [{ kind: 'text', text: 'run' }],
+          },
+        },
+      }),
+    })
+    await sandboxReady
+    await pushStore.set('runtime-secret-task', { id: 'cfg', url: 'https://hook.example/terminal' })
+    config.a2a!.webhookSecret = undefined
+    releaseSandbox()
+
+    const response = await request
+    expect(response.status).toBe(200)
+    expect((await response.json() as { result?: { status?: { state?: string } } })
+      .result?.status?.state).toBe('completed')
+    expect(deliveries).toBe(0)
   })
 
   it('does not mark payment execution before sandbox acquisition succeeds', async () => {
@@ -427,20 +557,41 @@ describe('PR #11 production regressions', () => {
     expect((await taskStore.get('pr11-cancel-race'))?.status.state).toBe('canceled')
   })
 
-  it('cancels an execution already fenced by another worker', async () => {
-    const taskStore = new InMemoryTaskStore()
-    let executionClaimed!: () => void
-    const executionReady = new Promise<void>((resolve) => { executionClaimed = resolve })
-    let releaseExecution!: () => void
-    const executionReleased = new Promise<void>((resolve) => { releaseExecution = resolve })
+  it('rejects cross-worker cancellation after the durable fence and before provider start', async () => {
+    const innerStore = new InMemoryTaskStore()
+    let fenceWritten!: () => void
+    const fenceReady = new Promise<void>((resolve) => { fenceWritten = resolve })
+    let releaseFence!: () => void
+    const fenceReleased = new Promise<void>((resolve) => { releaseFence = resolve })
+    let blocked = false
+    const taskStore: TaskStore = {
+      get: (id) => innerStore.get(id),
+      put: (task) => innerStore.put(task),
+      createIfAbsent: (task) => innerStore.createIfAbsent(task),
+      delete: (id) => innerStore.delete(id),
+      async compareAndSet(expected, next) {
+        const won = await innerStore.compareAndSet(expected, next)
+        if (won && !blocked && next.metadata?.gatewayExecution !== undefined) {
+          blocked = true
+          fenceWritten()
+          await fenceReleased
+        }
+        return won
+      },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
+    }
+    let providerStarted = false
+    let releaseProvider!: () => void
+    const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve })
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
           if (worker === 'runner') {
-            executionClaimed()
-            await executionReleased
+            providerStarted = true
+            await providerReleased
           }
           yield { type: 'sandbox.usage', data: { usage: usage() } }
         },
@@ -484,7 +635,7 @@ describe('PR #11 production regressions', () => {
         },
       }),
     })
-    await executionReady
+    await fenceReady
 
     const cancel = await canceler.request('/v1/agents/pr11', {
       method: 'POST',
@@ -496,14 +647,17 @@ describe('PR #11 production regressions', () => {
         params: { id: 'pr11-active-cancel-race' },
       }),
     })
-    const cancelBody = await cancel.json() as { result?: { status?: { state?: string } } }
+    const cancelBody = await cancel.json() as { error?: { code?: number } }
     expect(cancel.status).toBe(200)
-    expect(cancelBody.result?.status?.state).toBe('canceled')
+    expect(cancelBody.error?.code).toBe(A2A_ERROR_CODES.TASK_NOT_CANCELABLE)
+    expect(providerStarted).toBe(false)
+    expect((await taskStore.get('pr11-active-cancel-race'))?.status.state).toBe('working')
 
-    releaseExecution()
+    releaseFence()
+    releaseProvider()
     const runningResponse = await running
     const runningBody = await runningResponse.json() as { result?: { status?: { state?: string } } }
-    expect(runningBody.result?.status?.state).toBe('canceled')
+    expect(runningBody.result?.status?.state).toBe('completed')
     expect((await taskStore.get('pr11-active-cancel-race'))?.metadata?.gatewayExecution)
       .toBeUndefined()
   })
@@ -528,6 +682,8 @@ describe('PR #11 production regressions', () => {
         }
         return innerStore.compareAndSet(expected, next)
       },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(durableConfig({
@@ -578,7 +734,7 @@ describe('PR #11 production regressions', () => {
       .result?.status?.state).toBe('completed')
   })
 
-  it('retries cancellation after a heartbeat changes the task row', async () => {
+  it('rejects cancellation when a heartbeat wins the cancellation CAS race', async () => {
     const innerStore = new InMemoryTaskStore()
     let cancelAttempts = 0
     const taskStore: TaskStore = {
@@ -603,6 +759,8 @@ describe('PR #11 production regressions', () => {
         }
         return innerStore.compareAndSet(expected, next)
       },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
     await taskStore.put({
       kind: 'task',
@@ -611,11 +769,6 @@ describe('PR #11 production regressions', () => {
       status: { state: 'working', timestamp: new Date().toISOString() },
       metadata: {
         gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
-        gatewayExecution: {
-          version: 1,
-          requestId: 'heartbeat-owner',
-          lease: { id: 'heartbeat-owner', expiresAt: Date.now() + 60_000 },
-        },
       },
     })
     const app = new Hono()
@@ -636,9 +789,10 @@ describe('PR #11 production regressions', () => {
     const body = await response.json() as { result?: Task; error?: unknown }
 
     expect(response.status).toBe(200)
-    expect(body.error).toBeUndefined()
-    expect(body.result?.status.state).toBe('canceled')
-    expect(cancelAttempts).toBe(2)
+    expect((body.error as { code?: number } | undefined)?.code)
+      .toBe(A2A_ERROR_CODES.TASK_NOT_CANCELABLE)
+    expect(body.result).toBeUndefined()
+    expect(cancelAttempts).toBe(1)
   })
 
   it('quotes retained A2A history before charging a continuation', async () => {
@@ -1179,13 +1333,183 @@ describe('PR #11 production regressions', () => {
         get: async () => undefined,
         delete: async () => undefined,
       },
-      webhookSecret: undefined,
+      webhookSecret: 'test-webhook-secret',
       fetcher: fetcher as unknown as typeof fetch,
     })
 
     expect(results[0]).toMatchObject({ ok: false, status: 302 })
     expect(results[0]?.error).toContain('redirect')
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ redirect: 'manual' })
+  })
+
+  it('does not consume a rejected push claim and delivers on a valid retry', async () => {
+    const { deliverPushNotifications } = await import('../src/a2a/push-notifications')
+    const task: Task = {
+      kind: 'task',
+      id: 'push-validation-retry',
+      contextId: 'push-validation-context',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+    }
+    const pushStore = new InMemoryPushNotificationStore()
+    await pushStore.set(task.id, { id: 'retry', url: 'https://receiver.example/hook' })
+    const webhook = new Hono()
+    let deliveries = 0
+    webhook.post('/hook', async (context) => {
+      deliveries += 1
+      await context.req.json()
+      return context.text('ok')
+    })
+    const fetcher = async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => webhook.fetch(
+      input instanceof Request ? new Request(input, init) : new Request(input.toString(), init),
+    )
+    let policyAllows = false
+    let claims = 0
+
+    const deliver = () => deliverPushNotifications({
+      task,
+      store: pushStore,
+      webhookSecret: 'test-webhook-secret',
+      requireUrlValidator: true,
+      urlValidator: async () => policyAllows,
+      claimDelivery: async () => {
+        claims += 1
+        return true
+      },
+      fetcher,
+    })
+
+    const rejected = await deliver()
+    expect(rejected[0]).toMatchObject({ ok: false, error: 'push notification URL was rejected by host policy' })
+    expect(claims).toBe(0)
+    expect(deliveries).toBe(0)
+
+    policyAllows = true
+    const delivered = await deliver()
+    expect(delivered[0]).toMatchObject({ ok: true, status: 200 })
+    expect(claims).toBe(1)
+    expect(deliveries).toBe(1)
+  })
+
+  it('rejects unsigned direct push delivery before reading configs or fetching', async () => {
+    const { deliverPushNotifications } = await import('../src/a2a/push-notifications')
+    const list = vi.fn(async () => [{ id: 'unsigned', url: 'https://hook.example/terminal' }])
+    const fetcher = vi.fn(async () => new Response('unexpected', { status: 200 }))
+
+    await expect(deliverPushNotifications({
+      task: {
+        kind: 'task',
+        id: 'unsigned-task',
+        contextId: 'unsigned-context',
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+      },
+      store: {
+        list,
+        set: async () => undefined,
+        get: async () => undefined,
+        delete: async () => undefined,
+      },
+      webhookSecret: '   ',
+      fetcher: fetcher as unknown as typeof fetch,
+    })).rejects.toThrow('non-empty webhookSecret')
+
+    expect(list).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('closes a malformed execution marker through tasks/get and preserves payment recovery', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const task: Task = {
+      kind: 'task',
+      id: 'malformed-execution-get',
+      contextId: 'malformed-execution-context',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-a',
+          lease: { id: 'worker-a' },
+        },
+        gatewayPaymentRecovery: { version: 1, id: 'payment-recovery-get' },
+      },
+    }
+    await taskStore.put(task)
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tasks/get',
+        params: { id: task.id },
+      }),
+    })
+    const body = await response.json() as { result?: Task; error?: unknown }
+
+    expect(response.status).toBe(200)
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status.state).toBe('failed')
+    expect(body.result?.metadata?.gatewayExecution).toBeUndefined()
+    expect(body.result?.metadata?.gatewayExecutionRecovery).toMatchObject({
+      error: expect.stringContaining('malformed'),
+    })
+    expect(body.result?.metadata?.gatewayPaymentRecovery)
+      .toEqual({ version: 1, id: 'payment-recovery-get' })
+    expect((await taskStore.get(task.id))?.status.state).toBe('failed')
+  })
+
+  it('closes a malformed execution marker through tasks/resubscribe and emits final state', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const task: Task = {
+      kind: 'task',
+      id: 'malformed-execution-resubscribe',
+      contextId: 'malformed-execution-context',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewayExecution: { version: 1, requestId: 'worker-b', lease: null },
+        gatewayPaymentRecovery: { version: 1, id: 'payment-recovery-resubscribe' },
+      },
+    }
+    await taskStore.put(task)
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/resubscribe',
+        params: { id: task.id },
+      }),
+    })
+    const eventLine = (await response.text()).split('\n')
+      .find((line) => line.startsWith('data: '))
+    const event = eventLine
+      ? JSON.parse(eventLine.slice('data: '.length)) as { result?: {
+          final?: boolean
+          status?: Task['status']
+          taskId?: string
+        } }
+      : undefined
+
+    expect(response.status).toBe(200)
+    expect(event?.result?.taskId).toBe(task.id)
+    expect(event?.result?.status?.state).toBe('failed')
+    expect(event?.result?.final).toBe(true)
+    expect((await taskStore.get(task.id))?.metadata?.gatewayExecution).toBeUndefined()
+    expect((await taskStore.get(task.id))?.metadata?.gatewayPaymentRecovery)
+      .toEqual({ version: 1, id: 'payment-recovery-resubscribe' })
   })
 
   it('rejects direct private push destinations before fetch', async () => {
@@ -1204,7 +1528,7 @@ describe('PR #11 production regressions', () => {
         get: async () => undefined,
         delete: async () => undefined,
       },
-      webhookSecret: undefined,
+      webhookSecret: 'test-webhook-secret',
       fetcher: fetcher as unknown as typeof fetch,
     })
 
@@ -1237,7 +1561,7 @@ describe('PR #11 production regressions', () => {
           get: async () => undefined,
           delete: async () => undefined,
         },
-        webhookSecret: undefined,
+        webhookSecret: 'test-webhook-secret',
         fetcher: fetcher as unknown as typeof fetch,
       })
 

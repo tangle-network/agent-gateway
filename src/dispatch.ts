@@ -578,6 +578,7 @@ export async function claimPayment(
   state: GatewayState,
   hooks: PaymentClaimHooks = {},
 ): Promise<void> {
+  assertX402V1SettlementSafe(authz, config)
   if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
     const context = paymentAuthorizationContext(authz)
     if (config.x402.paymentProtocolVersion === 2) {
@@ -1433,6 +1434,7 @@ export async function settleAndRecord(
   obs: GatewayObserver | undefined,
   options: SettleAndRecordOptions = {},
 ): Promise<void> {
+  assertX402V1SettlementSafe(authz, config)
   const settlementBasis = options.settlementBasis ?? 'usage-receipt'
   await markRecoverySettling(authz, usage, settlementBasis, config)
   if (options.usageAlreadyRecorded) await markRecoveryUsageRecorded(authz, config)
@@ -1539,6 +1541,20 @@ export async function settleAndRecord(
     console.error(
       `[agent-gateway] completion observer failed for ${authz.requestId}:`,
       error instanceof Error ? error.message : String(error),
+    )
+  }
+}
+
+function assertX402V1SettlementSafe(authz: AuthorizedRequest, config: GatewayConfig): void {
+  if (
+    authz.paymentMethod === 'x402' &&
+    config.x402.paymentProtocolVersion !== 2 &&
+    !config.x402.demoMode &&
+    config.settlePayment
+  ) {
+    throw new Error(
+      'production x402 version 1 cannot use settlePayment; ' +
+        'use paymentProtocolVersion: 2 with paymentOperations',
     )
   }
 }

@@ -40,6 +40,7 @@
  *   await store.migrate()
  */
 
+import { inspectTaskExecution } from './execution-fence'
 import { hasPendingPaymentRecovery, type TaskStore } from './task-store'
 import type { Task } from './types'
 
@@ -97,7 +98,9 @@ const TASKS_TABLE_DDL = (table: string) => `
     context_id TEXT NOT NULL,
     state TEXT NOT NULL,
     payload TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    execution_request_id TEXT,
+    execution_lease_expires_at REAL
   )
 `
 const CTX_INDEX_DDL = (table: string) => `
@@ -126,13 +129,27 @@ export class SqlTaskStore implements TaskStore {
   private async readRow(id: string): Promise<{
     payload: string
     updatedAt: number
+    executionRequestId: string | null
+    executionLeaseExpiresAt: number | null
   } | undefined> {
-    const rows = await this.db.query<{ payload: string; updated_at: number }>(
-      `SELECT payload, updated_at FROM ${this.table} WHERE id = ?`,
+    const rows = await this.db.query<{
+      payload: string
+      updated_at: number
+      execution_request_id?: string | null
+      execution_lease_expires_at?: number | null
+    }>(
+      `SELECT payload, updated_at, execution_request_id, execution_lease_expires_at FROM ${this.table} WHERE id = ?`,
       [id],
     )
     const row = rows[0]
-    return row ? { payload: row.payload, updatedAt: row.updated_at } : undefined
+    return row
+      ? {
+          payload: row.payload,
+          updatedAt: row.updated_at,
+          executionRequestId: row.execution_request_id ?? null,
+          executionLeaseExpiresAt: row.execution_lease_expires_at ?? null,
+        }
+      : undefined
   }
 
   private isExpired(updatedAt: number, task: Task): boolean {
@@ -154,6 +171,17 @@ export class SqlTaskStore implements TaskStore {
   /** Idempotent. Call once at deploy. */
   async migrate(): Promise<void> {
     await this.db.exec(TASKS_TABLE_DDL(this.table))
+    for (const column of [
+      'execution_request_id TEXT',
+      'execution_lease_expires_at REAL',
+    ]) {
+      try {
+        await this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN ${column}`)
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
+        if (!message.includes('duplicate column') && !message.includes('already exists')) throw error
+      }
+    }
     await this.db.exec(CTX_INDEX_DDL(this.table))
   }
 
@@ -172,9 +200,19 @@ export class SqlTaskStore implements TaskStore {
 
   private async insert(task: Task): Promise<number> {
     const payload = JSON.stringify(task)
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(task)
     const result = await this.db.exec(
-      `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
-      [task.id, task.contextId, task.status.state, payload, Date.now()],
+      `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at, execution_request_id, execution_lease_expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        task.id,
+        task.contextId,
+        task.status.state,
+        payload,
+        Date.now(),
+        executionRequestId,
+        executionLeaseExpiresAt,
+      ],
     )
     return result.rowsAffected
   }
@@ -182,17 +220,38 @@ export class SqlTaskStore implements TaskStore {
   async put(task: Task): Promise<void> {
     const payload = JSON.stringify(task)
     const updatedAt = Date.now()
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(task)
     // Adapter-agnostic upsert: try update, fall back to insert if no row
     // existed. Avoids needing ON CONFLICT (postgres) vs INSERT OR REPLACE
     // (sqlite/libSQL) divergence at the SQL layer.
     const updated = await this.db.exec(
-      `UPDATE ${this.table} SET context_id = ?, state = ?, payload = ?, updated_at = ? WHERE id = ?`,
-      [task.contextId, task.status.state, payload, updatedAt, task.id],
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ?`,
+      [
+        task.contextId,
+        task.status.state,
+        payload,
+        updatedAt,
+        executionRequestId,
+        executionLeaseExpiresAt,
+        task.id,
+      ],
     )
     if (updated.rowsAffected === 0) {
       await this.db.exec(
-        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
-        [task.id, task.contextId, task.status.state, payload, updatedAt],
+        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at, execution_request_id, execution_lease_expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          task.id,
+          task.contextId,
+          task.status.state,
+          payload,
+          updatedAt,
+          executionRequestId,
+          executionLeaseExpiresAt,
+        ],
       )
     }
   }
@@ -223,9 +282,69 @@ export class SqlTaskStore implements TaskStore {
   async compareAndSet(expected: Task, next: Task): Promise<boolean> {
     const expectedPayload = JSON.stringify(expected)
     const payload = JSON.stringify(next)
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(next)
     const result = await this.db.exec(
-      `UPDATE ${this.table} SET context_id = ?, state = ?, payload = ?, updated_at = ? WHERE id = ? AND payload = ?`,
-      [next.contextId, next.status.state, payload, Date.now(), expected.id, expectedPayload],
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ? AND payload = ?`,
+      [
+        next.contextId,
+        next.status.state,
+        payload,
+        Date.now(),
+        executionRequestId,
+        executionLeaseExpiresAt,
+        expected.id,
+        expectedPayload,
+      ],
+    )
+    return result.rowsAffected === 1
+  }
+
+  async compareAndSetExecution(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean> {
+    const expectedMarker = inspectTaskExecution(expected)
+    const nextMarker = inspectTaskExecution(next)
+    if (
+      expectedMarker.state !== 'valid' ||
+      nextMarker.state !== 'valid' ||
+      expectedMarker.marker.requestId !== requestId ||
+      nextMarker.marker.requestId !== requestId ||
+      expectedMarker.marker.lease.expiresAt <= now ||
+      nextMarker.marker.lease.expiresAt <= now
+    ) return false
+    const expectedPayload = JSON.stringify(expected)
+    const payload = JSON.stringify(next)
+    const updatedAt = Date.now()
+    // Both NULL columns identify a legacy row whose payload still owns the fence.
+    const result = await this.db.exec(
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ?
+         AND payload = ?
+         AND state = 'working'
+         AND (
+           (execution_request_id = ? AND execution_lease_expires_at > ?)
+           OR (execution_request_id IS NULL AND execution_lease_expires_at IS NULL)
+         )`,
+      [
+        next.contextId,
+        next.status.state,
+        payload,
+        updatedAt,
+        nextMarker.marker.requestId,
+        nextMarker.marker.lease.expiresAt,
+        expected.id,
+        expectedPayload,
+        requestId,
+        now,
+      ],
     )
     return result.rowsAffected === 1
   }
@@ -258,4 +377,11 @@ export class SqlTaskStore implements TaskStore {
       )
       .map(({ task }) => task)
   }
+}
+
+function executionColumns(task: Task): [string | null, number | null] {
+  const inspection = inspectTaskExecution(task)
+  return inspection.state === 'valid'
+    ? [inspection.marker.requestId, inspection.marker.lease.expiresAt]
+    : [null, null]
 }

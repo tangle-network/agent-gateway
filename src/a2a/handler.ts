@@ -44,13 +44,19 @@ import { buildAgentCard } from './agent-card'
 import {
   claimTaskExecution,
   clearTaskExecution,
+  hasActiveTaskExecution,
   hasExpiredTaskExecution,
+  inspectTaskExecution,
+  hasMalformedTaskExecution,
   renewTaskExecution,
 } from './execution-fence'
 import { fail, ok, parseEnvelope } from './jsonrpc'
 import {
+  deliverDemoPushNotifications,
   deliverPushNotifications,
   validatePushNotificationUrl,
+  type PushNotificationDeliveryOptions,
+  type PushDeliveryResult,
   type PushNotificationStore,
   type TaskPushNotificationConfig,
 } from './push-notifications'
@@ -184,6 +190,11 @@ class CancelRegistry {
 
   isFinalizing(taskId: string): boolean {
     return this.finalizing.has(taskId)
+  }
+
+  has(taskId: string): boolean {
+    const controller = this.controllers.get(taskId)
+    return controller !== undefined && !controller.signal.aborted
   }
 
   cancel(taskId: string): boolean {
@@ -927,13 +938,16 @@ async function handleTasksCancel(
 
   if (
     isTaskFinalizing(task) ||
-    cancels.isFinalizing(task.id)
+    cancels.isFinalizing(task.id) ||
+    (hasActiveTaskExecution(task) && !cancels.has(task.id))
   ) {
     return c.json(
       fail(
         req.id,
         A2A_ERROR_CODES.TASK_NOT_CANCELABLE,
-        `task '${task.id}' is being finalized`,
+        hasActiveTaskExecution(task)
+          ? `task '${task.id}' has an active execution fence`
+          : `task '${task.id}' is being finalized`,
       ),
     )
   }
@@ -948,6 +962,11 @@ async function handleTasksCancel(
     if (isTaskFinalizing(candidate)) {
       return c.json(
         fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' is being finalized`),
+      )
+    }
+    if (hasActiveTaskExecution(candidate) && !cancels.has(candidate.id)) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' has an active execution fence`),
       )
     }
     const canceled = withStatus(candidate, 'canceled')
@@ -1861,12 +1880,15 @@ function clearPaymentRecoveryMarker(task: Task): Task {
 }
 
 function normalizeTaskStore(taskStore: TaskStore, allowUnsafeFallback: boolean): TaskStore {
-  if (typeof taskStore.createIfAbsent === 'function' && typeof taskStore.compareAndSet === 'function') {
+  const hasCreateIfAbsent = typeof taskStore.createIfAbsent === 'function'
+  const hasCompareAndSet = typeof taskStore.compareAndSet === 'function'
+  const hasCompareAndSetExecution = typeof taskStore.compareAndSetExecution === 'function'
+  if (hasCreateIfAbsent && hasCompareAndSet && hasCompareAndSetExecution) {
     return taskStore
   }
   if (!allowUnsafeFallback) {
     throw new Error(
-      'A2A production task store must implement createIfAbsent and compareAndSet',
+      'A2A production task store must implement createIfAbsent, compareAndSet, and compareAndSetExecution',
     )
   }
   return {
@@ -1874,13 +1896,34 @@ function normalizeTaskStore(taskStore: TaskStore, allowUnsafeFallback: boolean):
     put: (task) => taskStore.put(task),
     delete: (id) => taskStore.delete(id),
     async createIfAbsent(task) {
+      if (hasCreateIfAbsent) return taskStore.createIfAbsent!(task)
       if (await taskStore.get(task.id)) return false
       await taskStore.put(task)
       return true
     },
     async compareAndSet(expected, next) {
+      if (hasCompareAndSet) return taskStore.compareAndSet!(expected, next)
       const current = await taskStore.get(expected.id)
       if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return false
+      await taskStore.put(next)
+      return true
+    },
+    async compareAndSetExecution(expected, next, requestId, now) {
+      if (hasCompareAndSetExecution) {
+        return taskStore.compareAndSetExecution!(expected, next, requestId, now)
+      }
+      const current = await taskStore.get(expected.id)
+      const expectedMarker = inspectTaskExecution(current ?? expected)
+      const nextMarker = inspectTaskExecution(next)
+      if (
+        !current ||
+        JSON.stringify(current) !== JSON.stringify(expected) ||
+        expectedMarker.state !== 'valid' ||
+        nextMarker.state !== 'valid' ||
+        expectedMarker.marker.requestId !== requestId ||
+        nextMarker.marker.requestId !== requestId ||
+        expectedMarker.marker.lease.expiresAt <= now
+      ) return false
       await taskStore.put(next)
       return true
     },
@@ -2296,17 +2339,21 @@ async function recoverTaskIfNeeded(
 }
 
 async function recoverExpiredExecutionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
+  const malformed = hasMalformedTaskExecution(task)
   if (
     task.status.state !== 'working' ||
-    isTaskFinalizing(task) ||
-    !hasExpiredTaskExecution(task)
+    (isTaskFinalizing(task) && !malformed) ||
+    (!malformed && !hasExpiredTaskExecution(task))
   ) return task
+  const inspection = inspectTaskExecution(task)
   const failed: Task = {
     ...withStatus(task, 'failed'),
     metadata: {
       ...(clearTaskExecution(task).metadata ?? {}),
       [EXECUTION_RECOVERY_METADATA_KEY]: {
-        error: 'A2A execution lease expired before a task result was stored',
+        error: inspection.state === 'malformed'
+          ? `A2A execution marker was malformed: ${inspection.reason}`
+          : 'A2A execution lease expired before a task result was stored',
       },
     },
   }
@@ -2577,12 +2624,17 @@ async function readJsonBody(request: Request): Promise<unknown> {
  */
 async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void> {
   if (!deps.pushStore || !TERMINAL_STATES.has(task.status.state)) return
+  const webhookSecret = deps.config.a2a?.webhookSecret
+  const hasWebhookSecret = typeof webhookSecret === 'string' && webhookSecret.trim().length > 0
+  if (!deps.config.x402.demoMode && !hasWebhookSecret) {
+    console.error(`[agent-gateway] production A2A push requires a webhookSecret for task ${task.id}`)
+    return
+  }
   try {
     const deliveryTask = clearPushDeliveryClaims(task)
-    await deliverPushNotifications({
+    const deliveryArgs: Omit<PushNotificationDeliveryOptions, 'webhookSecret'> = {
       task: deliveryTask,
       store: deps.pushStore,
-      webhookSecret: deps.config.a2a?.webhookSecret,
       fetcher: deps.config.a2a?.pushFetcher,
       urlValidator: deps.config.a2a?.pushUrlValidator,
       requireUrlValidator: !deps.config.x402.demoMode,
@@ -2592,7 +2644,7 @@ async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void>
         configId,
         terminalState,
       ),
-      onDelivery: (result) => {
+      onDelivery: (result: PushDeliveryResult) => {
         if (!result.ok) {
           deps.state.obs?.onStreamError?.(
             { requestId: result.taskId, agentSlug: task.id, startMs: Date.now() },
@@ -2603,7 +2655,12 @@ async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void>
           )
         }
       },
-    })
+    }
+    if (hasWebhookSecret) {
+      await deliverPushNotifications({ ...deliveryArgs, webhookSecret })
+    } else {
+      await deliverDemoPushNotifications(deliveryArgs)
+    }
   } catch (err) {
     // Catastrophic failure of the push pipeline itself (e.g. the store threw).
     // Logged but never escalated — a busted webhook MUST NOT fail the agent.

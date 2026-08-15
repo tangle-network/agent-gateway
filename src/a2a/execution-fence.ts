@@ -7,11 +7,16 @@ export const TASK_EXECUTION_METADATA_KEY = 'gatewayExecution'
 const TASK_EXECUTION_VERSION = 1 as const
 const TASK_EXECUTION_LEASE_MS = 5 * 60 * 1000
 
-interface TaskExecutionMarker {
+export interface TaskExecutionMarker {
   version: typeof TASK_EXECUTION_VERSION
   requestId: string
   lease: { id: string; expiresAt: number }
 }
+
+export type TaskExecutionInspection =
+  | { state: 'absent' }
+  | { state: 'valid'; marker: TaskExecutionMarker }
+  | { state: 'malformed'; reason: string }
 
 export class TaskExecutionCanceledError extends Error {
   constructor(taskId: string) {
@@ -32,7 +37,11 @@ export async function claimTaskExecution(
     if (!current || current.status.state !== 'working') {
       throw new TaskExecutionCanceledError(task.id)
     }
-    const existing = readTaskExecution(current)
+    const inspection = inspectTaskExecution(current)
+    if (inspection.state === 'malformed') {
+      throw new Error(`A2A task '${task.id}' has a malformed execution marker`)
+    }
+    const existing = inspection.state === 'valid' ? inspection.marker : undefined
     if (existing && existing.lease.expiresAt > now) {
       if (existing.requestId === requestId) return current
       throw new Error(`A2A task '${task.id}' is already executing`)
@@ -48,21 +57,32 @@ export async function renewTaskExecution(
   store: TaskStore,
   taskId: string,
   requestId: string,
-  now = Date.now(),
+  now?: number,
 ): Promise<Task> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const current = await store.get(taskId)
-    const marker = current ? readTaskExecution(current) : undefined
+    const inspection = current ? inspectTaskExecution(current) : { state: 'absent' as const }
+    if (inspection.state === 'malformed') {
+      throw new Error(`A2A task '${taskId}' has a malformed execution marker`)
+    }
+    const marker = inspection.state === 'valid' ? inspection.marker : undefined
     if (!current || current.status.state !== 'working' || marker?.requestId !== requestId) {
       throw new TaskExecutionCanceledError(taskId)
     }
-    const next = withTaskExecution(current, requestId, now)
-    if (store.compareAndSet && await store.compareAndSet(current, next)) return next
+    const renewalNow = now ?? Date.now()
+    if (marker.lease.expiresAt <= renewalNow) {
+      throw new TaskExecutionCanceledError(taskId)
+    }
+    const next = withTaskExecution(current, requestId, renewalNow)
+    if (!store.compareAndSetExecution) {
+      throw new Error('A2A task store does not provide atomic execution renewal')
+    }
+    if (await store.compareAndSetExecution(current, next, requestId, renewalNow)) return next
   }
   throw new Error(`A2A task '${taskId}' changed too many times while execution was active`)
 }
 
-/** Cancellation is rejected only while a live execution fence is held. */
+/** Remote cancellation is rejected while a live execution fence is held. */
 export function hasActiveTaskExecution(task: Task, now = Date.now()): boolean {
   const marker = readTaskExecution(task)
   return marker !== undefined && marker.lease.expiresAt > now
@@ -72,6 +92,11 @@ export function hasActiveTaskExecution(task: Task, now = Date.now()): boolean {
 export function hasExpiredTaskExecution(task: Task, now = Date.now()): boolean {
   const marker = readTaskExecution(task)
   return marker !== undefined && !hasActiveTaskExecution(task, now)
+}
+
+/** A working task with an execution key that cannot be trusted. */
+export function hasMalformedTaskExecution(task: Task): boolean {
+  return inspectTaskExecution(task).state === 'malformed'
 }
 
 /** Remove the marker when the task reaches a terminal or paused state. */
@@ -102,8 +127,16 @@ function withTaskExecution(task: Task, requestId: string, now: number): Task {
 }
 
 function readTaskExecution(task: Task): TaskExecutionMarker | undefined {
+  const inspection = inspectTaskExecution(task)
+  return inspection.state === 'valid' ? inspection.marker : undefined
+}
+
+export function inspectTaskExecution(task: Task): TaskExecutionInspection {
   const raw = task.metadata?.[TASK_EXECUTION_METADATA_KEY]
-  if (!raw || typeof raw !== 'object') return undefined
+  if (raw === undefined) return { state: 'absent' }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { state: 'malformed', reason: 'marker must be an object' }
+  }
   const marker = raw as Partial<TaskExecutionMarker>
   if (
     marker.version !== TASK_EXECUTION_VERSION ||
@@ -114,6 +147,6 @@ function readTaskExecution(task: Task): TaskExecutionMarker | undefined {
     marker.lease.id.length === 0 ||
     typeof marker.lease.expiresAt !== 'number' ||
     !Number.isFinite(marker.lease.expiresAt)
-  ) return undefined
-  return marker as TaskExecutionMarker
+  ) return { state: 'malformed', reason: 'marker fields are invalid' }
+  return { state: 'valid', marker: marker as TaskExecutionMarker }
 }

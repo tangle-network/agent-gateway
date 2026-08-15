@@ -316,6 +316,7 @@ export interface GatewayConfig {
   /**
    * Settle a legacy payment after usage attribution is recorded.
    * Version 2 x402 operations use `x402.paymentOperations` instead.
+   * Production x402 version 1 rejects this callback before nonce claim.
    * For API keys, deduct from the spending limit.
    * Default: no-op in explicit demo mode.
    */
@@ -416,8 +417,8 @@ export interface GatewayConfig {
      * Shared HMAC secret used to sign webhook deliveries (`X-A2A-Signature:
      * sha256=<hex>`). The consumer's webhook verifies the body against this
      * secret to confirm the call originated from this gateway. Required when
-     * `pushStore` is set; without it, deliveries fire unsigned and a
-     * malicious party that knows the webhook URL can forge deliveries.
+     * `pushStore` is set in production. Explicit demo mode may omit it for
+     * local tests; production deliveries never run unsigned.
      */
     webhookSecret?: string
     /**

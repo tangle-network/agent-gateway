@@ -223,16 +223,14 @@ export class SqlPushNotificationStore implements PushNotificationStore {
 
   async set(taskId: string, config: PushNotificationConfig): Promise<void> {
     const auth = config.authentication ? JSON.stringify(config.authentication) : null
-    const updated = await this.db.exec(
-      `UPDATE ${this.table} SET url = ?, token = ?, authentication = ? WHERE task_id = ? AND config_id = ?`,
-      [config.url, config.token ?? null, auth, taskId, config.id],
+    await this.db.exec(
+      `INSERT INTO ${this.table} (task_id, config_id, url, token, authentication) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (task_id, config_id) DO UPDATE SET
+         url = excluded.url,
+         token = excluded.token,
+         authentication = excluded.authentication`,
+      [taskId, config.id, config.url, config.token ?? null, auth],
     )
-    if (updated.rowsAffected === 0) {
-      await this.db.exec(
-        `INSERT INTO ${this.table} (task_id, config_id, url, token, authentication) VALUES (?, ?, ?, ?, ?)`,
-        [taskId, config.id, config.url, config.token ?? null, auth],
-      )
-    }
   }
 
   async get(taskId: string, configId: string): Promise<PushNotificationConfig | undefined> {
@@ -285,19 +283,10 @@ export class SqlPushNotificationStore implements PushNotificationStore {
   }
 }
 
-/**
- * Send the webhook for each registered config on a task. Signs the body with
- * HMAC-SHA256 against `webhookSecret` so the consumer can verify authenticity.
- * Fire-and-forget per the design note above — the function awaits delivery
- * (so observability hooks see the result) but does not retry on failure.
- *
- * The caller decides *when* to deliver — typically on terminal-state
- * transitions emitted from `message/send` and `message/stream`.
- */
-export async function deliverPushNotifications(args: {
+interface PushDeliveryOptions {
   task: Task
   store: PushNotificationStore
-  webhookSecret: string | undefined
+  webhookSecret?: string
   /** Atomically claim one terminal delivery before its external side effect. */
   claimDelivery?: (
     taskId: string,
@@ -312,7 +301,39 @@ export async function deliverPushNotifications(args: {
   requireUrlValidator?: boolean
   /** Optional callback so the gateway's observer can log delivery outcomes. */
   onDelivery?: (result: PushDeliveryResult) => void
-}): Promise<PushDeliveryResult[]> {
+}
+
+export type PushNotificationDeliveryOptions = Omit<PushDeliveryOptions, 'webhookSecret'> & {
+  webhookSecret: string
+}
+
+/**
+ * Send signed webhooks for a terminal task.
+ *
+ * A non-empty HMAC secret is mandatory. This public production path cannot
+ * send an unsigned request.
+ */
+export async function deliverPushNotifications(
+  args: PushNotificationDeliveryOptions,
+): Promise<PushDeliveryResult[]> {
+  if (typeof args.webhookSecret !== 'string' || args.webhookSecret.trim().length === 0) {
+    throw new Error('deliverPushNotifications requires a non-empty webhookSecret')
+  }
+  return deliverPushNotificationsInternal(args)
+}
+
+/**
+ * Deliver unsigned webhooks only for explicit local demo mode.
+ *
+ * Production callers must use `deliverPushNotifications`.
+ */
+export async function deliverDemoPushNotifications(
+  args: Omit<PushNotificationDeliveryOptions, 'webhookSecret'>,
+): Promise<PushDeliveryResult[]> {
+  return deliverPushNotificationsInternal(args)
+}
+
+async function deliverPushNotificationsInternal(args: PushDeliveryOptions): Promise<PushDeliveryResult[]> {
   const fetcher = args.fetcher ?? fetch
   const configs = await args.store.list(args.task.id)
   const body = JSON.stringify({
@@ -326,6 +347,31 @@ export async function deliverPushNotifications(args: {
 
   const results: PushDeliveryResult[] = []
   for (const config of configs) {
+    // Validate before claiming so policy rejection remains retryable.
+    try {
+      const url = validatePushNotificationUrl(config.url)
+      if (!url) {
+        throw new Error('push notification URL is not a safe HTTPS destination')
+      }
+      if (args.requireUrlValidator && !args.urlValidator) {
+        throw new Error('push notification URL validation is not configured')
+      }
+      if (args.urlValidator && !await args.urlValidator(url)) {
+        throw new Error('push notification URL was rejected by host policy')
+      }
+    } catch (err) {
+      const result: PushDeliveryResult = {
+        taskId: args.task.id,
+        configId: config.id,
+        url: config.url,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      }
+      args.onDelivery?.(result)
+      results.push(result)
+      continue
+    }
+
     if (
       args.claimDelivery &&
       !await args.claimDelivery(args.task.id, config.id, args.task.status.state)
@@ -342,16 +388,6 @@ export async function deliverPushNotifications(args: {
 
     let result: PushDeliveryResult
     try {
-      const url = new URL(config.url)
-      if (!validatePushNotificationUrl(config.url)) {
-        throw new Error('push notification URL is not a safe HTTPS destination')
-      }
-      if (args.requireUrlValidator && !args.urlValidator) {
-        throw new Error('push notification URL validation is not configured')
-      }
-      if (args.urlValidator && !await args.urlValidator(url)) {
-        throw new Error('push notification URL was rejected by host policy')
-      }
       const res = await fetcher(config.url, {
         method: 'POST',
         headers,

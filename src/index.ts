@@ -131,10 +131,12 @@ export {
   SqlTaskStore,
 } from './a2a/task-store-sql'
 export {
+  deliverDemoPushNotifications,
   deliverPushNotifications,
   InMemoryPushNotificationStore,
   validatePushNotificationUrl,
   type PushDeliveryResult,
+  type PushNotificationDeliveryOptions,
   type PushNotificationAuthentication,
   type PushNotificationConfig,
   type PushNotificationStore,

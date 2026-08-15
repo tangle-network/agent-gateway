@@ -476,6 +476,8 @@ describe('A2A payment ownership races', () => {
         }
         return innerStore.compareAndSet(expected, next)
       },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
     let settlements = 0
     const operations = new MemoryPaymentOperations({
@@ -557,6 +559,8 @@ describe('A2A payment ownership races', () => {
         }
         return transitioned
       },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
     let sandboxDrained!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxDrained = resolve })
@@ -783,6 +787,8 @@ describe('A2A payment ownership races', () => {
         }
         return innerStore.compareAndSet(expected, next)
       },
+      compareAndSetExecution: (expected, next, requestId, now) =>
+        innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
     let settlementAttempts = 0
     let recoveryAttempts = 0

@@ -50,6 +50,7 @@ Use version 2's `authorizePayment` to reserve or claim funds after rate limits, 
 For production version 2, set `x402.paymentProtocolVersion: 2`, provide `paymentOperations`, and return its operation from `authorizePayment`.
 Production version 2 also requires a durable `paymentRecovery.store`.
 Production version 1 is read-only and must not configure `authorizePayment`.
+Production x402 version 1 also rejects the legacy `settlePayment` callback before it consumes a nonce.
 Use version 2 whenever authorization can reserve, charge, or otherwise mutate external funds.
 Run `recoverPayments(config)` from a private scheduled worker.
 Every live request and worker uses a unique durable fence token.
@@ -112,13 +113,17 @@ Wire protocol handlers only translate their request and response shapes.
 
 The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
 Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
-Custom production task stores must implement atomic `createIfAbsent` and `compareAndSet` methods.
+Custom production task stores must implement atomic `createIfAbsent`, `compareAndSet`, and `compareAndSetExecution` methods.
+`compareAndSetExecution` must reject a renewal when the stored owner lease has expired.
 Task stores must retain payment recovery metadata until reconciliation clears it.
 The short-lived `gatewaySubmission` marker is not a payment recovery record and may expire with its task.
 The bundled memory and SQL stores enforce this rule even after the normal task TTL.
 Push destinations must use HTTPS without URL credentials.
 Push delivery does not follow redirects.
 Production push delivery also requires `a2a.pushUrlValidator` to reject private DNS destinations.
+Production push delivery requires `a2a.webhookSecret` so every webhook has an HMAC signature.
+The exported `deliverPushNotifications` function also requires a non-empty secret.
+Use `deliverDemoPushNotifications` only for explicit local demo mode.
 Tasks created before this release have no recorded origin and fail closed; migrate them with a verified owner binding or let them expire.
 The payment claim keeps its submission lease until the atomic submitted-to-working transition.
 An expired execution lease fails the working task and preserves its payment recovery markers.

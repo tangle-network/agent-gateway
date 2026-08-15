@@ -15,7 +15,7 @@
  *          EIP-712 signer address and asserts it matches the commitment
  *   4. Gateway resolves the agent, rate-limits the consumer, filters for
  *      injection, gets a sandbox, streams the response, records usage,
- *      and fires settlePayment.
+ *      and settles through the durable version 2 payment operation.
  *   5. Consumer parses the SSE stream back to a string.
  *
  * Every step uses real code — real signatures (not fixtures), real Hono
@@ -41,6 +41,8 @@ import type {
 } from '../src/types'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
+import { MemoryPaymentOperations } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 
 // ----- Domain constants (mirror the Tangle ShieldedCredits contract shape) -----
 
@@ -184,6 +186,19 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
   const usage: GatewayUsageEvent[] = []
   const settlements: Array<{ payment: PaymentResult; cost: number }> = []
   let verifyCalls = 0
+  const paymentOperations = new MemoryPaymentOperations({
+    onSettle: async (operation, input) => {
+      settlements.push({
+        payment: {
+          method: 'x402',
+          consumerId: operation.authorizationId,
+          requestId: operation.acquiredByRequestId,
+        },
+        cost: input.totalCostUsd,
+      })
+    },
+    onReclaim: async () => undefined,
+  })
 
   const agent: AgentMeta = {
     id: 'agent_production',
@@ -202,17 +217,19 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => new ReplySandbox(chunks),
     recordUsage: async (evt) => { usage.push(evt) },
-    settlePayment: async (payment, cost) => { settlements.push({ payment, cost }) },
     x402: {
       operatorAddress: OPERATOR_ADDRESS,
       chainId: CHAIN_ID,
       creditsAddress: CREDITS_ADDRESS,
       demoMode: false, // PRODUCTION PATH — verifySigner is authoritative
+      paymentProtocolVersion: 2,
+      paymentOperations,
       verifySigner: async (payload) => {
         verifyCalls += 1
         return verifySignerOnChain(payload)
       },
     },
+    paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
     nonceStore: new MemoryNonceStore(),
     rateLimitStore: new MemoryRateLimitStore(),
   })
@@ -265,7 +282,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
 
   beforeEach(() => { harness = buildHarness() })
 
-  it('happy path: consumer signs → gateway verifies signer address → sandbox streams → settlement fires', async () => {
+  it('happy path: consumer signs → gateway verifies signer address → sandbox streams → durable settlement fires', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
       amount: FUNDED_REQUEST_AMOUNT,
@@ -304,7 +321,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     expect(harness.usage[0].ownerEarnedUsd).toBeCloseTo(harness.usage[0].totalCostUsd * 0.8, 10)
     expect(harness.usage[0].platformFeeUsd).toBeCloseTo(harness.usage[0].totalCostUsd * 0.2, 10)
 
-    // Settlement callback fired with the x402 method
+    // Durable settlement fired with the x402 method
     expect(harness.settlements).toHaveLength(1)
     expect(harness.settlements[0].payment.method).toBe('x402')
     expect(harness.settlements[0].cost).toBe(harness.usage[0].totalCostUsd)

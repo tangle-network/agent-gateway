@@ -6,6 +6,7 @@
  */
 
 import type { Task } from './types'
+import { inspectTaskExecution } from './execution-fence'
 
 export interface TaskStore {
   get(id: string): Promise<Task | undefined>
@@ -14,6 +15,13 @@ export interface TaskStore {
   createIfAbsent?(task: Task): Promise<boolean>
   /** Replace only when the stored task still equals `expected`. Required for production races. */
   compareAndSet?(expected: Task, next: Task): Promise<boolean>
+  /** Replace an execution marker only while its owner lease is still live. */
+  compareAndSetExecution?(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean>
   delete(id: string): Promise<void>
 }
 
@@ -58,6 +66,29 @@ export class InMemoryTaskStore implements TaskStore {
     this.gc()
     const entry = this.entries.get(expected.id)
     if (!entry || JSON.stringify(entry.task) !== JSON.stringify(expected)) return false
+    this.entries.set(expected.id, { task: clone(next), expiresAt: Date.now() + this.ttlMs })
+    return true
+  }
+
+  async compareAndSetExecution(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean> {
+    this.gc()
+    const entry = this.entries.get(expected.id)
+    if (!entry || JSON.stringify(entry.task) !== JSON.stringify(expected)) return false
+    const expectedMarker = inspectTaskExecution(expected)
+    const nextMarker = inspectTaskExecution(next)
+    if (
+      expectedMarker.state !== 'valid' ||
+      nextMarker.state !== 'valid' ||
+      expectedMarker.marker.requestId !== requestId ||
+      nextMarker.marker.requestId !== requestId ||
+      expectedMarker.marker.lease.expiresAt <= now ||
+      nextMarker.marker.lease.expiresAt <= now
+    ) return false
     this.entries.set(expected.id, { task: clone(next), expiresAt: Date.now() + this.ttlMs })
     return true
   }
