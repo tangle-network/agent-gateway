@@ -875,6 +875,105 @@ describe('A2A payment ownership races', () => {
     expect(recoveryCalls).toBe(1)
   })
 
+  it('recovers an ambiguous release after shared nonce ownership fails', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const nonceStore = {
+      hasSeen: async () => false,
+      claim: async () => false,
+    }
+    let sandboxStarted = false
+    let releaseCalls = 0
+    let recoveryCalls = 0
+    let failRecovery = true
+    const operations = new MemoryPaymentOperations({
+      onRelease: async () => {
+        releaseCalls += 1
+        throw new Error('release acknowledgement lost after refund')
+      },
+      onReclaim: async () => {
+        recoveryCalls += 1
+        if (failRecovery) {
+          failRecovery = false
+          throw new Error('release recovery acknowledgement also lost')
+        }
+      },
+    })
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        streamPrompt() {
+          sandboxStarted = true
+          return (async function* () {
+            yield { type: 'sandbox.usage', data: { usage: usage() } }
+          })()
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore,
+      a2a: { taskStore, authorizeTaskAccess: async () => true },
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+
+    const response = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('86') },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: message('run', 'task-nonce-release-recovery') },
+      }),
+    })
+    const body = await response.json() as { error?: { code?: number } }
+    expect(body.error?.code).toBe(-32603)
+    expect(sandboxStarted).toBe(false)
+    expect(operations.get(`x402:${commitment}:86`)?.state).toBe('releasing')
+    expect(releaseCalls).toBe(1)
+    expect(recoveryCalls).toBe(1)
+
+    const retained = await taskStore.get('task-nonce-release-recovery')
+    const marker = retained?.metadata?.gatewayPaymentRelease as {
+      lease: { id: string; expiresAt: number }
+      operationId: string
+    }
+    expect(retained?.status.state).toBe('failed')
+    expect(marker.operationId).toBe(`x402:${commitment}:86`)
+    await taskStore.put({
+      ...retained!,
+      metadata: {
+        ...retained!.metadata,
+        gatewayPaymentRelease: {
+          ...marker,
+          lease: { ...marker.lease, expiresAt: Date.now() - 1 },
+        },
+      },
+    })
+
+    const recovered = await app.request('/v1/agents/a2a-races', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/get',
+        params: { id: 'task-nonce-release-recovery' },
+      }),
+    })
+    expect(recovered.status).toBe(200)
+    expect((await taskStore.get('task-nonce-release-recovery'))?.metadata?.gatewayPaymentRelease)
+      .toBeUndefined()
+    expect(operations.get(`x402:${commitment}:86`)?.state).toBe('released')
+    expect(recoveryCalls).toBe(2)
+  })
+
   it('records usage once when an inserted acknowledgement is lost', async () => {
     const taskStore = new InMemoryTaskStore()
     const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })

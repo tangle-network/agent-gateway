@@ -556,6 +556,9 @@ export async function claimPayment(
       if (!authz.paymentOperationAcquired) {
         throw new Error('payment operation was already claimed')
       }
+      // Attach owned state before the shared nonce claim. If that claim fails,
+      // the caller can persist release recovery after an ambiguous refund.
+      authz.paymentOperation = operation
     }
     if (operation && authz.paymentNonceKey) {
       const claimed = await claimPaymentNonce(
@@ -576,7 +579,6 @@ export async function claimPayment(
         throw new Error('payment nonce was already consumed')
       }
     }
-    authz.paymentOperation = operation
   } else if (authz.paymentMethod === 'mpp') {
     if (!authz.paymentNonceKey) {
       throw new Error('MPP payment has no replay identity')
