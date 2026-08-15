@@ -94,6 +94,8 @@ export interface MemoryPaymentOperationsOptions {
 export class MemoryPaymentOperations implements PaymentOperations {
   readonly protocolVersion = PAYMENT_PROTOCOL_VERSION
   private readonly operations = new Map<string, PaymentOperation>()
+  private readonly claimFlights = new Map<string, Promise<PaymentOperation>>()
+  private readonly claimTokens = new Map<string, string>()
   private readonly settleFlights = new Map<string, Promise<PaymentOperation>>()
   private readonly releaseFlights = new Map<string, Promise<PaymentOperation>>()
   private readonly reclaimFlights = new Map<string, Promise<PaymentOperation>>()
@@ -141,16 +143,39 @@ export class MemoryPaymentOperations implements PaymentOperations {
     // The map write is synchronous. No second caller can observe a free nonce
     // between the uniqueness check and ownership write.
     this.operations.set(operationId, operation)
+    const claimToken = globalThis.crypto.randomUUID()
+    this.claimTokens.set(operationId, claimToken)
+    const claim = (async () => {
+      try {
+        await this.options.onClaim?.(operation)
+        if (this.claimTokens.get(operationId) !== claimToken) {
+          throw new Error('payment claim ownership was reclaimed')
+        }
+        const current = this.operations.get(operationId)
+        if (!current || current.state !== 'claiming') {
+          throw new Error('payment claim ownership was lost')
+        }
+        const claimed = { ...current, state: 'claimed' as const }
+        this.operations.set(operationId, claimed)
+        return claimed
+      } catch (error) {
+        // Keep the durable `claiming` row. The external authorization may have
+        // committed before its acknowledgement was lost, so expiry recovery
+        // must own the decision to reclaim it.
+        throw error
+      } finally {
+        if (this.claimTokens.get(operationId) === claimToken) {
+          this.claimTokens.delete(operationId)
+        }
+      }
+    })()
+    this.claimFlights.set(operationId, claim)
     try {
-      await this.options.onClaim?.(operation)
-      const claimed = { ...operation, state: 'claimed' as const }
-      this.operations.set(operationId, claimed)
-      return claimed
-    } catch (error) {
-      // Keep the durable `claiming` row. The external authorization may have
-      // committed before its acknowledgement was lost, so expiry recovery
-      // must own the decision to reclaim it.
-      throw error
+      return await claim
+    } finally {
+      if (this.claimFlights.get(operationId) === claim) {
+        this.claimFlights.delete(operationId)
+      }
     }
   }
 
@@ -301,6 +326,11 @@ export class MemoryPaymentOperations implements PaymentOperations {
     const flight = this.reclaimFlights.get(operationId)
     if (flight) return flight
     if (current.expiresAt > this.now()) throw new Error('payment operation has not expired')
+    if (current.state === 'claiming') {
+      // Invalidate the live claim before starting recovery. Its callback may
+      // still finish, but it can no longer promote the operation to claimed.
+      this.claimTokens.delete(operationId)
+    }
     const reclaimable = { ...current, state: 'reclaimable' as const }
     this.operations.set(operationId, reclaimable)
     const recovery = this.runReclaim(reclaimable, 'reclaimed')

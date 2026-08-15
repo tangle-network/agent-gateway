@@ -159,6 +159,37 @@ describe('version 2 payment operations', () => {
     expect(recoveredCalls).toBe(1)
   })
 
+  it('fences a delayed claim before expiry recovery can reclaim it', async () => {
+    let now = 100
+    let claimStarted!: () => void
+    let finishClaim!: () => void
+    const claimReady = new Promise<void>((resolve) => { claimStarted = resolve })
+    const claimFinished = new Promise<void>((resolve) => { finishClaim = resolve })
+    const events: string[] = []
+    const operations = new MemoryPaymentOperations({
+      now: () => now,
+      onClaim: async () => {
+        events.push('claim-start')
+        claimStarted()
+        await claimFinished
+        events.push('claim-finished')
+      },
+      onReclaim: async () => { events.push('reclaim') },
+    })
+    const operationId = 'x402:0x' + 'ab'.repeat(32) + ':23'
+    const claim = operations.claimPayment(payload('1000', '23', '200'), context())
+    await claimReady
+
+    now = 201
+    const reclaimed = await operations.reclaimPayment(operationId)
+    expect(reclaimed.state).toBe('reclaimed')
+    finishClaim()
+
+    await expect(claim).rejects.toThrow('payment claim ownership was reclaimed')
+    expect(operations.get(operationId)?.state).toBe('reclaimed')
+    expect(events).toEqual(['claim-start', 'reclaim', 'claim-finished'])
+  })
+
   it('does not refund active or retained work after authorization expiry', async () => {
     let now = 100
     const operations = new MemoryPaymentOperations({ now: () => now })

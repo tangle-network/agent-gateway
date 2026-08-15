@@ -564,10 +564,6 @@ export async function claimPayment(
       if (!result) throw new Error('payment authorization was rejected')
       if (typeof result !== 'boolean') {
         operation = result
-        // Retain the durable owner even if a later compatibility check fails.
-        // The caller can then release or reclaim the operation instead of
-        // losing its recovery handle.
-        authz.paymentOperation = operation
       }
       else if (config.x402.paymentProtocolVersion === 2) {
         throw new Error('version 2 payment authorization did not return an operation')
@@ -583,6 +579,13 @@ export async function claimPayment(
     }
     if (operation && operation.protocolVersion !== 2) {
       throw new Error('payment operation protocol version mismatch')
+    }
+    if (
+      operation &&
+      config.x402.paymentProtocolVersion === 2 &&
+      operation.operationId !== authz.paymentRecoveryId
+    ) {
+      throw new Error('x402 payment operation identity mismatch')
     }
     if (operation && !config.x402.paymentOperations) {
       throw new Error('durable payment operations are required to settle a claimed operation')
@@ -632,6 +635,9 @@ export async function claimPayment(
       }, hooks)
       const operation = await config.x402.paymentOperations.claimPayment(durablePayload, context)
       if (operation.protocolVersion !== 2) throw new Error('payment operation protocol version mismatch')
+      if (operation.operationId !== authz.paymentRecoveryId) {
+        throw new Error('x402 payment operation identity mismatch')
+      }
       if (operation.acquiredByRequestId !== context.requestId) {
         throw new Error('payment operation was already claimed')
       }
@@ -851,8 +857,9 @@ export async function releasePayment(
     await relinquishPaymentRecovery(authz, config, Date.now())
     return
   }
-  await markRecoveryReleasing(authz, config, reason)
+  let reconciled = false
   try {
+    await markRecoveryReleasing(authz, config, reason)
     if (ownsX402) {
       authz.paymentOperation = await config.x402.paymentOperations!.releasePayment(
         authz.paymentOperation!,
@@ -872,11 +879,18 @@ export async function releasePayment(
       )
       authz.mppChargeOperation = operation
     }
-  } catch (error) {
-    await relinquishPaymentRecovery(authz, config, Date.now())
-    throw error
+    await markRecoveryReconciled(authz, config)
+    reconciled = true
+  } finally {
+    if (!reconciled) {
+      try {
+        await relinquishPaymentRecovery(authz, config, Date.now())
+      } catch {
+        // Preserve the original provider or metadata error. A later worker
+        // retry still has the durable row when cleanup itself is unavailable.
+      }
+    }
   }
-  await markRecoveryReconciled(authz, config)
 }
 
 /** Mark a durable reservation active immediately before sandbox execution. */

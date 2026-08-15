@@ -8,8 +8,15 @@ import type {
   MppChargeOperation,
 } from '../src/mpp-payment'
 import { MemoryNonceStore } from '../src/nonce-store'
-import { MemoryPaymentOperations, type PaymentSettlementInput } from '../src/payment-operations'
-import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
+import {
+  MemoryPaymentOperations,
+  type PaymentOperation,
+  type PaymentSettlementInput,
+} from '../src/payment-operations'
+import {
+  MemoryPaymentRecoveryStore,
+  type PaymentRecoveryRecord,
+} from '../src/payment-recovery'
 import { recoverPayment, recoverPayments } from '../src/payment-recovery-worker'
 import type {
   AgentMeta,
@@ -80,6 +87,67 @@ function requestBody(message = 'run') {
   return JSON.stringify({ max_tokens: 4, messages: [{ role: 'user', content: message }] })
 }
 
+function pendingMppRecovery(
+  id: string,
+  now: number,
+  nextAttemptAt = now,
+): PaymentRecoveryRecord {
+  return {
+    version: 1,
+    id,
+    revision: 0,
+    state: 'claiming',
+    payment: { kind: 'mpp-charge', method: 'stripe', operationId: id },
+    attribution: {
+      requestId: `request-${id}`,
+      agentId: agent.id,
+      agentSlug: agent.slug,
+      consumerId: 'stripe:customer',
+      paymentMethod: 'mpp',
+      startMs: now,
+      pricePerTokenUsd: agent.pricePerTokenUsd,
+      platformFeePercent: agent.platformFeePercent,
+      requiredAmount: '1',
+      currencyDecimals: 6,
+      maxOutputTokens: 1,
+      executionBudget: {
+        maxInputTokens: 1,
+        maxOutputTokens: 1,
+        maxReasoningTokens: 0,
+        maxToolTokens: 0,
+        maxToolCalls: 0,
+        maxProviderCostUsd: 0.000001,
+      },
+    },
+    workStarted: false,
+    usageRecorded: false,
+    attempts: 0,
+    nextAttemptAt,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function mppRecoveryConfig(
+  store: MemoryPaymentRecoveryStore,
+  charge: MppChargeLifecycle,
+  timing: { leaseMs?: number; retryDelayMs?: number } = {},
+): GatewayConfig {
+  return {
+    resolveAgent: async () => agent,
+    getSandbox: async () => ({ async *streamPrompt() {} }),
+    recordUsage: async () => undefined,
+    x402: { operatorAddress, chainId: 1, demoMode: true },
+    mpp: {
+      realm: 'gateway.test',
+      method: 'stripe',
+      authenticateCredential: async () => ({ consumerId: 'unused', paymentIdentity: 'unused' }),
+      charge,
+    },
+    paymentRecovery: { store, ...timing },
+  }
+}
+
 class HostileChargeLifecycle implements MppChargeLifecycle {
   readonly protocolVersion = 1 as const
   readonly operations = new Map<string, MppChargeOperation>()
@@ -127,6 +195,21 @@ class HostileChargeLifecycle implements MppChargeLifecycle {
   async recoverPayment(operationId: string) {
     this.recovered += 1
     return this.operations.get(operationId) ?? { operationId, state: 'not-found' as const }
+  }
+}
+
+class FailOnceRecoveryStore extends MemoryPaymentRecoveryStore {
+  private failed = false
+
+  override async compareAndSet(
+    expected: PaymentRecoveryRecord,
+    next: PaymentRecoveryRecord,
+  ): Promise<boolean> {
+    if (!this.failed && next.state === 'releasing') {
+      this.failed = true
+      throw new Error('payment metadata unavailable')
+    }
+    return super.compareAndSet(expected, next)
   }
 }
 
@@ -268,6 +351,90 @@ describe('generic MPP charge lifecycle', () => {
     expect(lifecycle.confirmations).toBe(1)
     expect(lifecycle.refunds).toBe(1)
     expect(runs).toBe(0)
+  })
+
+  it('starts each batch lease from the time that row begins recovery', async () => {
+    vi.useFakeTimers()
+    const startedAt = new Date('2026-08-14T00:00:00.000Z').getTime()
+    vi.setSystemTime(startedAt)
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const leaseRemaining: number[] = []
+    const lifecycle: MppChargeLifecycle = {
+      protocolVersion: 1,
+      async confirmPayment() {
+        throw new Error('confirmation is not used during recovery')
+      },
+      async releasePayment(operation) {
+        return operation
+      },
+      async recoverPayment(operationId) {
+        if (operationId === 'slow') vi.setSystemTime(startedAt + 11)
+        if (operationId === 'next') {
+          const current = await recoveryStore.get(operationId)
+          leaseRemaining.push((current?.lease?.expiresAt ?? 0) - Date.now())
+        }
+        return { operationId, state: 'not-found' }
+      },
+    }
+    const config = mppRecoveryConfig(recoveryStore, lifecycle, { leaseMs: 10 })
+    await recoveryStore.createIfAbsent(pendingMppRecovery('slow', startedAt, startedAt - 2))
+    await recoveryStore.createIfAbsent(pendingMppRecovery('next', startedAt, startedAt - 1))
+
+    expect(await recoverPayments(config)).toMatchObject({ scanned: 2, reconciled: 2 })
+    expect(leaseRemaining).toEqual([10])
+  })
+
+  it('starts the retry delay after a failed provider recovery call', async () => {
+    vi.useFakeTimers()
+    const startedAt = new Date('2026-08-14T00:00:00.000Z').getTime()
+    vi.setSystemTime(startedAt)
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const lifecycle: MppChargeLifecycle = {
+      protocolVersion: 1,
+      async confirmPayment() {
+        throw new Error('confirmation is not used during recovery')
+      },
+      async releasePayment(operation) {
+        return operation
+      },
+      async recoverPayment() {
+        vi.setSystemTime(startedAt + 11)
+        throw new Error('provider unavailable')
+      },
+    }
+    const config = mppRecoveryConfig(recoveryStore, lifecycle, { retryDelayMs: 10 })
+    await recoveryStore.createIfAbsent(pendingMppRecovery('failed', startedAt))
+
+    await expect(recoverPayment('failed', config)).rejects.toThrow('provider unavailable')
+    expect((await recoveryStore.get('failed'))?.nextAttemptAt).toBe(startedAt + 21)
+  })
+
+  it('uses a fresh row clock after a supplied batch scan time', async () => {
+    const suppliedNow = 1_000
+    let current = suppliedNow
+    const clock = () => current
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    const lifecycle: MppChargeLifecycle = {
+      protocolVersion: 1,
+      async confirmPayment() {
+        throw new Error('confirmation is not used during recovery')
+      },
+      async releasePayment(operation) {
+        return operation
+      },
+      async recoverPayment() {
+        current += 11
+        throw new Error('provider unavailable')
+      },
+    }
+    const config = mppRecoveryConfig(recoveryStore, lifecycle, { retryDelayMs: 10 })
+    await recoveryStore.createIfAbsent(pendingMppRecovery('supplied-now', suppliedNow))
+
+    await expect(recoverPayments(config, { now: suppliedNow, clock })).resolves.toMatchObject({
+      scanned: 1,
+      failed: 1,
+    })
+    expect((await recoveryStore.get('supplied-now'))?.nextAttemptAt).toBe(1_021)
   })
 
   it('fences a live request when recovery releases its expired claim lease', async () => {
@@ -487,6 +654,95 @@ describe('generic MPP charge lifecycle', () => {
 })
 
 describe('durable OpenAI recovery', () => {
+  it('rejects a v2 adapter operation with a mismatched identity and clears its claim lease', async () => {
+    const recoveryStore = new MemoryPaymentRecoveryStore()
+    let sandboxCalls = 0
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxCalls += 1
+        },
+      }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations(),
+        authorizePayment: async (_payload, context): Promise<PaymentOperation> => ({
+          protocolVersion: 2,
+          operationId: 'adapter-operation-id',
+          acquiredByRequestId: context.requestId,
+          nonceKey: 'adapter-nonce',
+          authorizationId: 'adapter-authorization',
+          reservedAmount: 1_000_000_000n,
+          settledAmount: 0n,
+          refundAmount: 1_000_000_000n,
+          expiresAt: Math.floor(Date.now() / 1000) + 600,
+          state: 'claimed',
+        }),
+      },
+      nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: recoveryStore },
+    }
+    const app = mount(config)
+    const response = await app.request('/v1/agents/recovery/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': spendAuth('906') },
+      body: requestBody(),
+    })
+    await response.text()
+
+    const record = await recoveryStore.get(`x402:${commitment}:906`)
+    expect(response.status).toBe(402)
+    expect(record?.state).toBe('claiming')
+    expect(record?.lease).toBeUndefined()
+    expect(record?.payment.operationId).toBe(`x402:${commitment}:906`)
+    expect(sandboxCalls).toBe(0)
+  })
+
+  it('clears the active recovery lease when release metadata fails', async () => {
+    const recoveryStore = new FailOnceRecoveryStore()
+    const operationId = `x402:${commitment}:907`
+    class FailingExecutionOperations extends MemoryPaymentOperations {
+      override async beginPaymentExecution(_operation: PaymentOperation): Promise<PaymentOperation> {
+        throw new Error('execution unavailable')
+      }
+    }
+    const operations = new FailingExecutionOperations()
+    const config: GatewayConfig = {
+      resolveAgent: async () => agent,
+      getSandbox: async () => ({ async *streamPrompt() {} }),
+      recordUsage: async () => undefined,
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+      nonceStore: new MemoryNonceStore(),
+      paymentRecovery: { store: recoveryStore },
+    }
+    const app = mount(config)
+    const response = await app.request('/v1/agents/recovery/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': spendAuth('907'),
+      },
+      body: requestBody(),
+    })
+    await response.text()
+
+    const pending = await recoveryStore.get(operationId)
+    expect(pending?.state).toBe('executing')
+    expect(pending?.lease).toBeUndefined()
+    expect(operations.get(operationId)?.state).toBe('claimed')
+  })
+
   it('persists operation and attribution before output, then heals settlement acknowledgement loss', async () => {
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let settleCalls = 0

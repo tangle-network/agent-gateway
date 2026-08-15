@@ -15,6 +15,8 @@ import type { AgentMeta, GatewayConfig, SandboxUsageReceipt } from './types'
 
 interface RecoveryWorkerOptions {
   now?: number
+  /** Fresh wall-clock source for each row's lease and retry timestamps. */
+  clock?: () => number
   workerId?: string
 }
 
@@ -44,18 +46,18 @@ export async function recoverPayments(
 ): Promise<PaymentRecoveryRun> {
   const recovery = config.paymentRecovery
   if (!recovery) throw new Error('durable payment recovery is not configured')
-  const now = options.now ?? Date.now()
+  const scanNow = options.now ?? recoveryNow(options)
   const limit = options.limit ?? 100
   if (!Number.isSafeInteger(limit) || limit <= 0) {
     throw new Error('payment recovery limit must be a positive safe integer')
   }
-  const due = await recovery.store.listDue(now, limit)
+  const due = await recovery.store.listDue(scanNow, limit)
   const run: PaymentRecoveryRun = { scanned: due.length, reconciled: 0, deferred: 0, failed: 0 }
   for (const candidate of due) {
     try {
       const result = await recoverPayment(candidate.id, config, {
-        now,
         force: false,
+        ...(options.clock ? { clock: options.clock } : {}),
         ...(options.workerId ? { workerId: options.workerId } : {}),
       })
       if (result?.state === 'reconciled') run.reconciled += 1
@@ -75,10 +77,11 @@ export async function recoverPayment(
 ): Promise<PaymentRecoveryRecord | undefined> {
   const recovery = config.paymentRecovery
   if (!recovery) throw new Error('durable payment recovery is not configured')
-  const now = options.now ?? Date.now()
+  const scanNow = options.now ?? recoveryNow(options)
   const current = await recovery.store.get(recoveryId)
   if (!current || current.state === 'reconciled') return current
-  if (!options.force && current.nextAttemptAt > now) return current
+  if (!options.force && current.nextAttemptAt > scanNow) return current
+  const now = recoveryNow(options)
 
   const leased = await acquireLease(
     current.id,
@@ -96,20 +99,25 @@ export async function recoverPayment(
     await reconcileLeased(ready, config, now)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    const failedAt = recoveryNow(options)
     try {
       await updateOwnedPaymentRecovery(recovery.store, recoveryId, fenceId, (record) => ({
         ...record,
         attempts: record.attempts + 1,
         lastError: message,
         lease: undefined,
-        nextAttemptAt: now + recoveryTiming(recovery).retryDelayMs,
-      }), now)
+        nextAttemptAt: failedAt + recoveryTiming(recovery).retryDelayMs,
+      }), failedAt)
     } catch (updateError) {
       if (!(updateError instanceof PaymentRecoveryFenceError)) throw updateError
     }
     throw error
   }
   return recovery.store.get(recoveryId)
+}
+
+function recoveryNow(options: RecoveryWorkerOptions): number {
+  return options.clock?.() ?? Date.now()
 }
 
 async function reconcileLeased(
