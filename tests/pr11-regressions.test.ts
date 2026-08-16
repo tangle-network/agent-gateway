@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
 import { InMemoryPushNotificationStore } from '../src/a2a/push-notifications'
+import { recoverPaymentReleaseIfNeeded } from '../src/a2a/payment-recovery'
 import { createAgentGateway } from '../src/middleware'
 import { dispatchSandboxStreamRich, requiredX402Amount } from '../src/dispatch'
 import { MemoryNonceStore, claimStoredNonce, type NonceStore } from '../src/nonce-store'
@@ -1510,6 +1511,43 @@ describe('PR #11 production regressions', () => {
     expect((await taskStore.get(task.id))?.metadata?.gatewayExecution).toBeUndefined()
     expect((await taskStore.get(task.id))?.metadata?.gatewayPaymentRecovery)
       .toEqual({ version: 1, id: 'payment-recovery-resubscribe' })
+  })
+
+  it('clears the execution marker when malformed payment release metadata fails a task', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const task: Task = {
+      kind: 'task',
+      id: 'malformed-payment-release',
+      contextId: 'malformed-payment-release-context',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-a',
+          lease: { id: 'worker-a', expiresAt: Date.now() + 60_000 },
+        },
+        gatewayPaymentRelease: { version: 1 },
+      },
+    }
+    await taskStore.put(task)
+    const deliverPush = vi.fn(async () => undefined)
+
+    const recovered = await recoverPaymentReleaseIfNeeded(task, {
+      taskStore,
+      releasePayment: async () => undefined,
+      releasePaymentAfterFailure: async () => undefined,
+      recoverDurablePayment: async () => undefined,
+      deliverPush,
+    })
+
+    expect(recovered.status.state).toBe('failed')
+    expect(recovered.metadata?.gatewayExecution).toBeUndefined()
+    expect(recovered.metadata?.gatewayPaymentRelease).toBeUndefined()
+    expect(recovered.metadata?.gatewayPaymentReleaseRecovery).toMatchObject({
+      error: expect.stringContaining('record is missing'),
+    })
+    expect((await taskStore.get(task.id))?.metadata?.gatewayExecution).toBeUndefined()
+    expect(deliverPush).toHaveBeenCalledOnce()
   })
 
   it('rejects direct private push destinations before fetch', async () => {

@@ -415,11 +415,11 @@ async function expirePaymentRelease(
   error: Error,
 ): Promise<Task> {
   const cleanTask = clearPaymentReleaseRecord(task)
+  const terminalTask = withStatus(cleanTask, 'failed')
   const failed: Task = {
-    ...cleanTask,
-    status: { state: 'failed', timestamp: new Date().toISOString() },
+    ...terminalTask,
     metadata: {
-      ...(cleanTask.metadata ?? {}),
+      ...(terminalTask.metadata ?? {}),
       gatewayPaymentReleaseRecovery: { error: error.message },
     },
   }
