@@ -1,5 +1,7 @@
-import type { SandboxUsageReceipt } from './types'
-import type { PaymentSettlementBasis } from './payment-recovery'
+import type {
+  PaymentSettlementBasis,
+  SandboxUsageReceipt,
+} from './payment-types'
 
 /** Version negotiated by gateways that use durable payment operations. */
 export const PAYMENT_PROTOCOL_VERSION = 2 as const

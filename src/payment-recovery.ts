@@ -2,9 +2,12 @@ import type { MppChargeOperation } from './mpp-payment'
 import type { PaymentOperation } from './payment-operations'
 import type {
   PaymentMethod,
+  PaymentSettlementBasis,
   SandboxExecutionBudget,
   SandboxUsageReceipt,
-} from './types'
+} from './payment-types'
+
+export type { PaymentSettlementBasis } from './payment-types'
 
 export const PAYMENT_RECOVERY_VERSION = 1 as const
 
@@ -16,8 +19,6 @@ export type PaymentRecoveryState =
   | 'settling'
   | 'releasing'
   | 'reconciled'
-
-export type PaymentSettlementBasis = 'usage-receipt' | 'quoted-ceiling'
 
 export interface SerializedPaymentOperation {
   protocolVersion: 2

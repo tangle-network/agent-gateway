@@ -4,7 +4,21 @@ import type {
   PaymentOperations,
 } from './payment-operations'
 import type { MppAuthenticatedCredential, MppChargeLifecycle } from './mpp-payment'
-import type { PaymentRecoveryConfig, PaymentSettlementBasis } from './payment-recovery'
+import type { PaymentRecoveryConfig } from './payment-recovery'
+import type { GatewayObserver } from './observer-types'
+import type {
+  GatewayUsageEvent,
+  PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
+} from './payment-types'
+
+export type {
+  GatewayUsageEvent,
+  PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
+} from './payment-types'
 
 // --- Agent resolution ---
 
@@ -78,17 +92,6 @@ export interface AgentMeta {
 }
 
 // --- Payment ---
-
-export type PaymentMethod = 'x402' | 'mpp' | 'apikey' | 'none'
-
-export interface SandboxExecutionBudget {
-  maxInputTokens: number
-  maxOutputTokens: number
-  maxReasoningTokens: number
-  maxToolTokens: number
-  maxToolCalls: number
-  maxProviderCostUsd: number
-}
 
 export interface X402Config {
   /** Ethereum operator address for SpendAuth verification */
@@ -184,40 +187,6 @@ export interface ApiKeyInfo {
   dailyLimit?: number
 }
 
-// --- Usage tracking ---
-
-export interface GatewayUsageEvent {
-  /**
-   * Per-request id (matches `RequestContext.requestId`). Lets
-   * `recordUsage` correlate the usage row to the same request that
-   * `settlePayment` settles, observability hooks observe, and
-   * `onRequestComplete` reports — without re-deriving from a
-   * synthetic key. Required field as of 0.4.0; the gateway always has
-   * it in scope at the recordUsage call site.
-   */
-  requestId: string
-  agentId: string
-  agentSlug: string
-  consumerId: string
-  paymentMethod: PaymentMethod
-  inputTokens: number
-  outputTokens: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
-  reasoningTokens?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
-  toolTokens?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
-  toolCallCount?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
-  providerCostUsd?: number
-  totalCostUsd: number
-  ownerEarnedUsd: number
-  platformFeeUsd: number
-  durationMs: number
-  /** Exact receipt in normal operation; quoted ceiling only after receipt timeout. */
-  settlementBasis?: PaymentSettlementBasis
-}
-
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
@@ -241,17 +210,6 @@ export interface SandboxStreamEvent {
     tool?: { name?: string; inputTokens?: number; outputTokens?: number }
     reasoning?: { tokens?: number }
   }
-}
-
-export interface SandboxUsageReceipt {
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number
-  toolTokens: number
-  toolCallCount: number
-  providerCostUsd: number
-  /** True only when the provider/adapter enforced every supplied budget. */
-  budgetEnforced: boolean
 }
 
 export interface SandboxBox {
@@ -372,7 +330,7 @@ export interface GatewayConfig {
    * and settlement failures. See ./observer.ts for the interface and
    * ConsoleObserver / CompositeObserver implementations.
    */
-  observer?: import('./observer').GatewayObserver
+  observer?: GatewayObserver
 
   /**
    * A2A protocol configuration. The gateway exposes A2A with an in-memory

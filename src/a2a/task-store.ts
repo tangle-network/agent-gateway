@@ -7,6 +7,9 @@
 
 import type { Task } from './types'
 import { inspectTaskExecution } from './execution-fence'
+import { hasPendingPaymentRecovery } from './task-recovery'
+
+export { hasPendingPaymentRecovery } from './task-recovery'
 
 export interface TaskStore {
   get(id: string): Promise<Task | undefined>
@@ -26,17 +29,6 @@ export interface TaskStore {
 }
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000
-
-const PAYMENT_RECOVERY_KEYS = [
-  'gatewayFinalizing',
-  'gatewayPaymentRelease',
-  'gatewayPaymentRecovery',
-] as const
-
-/** Payment recovery tasks must remain readable until reconciliation clears the marker. */
-export function hasPendingPaymentRecovery(task: Task): boolean {
-  return PAYMENT_RECOVERY_KEYS.some((key) => task.metadata?.[key] !== undefined)
-}
 
 export class InMemoryTaskStore implements TaskStore {
   private readonly entries = new Map<string, { task: Task; expiresAt: number }>()

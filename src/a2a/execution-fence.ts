@@ -1,5 +1,15 @@
 import type { Task } from './types'
-import type { TaskStore } from './task-store'
+
+interface ExecutionTaskStore {
+  get(id: string): Promise<Task | undefined>
+  compareAndSet?(expected: Task, next: Task): Promise<boolean>
+  compareAndSetExecution?(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean>
+}
 
 /** Durable marker that prevents cancellation from racing sandbox start. */
 export const TASK_EXECUTION_METADATA_KEY = 'gatewayExecution'
@@ -27,7 +37,7 @@ export class TaskExecutionCanceledError extends Error {
 
 /** Claim the right to start one task after its sandbox has been acquired. */
 export async function claimTaskExecution(
-  store: TaskStore,
+  store: ExecutionTaskStore,
   task: Task,
   requestId: string,
   now = Date.now(),
@@ -54,7 +64,7 @@ export async function claimTaskExecution(
 
 /** Renew both the task execution fence and its cancellation protection. */
 export async function renewTaskExecution(
-  store: TaskStore,
+  store: ExecutionTaskStore,
   taskId: string,
   requestId: string,
   now?: number,
