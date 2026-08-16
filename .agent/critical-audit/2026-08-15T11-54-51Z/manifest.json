@@ -1,0 +1,29 @@
+{
+  "skill": "/critical-audit",
+  "target": "agent-gateway PR #11 blocking findings",
+  "base_ref": "HEAD",
+  "base_sha": "43897380c5c7034b59f5ac5d06885679d5a9bb94",
+  "head_sha": "43897380c5c7034b59f5ac5d06885679d5a9bb94",
+  "working_tree_diff": true,
+  "files": 9,
+  "project_type": "TypeScript package",
+  "reviewers": [
+    "A correctness and security",
+    "B architecture and quality",
+    "C standards and real-system coverage"
+  ],
+  "review_mode": "serial",
+  "independent_review": "Codex gpt-5.6-sol inspected the diff and ran direct race and timeout smoke checks in read-only mode.",
+  "checks": [
+    "pnpm typecheck",
+    "TSX_DISABLE_CACHE=1 NODE_OPTIONS=--import tsx pnpm exec vitest run ... tests/pr11-regressions.test.ts",
+    "pnpm test",
+    "pnpm build",
+    "git diff --check"
+  ],
+  "findings": 0,
+  "dropped": 0,
+  "verdict": "APPROVE",
+  "not_inspected": "Live SQL provider behavior and external payment provider behavior; local stores and the public operation contract were inspected.",
+  "timestamp": "2026-08-15T11:54:51Z"
+}

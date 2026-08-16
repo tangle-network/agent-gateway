@@ -1,11 +1,58 @@
 export { createAgentGateway } from './middleware'
+export { reclaimPayment } from './dispatch'
+export {
+  recoverPayment,
+  recoverPayments,
+  type RecoverPaymentOptions,
+  type RecoverPaymentsOptions,
+  type PaymentRecoveryRun,
+} from './payment-recovery-worker'
 export {
   verifyX402,
   verifyMpp,
+  verifyMppCredential,
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
+  mppReplayNonceKey,
+  mppPaymentCredential,
+  type VerifiedMppCredential,
 } from './verify'
+export {
+  MPP_CHARGE_PROTOCOL_VERSION,
+  mppPaymentOperationId,
+  type MppAuthenticatedCredential,
+  type MppChargeLifecycle,
+  type MppChargeOperation,
+  type MppChargeOperationState,
+  type MppChargeRecoveryResult,
+  type MppChargeRequest,
+} from './mpp-payment'
+export {
+  PAYMENT_RECOVERY_VERSION,
+  MemoryPaymentRecoveryStore,
+  PaymentRecoveryFenceError,
+  type PaymentRecoveryAttribution,
+  type PaymentRecoveryConfig,
+  type PaymentRecoveryRecord,
+  type PaymentRecoveryState,
+  type PaymentRecoveryStore,
+  type PaymentRecoveryTarget,
+  type PaymentSettlementBasis,
+} from './payment-recovery'
+export { SqlPaymentRecoveryStore } from './payment-recovery-sql'
+export {
+  PAYMENT_PROTOCOL_VERSION,
+  MemoryPaymentOperations,
+  type MemoryPaymentOperationsOptions,
+  type PaymentAuthorizationContext,
+  type PaymentOperation,
+  type PaymentOperationNotFound,
+  type PaymentOperationRecoveryResult,
+  type PaymentOperationState,
+  type PaymentOperations,
+  type PaymentSettlementInput,
+} from './payment-operations'
 export {
   filterConsumerMessages,
   filterConsumerMessagesStrict,
@@ -31,6 +78,10 @@ export {
 export {
   MemoryNonceStore,
   KvNonceStore,
+  isAtomicNonceStore,
+  type AtomicKvNonceClaim,
+  type AtomicNonceStore,
+  type KvNonceStoreOptions,
   type NonceStore,
 } from './nonce-store'
 export {
@@ -56,6 +107,8 @@ export type {
   PaymentResult,
   ApiKeyInfo,
   GatewayUsageEvent,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
   SandboxStreamEvent,
   SandboxBox,
   GatewayConfig,
@@ -66,7 +119,7 @@ export type {
 
 // --- A2A protocol surface (Google Agent-to-Agent) ---
 // Types + task-store adapter. Handlers are wired automatically by
-// createAgentGateway when `GatewayConfig.a2a` (or its default) is honored;
+// createAgentGateway with an in-memory store by default;
 // consumers only import these to BYO a durable TaskStore (D1, postgres, DO)
 // or to declare richer AgentMeta.skills for the Agent Card.
 export { InMemoryTaskStore, type TaskStore } from './a2a/task-store'
@@ -78,9 +131,12 @@ export {
   SqlTaskStore,
 } from './a2a/task-store-sql'
 export {
+  deliverDemoPushNotifications,
   deliverPushNotifications,
   InMemoryPushNotificationStore,
+  validatePushNotificationUrl,
   type PushDeliveryResult,
+  type PushNotificationDeliveryOptions,
   type PushNotificationAuthentication,
   type PushNotificationConfig,
   type PushNotificationStore,

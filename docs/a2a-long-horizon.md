@@ -9,32 +9,117 @@ The A2A protocol works well for short request-response calls out of the box. For
 | Resubscribe | `tasks/resubscribe` | A client that lost its SSE stream can re-attach to find out where the task ended up |
 | Input-required + multi-turn | `input-required` state + follow-up `message/send` with the same `taskId` | The agent can pause and ask the user a question without ending the task |
 
-All four are gated on configuration — they cost nothing for agents that don't need them, and the agent card honestly reflects what each gateway will actually do.
+The A2A surface is available with an in-memory task store by default.
+Durable storage and push notifications are enabled through `GatewayConfig.a2a`.
 
 ## Durable tasks (SqlTaskStore)
 
-By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments. Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a 2-method `SqlAdapter` shim.
+By default `GatewayConfig.a2a.taskStore` is in-memory: fast, zero-config, fine for tests and single-machine deployments.
+Production deployments swap in `SqlTaskStore` against any SQL store — D1, postgres, sqlite, libSQL, Turso — via a `SqlAdapter` shim.
+Custom production task stores must implement `createIfAbsent`, `compareAndSet`, and `compareAndSetExecution`.
+`compareAndSetExecution` must reject a renewal when the stored owner lease has expired.
+The gateway keeps the OpenAI surface available when an older store lacks either method.
+It returns `503` for A2A until the store is upgraded, rather than using a cross-worker unsafe fallback.
+Use `SqlTaskStore` or another atomic adapter for multi-worker production deployments.
+
+Payment nonce stores also require an atomic claim operation on every payment protocol version.
+Plain Cloudflare KV cannot provide that operation.
+Use D1, a Durable Object, or a custom atomic adapter for the claim callback passed to `KvNonceStore`.
+
+Before a payment provider can mutate state, the gateway stores the recovery identity in task metadata.
+The record contains the payment operation, usage receipt, output artifact, and a five-minute lease.
+The task also points to the shared payment recovery outbox.
+This outbox survives task-handler crashes and supports scheduled recovery without a task read.
+After a restart, the first task read after lease expiry resumes settlement with the same operation.
+If settlement acknowledgement fails, the gateway keeps the operation and retries after the lease expires.
+Cancellation stores the recovery record before it completes the canceled task.
+The canceled task therefore keeps a retryable lease when settlement acknowledgement fails.
+If cancellation must release an unused durable operation, the shared outbox enters `releasing` before the adapter call.
+An ambiguous release acknowledgement remains in that outbox and is retried by operation ID.
+Usage attribution must atomically upsert by `requestId`.
+The finalization record stores whether attribution was acknowledged, so recovery does not repeat an acknowledged usage event.
+The payment claim keeps its submission lease until the task changes to `working` in one compare-and-set operation.
+An expired execution lease fails the task while leaving payment recovery metadata available for reconciliation.
+If a legacy record is malformed or has no recoverable operation, the gateway expires the task as failed.
+If work exists without a receipt, the outbox settles the original quoted ceiling after its configured timeout.
+The task-store TTL cannot delete a task while any payment recovery marker remains.
+The short-lived `gatewaySubmission` marker is not a payment recovery marker.
+An abandoned submission without a payment marker may expire after the normal task TTL.
+
+Task control methods (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and push configuration methods) require `a2a.authorizeTaskAccess` in production.
+The hook receives the task and request headers so the application can enforce task ownership.
+Explicit `x402.demoMode` permits these methods without the hook for local tests only.
+This is a fail-closed upgrade boundary.
+Tasks stored before this release do not have a `gatewayOrigin` binding and cannot pass the default ownership check.
+Migrate those records with a verified owner binding, or allow them to expire before enabling production control methods.
+Push registration rejects reserved IP literals and private hostname suffixes.
+Production push delivery also requires `a2a.pushUrlValidator`, which should apply the deployment's DNS-aware private-network policy.
+The exported `deliverPushNotifications` function requires a non-empty HMAC secret.
+Use `deliverDemoPushNotifications` only for explicit local demo mode.
 
 ### D1 (Cloudflare Workers)
+
+Cloudflare does not invoke arbitrary `migrate` exports on a module Worker.
+Create a D1 migration file and apply it before serving traffic.
+
+```sql
+-- migrations/0001_a2a.sql
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+  id TEXT PRIMARY KEY,
+  context_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  execution_request_id TEXT,
+  execution_lease_expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context
+  ON a2a_tasks (context_id, updated_at);
+CREATE TABLE IF NOT EXISTS a2a_push_configs (
+  task_id TEXT NOT NULL,
+  config_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  token TEXT,
+  authentication TEXT,
+  PRIMARY KEY (task_id, config_id)
+);
+```
+
+Apply it with `npx wrangler d1 migrations apply DB_NAME --remote`.
+This creates both tables before the Worker uses them.
+For an existing `a2a_tasks` table, apply a separate upgrade migration with these two statements before deployment:
+
+```sql
+ALTER TABLE a2a_tasks ADD COLUMN execution_request_id TEXT;
+ALTER TABLE a2a_tasks ADD COLUMN execution_lease_expires_at REAL;
+```
+
+Do not serve traffic until this upgrade is applied.
+The upgrade leaves both columns `NULL` for rows created by the old schema.
+On the first renewal of a working legacy task, `SqlTaskStore` seeds both columns from the valid `gatewayExecution` payload marker in one atomic compare-and-set.
+The compare-and-set requires the old payload, `state = 'working'`, and both columns to remain `NULL`, so only one worker can seed the row.
+If the marker is malformed or only one column is populated, renewal fails closed.
+Do not replace this contract with an unconditional payload backfill.
 
 ```ts
 import {
   createAgentGateway,
   d1ToSqlAdapter,
-  InMemoryPushNotificationStore,
+  SqlPushNotificationStore,
   SqlTaskStore,
 } from '@tangle-network/agent-gateway'
 
 export default {
   async fetch(req: Request, env: { DB: D1Database }) {
-    const taskStore = new SqlTaskStore(d1ToSqlAdapter(env.DB))
-    await taskStore.migrate() // run once at deploy; idempotent
+    const db = d1ToSqlAdapter(env.DB)
+    const taskStore = new SqlTaskStore(db)
+    const pushStore = new SqlPushNotificationStore(db)
 
     const gw = createAgentGateway({
       // ... your existing config ...
       a2a: {
         taskStore,
-        pushStore: new InMemoryPushNotificationStore(),
+        pushStore,
         webhookSecret: env.A2A_WEBHOOK_SECRET,
       },
     })
@@ -106,12 +191,21 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
   context_id TEXT NOT NULL,
   state TEXT NOT NULL,
   payload TEXT NOT NULL,           -- JSON Task envelope
-  updated_at INTEGER NOT NULL      -- ms since epoch
+  updated_at INTEGER NOT NULL,     -- ms since epoch
+  execution_request_id TEXT,       -- nullable durable execution owner
+  execution_lease_expires_at REAL  -- ms since epoch
 );
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_context ON a2a_tasks (context_id, updated_at);
 ```
 
-One table, JSON payload. TTL is enforced at read time (default 1 hour, configurable via `new SqlTaskStore(db, { ttlMs })`); expired rows are lazily deleted so callers see consistent "expired" semantics regardless of when the GC actually runs.
+The two execution columns are required by the current store schema.
+For an existing table, apply the upgrade migration above before traffic.
+Rows from the old schema keep `NULL` execution columns until their first valid renewal, which performs the guarded seed described above.
+
+One table stores the JSON payload.
+TTL is enforced at read time and defaults to one hour.
+Configure it with `new SqlTaskStore(db, { ttlMs })`.
+Expired rows are lazily deleted only when they have no payment recovery marker.
 
 `SqlTaskStore` also exposes `listByContext(contextId)` for surfacing all tasks in a conversation when the consumer's UI wants to show a thread view.
 
@@ -127,7 +221,7 @@ When a task reaches a terminal state (`completed`, `canceled`, `failed`, `reject
 ```ts
 import {
   createAgentGateway,
-  InMemoryPushNotificationStore,
+  d1ToSqlAdapter,
   SqlPushNotificationStore,
 } from '@tangle-network/agent-gateway'
 
@@ -164,6 +258,7 @@ When `pushStore` is set, the agent card advertises `capabilities.pushNotificatio
 ```
 
 Get / list / delete mirror standard CRUD via the same method namespace.
+Push destinations must use HTTPS and must not include URL credentials.
 
 ### Webhook receiver shape
 
@@ -206,7 +301,11 @@ async function verify(req: Request, secret: string): Promise<boolean> {
 
 ### Delivery semantics
 
-- **Fire-once.** No retries. If a webhook returns non-2xx or the request fails, the gateway logs and moves on. The consumer's webhook handler SHOULD idempotently re-fetch state via `tasks/get` rather than rely on at-least-once delivery.
+- **Fire-once.** The gateway claims each terminal `(task, config)` delivery with the durable task store before it sends the webhook.
+  Concurrent workers therefore produce at most one attempt for that terminal state.
+  There are no retries after a failed attempt.
+  If a webhook returns non-2xx or the request fails, the gateway logs and moves on.
+  The consumer's webhook handler SHOULD idempotently re-fetch state via `tasks/get` rather than rely on at-least-once delivery.
 - **No partial-state deliveries.** Only terminal transitions fire push. `input-required` is NOT terminal — it's a pause, not an end.
 - **Fire even on cancel + fail.** Consumers want to know the task ended for any reason, not just success.
 
@@ -270,6 +369,10 @@ The gateway then:
 3. Persists the task with the partial response as an artifact.
 4. Does NOT fire push notifications — `input-required` is non-terminal.
 5. Returns the task envelope (for `message/send`) or emits a final `status-update` (for `message/stream`).
+
+The gateway records a short-lived execution fence after sandbox acquisition and before the provider call.
+Another worker can cancel before that fence is recorded.
+After the fence is recorded, a remote cancellation returns `TASK_NOT_CANCELABLE` because it cannot abort the live worker safely.
 
 Sandboxes that never emit input-required see identical behavior to before.
 

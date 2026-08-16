@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { KvNonceStore, type KVNamespace as NonceKV } from '../src/nonce-store'
+import { isAtomicNonceStore, KvNonceStore, type KVNamespace as NonceKV } from '../src/nonce-store'
 import { KvRateLimitStore, checkRateLimit } from '../src/rate-limit'
 import type { KVNamespace as RlKV } from '../src/rate-limit'
 
@@ -23,6 +23,14 @@ class StubKV implements NonceKV, RlKV {
     this.store.set(key, { value, expiresAt: this.now() + ttl * 1000 })
   }
 
+  async putIfAbsent(key: string, value: string, options?: { expirationTtl?: number }): Promise<boolean> {
+    const entry = this.store.get(key)
+    if (entry && entry.expiresAt >= this.now()) return false
+    const ttl = options?.expirationTtl ?? 86400
+    this.store.set(key, { value, expiresAt: this.now() + ttl * 1000 })
+    return true
+  }
+
   async delete(key: string): Promise<void> {
     this.store.delete(key)
   }
@@ -31,42 +39,43 @@ class StubKV implements NonceKV, RlKV {
 describe('KvNonceStore', () => {
   afterEach(() => vi.useRealTimers())
 
-  it('returns false on unseen nonce', async () => {
+  it('claims an unseen nonce and rejects its replay', async () => {
     const store = new KvNonceStore(new StubKV())
-    expect(await store.hasSeen('fresh')).toBe(false)
+    expect(await store.claim('fresh', 60)).toBe(true)
+    expect(await store.claim('fresh', 60)).toBe(false)
   })
 
-  it('returns true after markSeen — regression: missed replay would let attackers reuse payments', async () => {
+  it('retains an atomic claim — regression: missed replay would let attackers reuse payments', async () => {
     const store = new KvNonceStore(new StubKV())
-    await store.markSeen('replay', 3600)
-    expect(await store.hasSeen('replay')).toBe(true)
+    expect(await store.claim('replay', 3600)).toBe(true)
+    expect(await store.claim('replay', 3600)).toBe(false)
   })
 
   it('enforces 60s minimum TTL — regression: KV rejects shorter TTLs so shorter expiries silently drop', async () => {
     const kv = new StubKV()
-    const putSpy = vi.spyOn(kv, 'put')
+    const putIfAbsentSpy = vi.spyOn(kv, 'putIfAbsent')
     const store = new KvNonceStore(kv)
-    await store.markSeen('n1', 10) // request 10 seconds
-    expect(putSpy).toHaveBeenCalledWith(expect.stringContaining('nonce:'), '1', { expirationTtl: 60 })
+    await store.claim('n1', 10) // request 10 seconds
+    expect(putIfAbsentSpy).toHaveBeenCalledWith(expect.stringContaining('nonce:'), '1', { expirationTtl: 60 })
   })
 
   it('honors TTL expiry via KV eviction semantics', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'))
     const store = new KvNonceStore(new StubKV())
-    await store.markSeen('fleeting', 60)
-    expect(await store.hasSeen('fleeting')).toBe(true)
+    expect(await store.claim('fleeting', 60)).toBe(true)
+    expect(await store.claim('fleeting', 60)).toBe(false)
     vi.advanceTimersByTime(61_000)
-    expect(await store.hasSeen('fleeting')).toBe(false)
+    expect(await store.claim('fleeting', 60)).toBe(true)
   })
 
   it('namespaces by prefix — regression: collisions across shared KVs', async () => {
     const kv = new StubKV()
     const x402 = new KvNonceStore(kv, 'x402')
     const mpp = new KvNonceStore(kv, 'mpp')
-    await x402.markSeen('42', 300)
-    expect(await x402.hasSeen('42')).toBe(true)
-    expect(await mpp.hasSeen('42')).toBe(false)
+    expect(await x402.claim('42', 300)).toBe(true)
+    expect(await x402.claim('42', 300)).toBe(false)
+    expect(await mpp.claim('42', 300)).toBe(true)
   })
 
   it('integrates with verifyX402 across distributed isolates — regression: same nonce accepted on a second isolate', async () => {
@@ -75,9 +84,57 @@ describe('KvNonceStore', () => {
     const isolateA = new KvNonceStore(sharedKv)
     const isolateB = new KvNonceStore(sharedKv)
 
-    await isolateA.markSeen('shared-nonce', 300)
-    // Isolate B sees the same nonce as used — no cross-isolate bypass
-    expect(await isolateB.hasSeen('shared-nonce')).toBe(true)
+    expect(await isolateA.claim('shared-nonce', 300)).toBe(true)
+    // Isolate B sees the same nonce as used — no cross-isolate bypass.
+    expect(await isolateB.claim('shared-nonce', 300)).toBe(false)
+  })
+
+  it('keeps same-owner claims idempotent when isolates race on the atomic insert', async () => {
+    const sharedKv = new StubKV()
+    const isolateA = new KvNonceStore(sharedKv)
+    const isolateB = new KvNonceStore(sharedKv)
+    const results = await Promise.all([
+      isolateA.claim('shared-operation', 300, 'operation-1'),
+      isolateB.claim('shared-operation', 300, 'operation-1'),
+    ])
+    expect(results).toEqual([true, true])
+    expect(await isolateA.claim('shared-operation', 300, 'operation-2')).toBe(false)
+  })
+
+  it('fails closed when the KV binding cannot make an atomic claim', async () => {
+    const backing = new StubKV()
+    const cloudflareKv: NonceKV = {
+      get: backing.get.bind(backing),
+      put: backing.put.bind(backing),
+      delete: backing.delete.bind(backing),
+    }
+    const store = new KvNonceStore(cloudflareKv)
+
+    expect(isAtomicNonceStore(store)).toBe(false)
+    await expect(store.claim('legacy', 300)).rejects.toThrow('atomicClaim')
+    await expect(store.claim('version-2', 300, 'operation-1')).rejects.toThrow('atomicClaim')
+  })
+
+  it('accepts an explicitly supplied atomic claim backend for standard KV', async () => {
+    const backing = new StubKV()
+    const cloudflareKv: NonceKV = {
+      get: backing.get.bind(backing),
+      put: backing.put.bind(backing),
+      delete: backing.delete.bind(backing),
+    }
+    const claims = new Map<string, string>()
+    const store = new KvNonceStore(cloudflareKv, 'nonce', {
+      atomicClaim: async (key, ttlSeconds, ownerId) => {
+        const existing = claims.get(key)
+        if (existing !== undefined) return ownerId !== undefined && existing === ownerId
+        claims.set(key, ownerId ?? '1')
+        await cloudflareKv.put(key, ownerId ?? '1', { expirationTtl: ttlSeconds })
+        return true
+      },
+    })
+
+    expect(isAtomicNonceStore(store)).toBe(true)
+    expect(await store.claim('backend', 300, 'operation-1')).toBe(true)
   })
 })
 

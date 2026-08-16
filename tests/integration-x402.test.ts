@@ -15,7 +15,7 @@
  *          EIP-712 signer address and asserts it matches the commitment
  *   4. Gateway resolves the agent, rate-limits the consumer, filters for
  *      injection, gets a sandbox, streams the response, records usage,
- *      and fires settlePayment.
+ *      and settles through the durable version 2 payment operation.
  *   5. Consumer parses the SSE stream back to a string.
  *
  * Every step uses real code — real signatures (not fixtures), real Hono
@@ -41,6 +41,8 @@ import type {
 } from '../src/types'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
+import { MemoryPaymentOperations } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 
 // ----- Domain constants (mirror the Tangle ShieldedCredits contract shape) -----
 
@@ -48,6 +50,7 @@ const CHAIN_ID = 3799
 const OPERATOR_PRIVATE_KEY = generatePrivateKey()
 const OPERATOR_ADDRESS = privateKeyToAccount(OPERATOR_PRIVATE_KEY).address
 const CREDITS_ADDRESS: Hex = '0x00000000000000000000000000000000DeaDBeef'
+const FUNDED_REQUEST_AMOUNT = 1_000_000n
 
 const domain = {
   name: 'ShieldedCredits',
@@ -144,8 +147,24 @@ async function verifySignerOnChain(payload: Record<string, unknown>): Promise<bo
 class ReplySandbox implements SandboxBox {
   constructor(private chunks: string[]) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00005,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -167,6 +186,19 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
   const usage: GatewayUsageEvent[] = []
   const settlements: Array<{ payment: PaymentResult; cost: number }> = []
   let verifyCalls = 0
+  const paymentOperations = new MemoryPaymentOperations({
+    onSettle: async (operation, input) => {
+      settlements.push({
+        payment: {
+          method: 'x402',
+          consumerId: operation.authorizationId,
+          requestId: operation.acquiredByRequestId,
+        },
+        cost: input.totalCostUsd,
+      })
+    },
+    onReclaim: async () => undefined,
+  })
 
   const agent: AgentMeta = {
     id: 'agent_production',
@@ -185,17 +217,19 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => new ReplySandbox(chunks),
     recordUsage: async (evt) => { usage.push(evt) },
-    settlePayment: async (payment, cost) => { settlements.push({ payment, cost }) },
     x402: {
       operatorAddress: OPERATOR_ADDRESS,
       chainId: CHAIN_ID,
       creditsAddress: CREDITS_ADDRESS,
       demoMode: false, // PRODUCTION PATH — verifySigner is authoritative
+      paymentProtocolVersion: 2,
+      paymentOperations,
       verifySigner: async (payload) => {
         verifyCalls += 1
         return verifySignerOnChain(payload)
       },
     },
+    paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
     nonceStore: new MemoryNonceStore(),
     rateLimitStore: new MemoryRateLimitStore(),
   })
@@ -248,10 +282,10 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
 
   beforeEach(() => { harness = buildHarness() })
 
-  it('happy path: consumer signs → gateway verifies signer address → sandbox streams → settlement fires', async () => {
+  it('happy path: consumer signs → gateway verifies signer address → sandbox streams → durable settlement fires', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n,
     })
 
@@ -287,7 +321,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     expect(harness.usage[0].ownerEarnedUsd).toBeCloseTo(harness.usage[0].totalCostUsd * 0.8, 10)
     expect(harness.usage[0].platformFeeUsd).toBeCloseTo(harness.usage[0].totalCostUsd * 0.2, 10)
 
-    // Settlement callback fired with the x402 method
+    // Durable settlement fired with the x402 method
     expect(harness.settlements).toHaveLength(1)
     expect(harness.settlements[0].payment.method).toBe('x402')
     expect(harness.settlements[0].cost).toBe(harness.usage[0].totalCostUsd)
@@ -304,7 +338,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       primaryType: 'SpendAuth',
       message: {
         operator: otherOperator, // not our operator
-        amount: 20000n,
+        amount: FUNDED_REQUEST_AMOUNT,
         nonce: 1n,
         expiry: BigInt(Math.floor(Date.now() / 1000) + 600),
       },
@@ -314,7 +348,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       commitment: account.address,
       signature: tampered,
       operator: otherOperator,
-      amount: '20000',
+      amount: FUNDED_REQUEST_AMOUNT.toString(),
       nonce: '1',
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }
@@ -345,7 +379,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       primaryType: 'SpendAuth',
       message: {
         operator: OPERATOR_ADDRESS,
-        amount: 20000n,
+        amount: FUNDED_REQUEST_AMOUNT,
         nonce: 2n,
         expiry: BigInt(Math.floor(Date.now() / 1000) + 600),
       },
@@ -356,7 +390,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
       commitment: '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       signature,
       operator: OPERATOR_ADDRESS,
-      amount: '20000',
+      amount: FUNDED_REQUEST_AMOUNT.toString(),
       nonce: '2',
       expiry: String(Math.floor(Date.now() / 1000) + 600),
     }
@@ -379,7 +413,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
   it('replay of the same signed SpendAuth is rejected across requests — regression: double-spend of one signed payment', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 99n,
     })
     const payloadStr = JSON.stringify(spendAuth)
@@ -411,7 +445,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
   it('expired SpendAuth is rejected — regression: forever-valid sigs enable drain attacks', async () => {
     const spendAuth = await signSpendAuth({
       consumerPrivateKey: harness.consumerPrivateKey,
-      amount: 20000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 5n,
       expirySeconds: -10, // expired 10 seconds ago
     })
@@ -435,7 +469,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     // Alice's wallet
     const aliceAuth = await signSpendAuth({
       consumerPrivateKey: alice.consumerPrivateKey,
-      amount: 10000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n,
     })
 
@@ -444,7 +478,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const bobAddr = privateKeyToAccount(bobKey).address
     const bobAuth = await signSpendAuth({
       consumerPrivateKey: bobKey,
-      amount: 10000n,
+      amount: FUNDED_REQUEST_AMOUNT,
       nonce: 1n, // same nonce, different commitment
     })
 

@@ -53,8 +53,24 @@ class InputRequiringSandbox implements SandboxBox {
     const seq = this.sequences[this.callIdx]
     this.callIdx += 1
     if (!seq) throw new Error(`InputRequiringSandbox: out of canned sequences at call ${this.callIdx}`)
+    let output = ''
     for (const delta of seq.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
     if (seq.pause) {
       yield { type: 'input-required', data: { inputRequired: { prompt: seq.pause.prompt } } }
@@ -65,8 +81,24 @@ class InputRequiringSandbox implements SandboxBox {
 class StubSandbox implements SandboxBox {
   constructor(private chunks: string[]) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -327,6 +359,31 @@ describe('A2A — push notification config RPCs', () => {
     )
     expect(delRes.status).toBe(200)
     expect(await pushStore.get(task.id, cfg.id)).toBeUndefined()
+  })
+
+  it('rejects non-HTTPS push destinations', async () => {
+    const { app } = buildHarness()
+    const sendRes = await postJsonRpc(
+      app,
+      { jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: textMessage('hi') } },
+      apiKeyHeader(),
+    )
+    const task = ((await sendRes.json()) as JSONRPCSuccessResponse<Task>).result
+    const res = await postJsonRpc(
+      app,
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/pushNotificationConfig/set',
+        params: {
+          taskId: task.id,
+          pushNotificationConfig: { id: 'cfg-http', url: 'http://localhost/hook' },
+        },
+      },
+      apiKeyHeader(),
+    )
+    const body = (await res.json()) as JSONRPCErrorResponse
+    expect(body.error.code).toBe(A2A_ERROR_CODES.INVALID_PARAMS)
   })
 
   it('get returns TASK_NOT_FOUND for an unregistered config', async () => {

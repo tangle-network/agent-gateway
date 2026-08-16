@@ -37,9 +37,25 @@ class StubSandbox implements SandboxBox {
     private opts: { delayMs?: number } = {},
   ) {}
   async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+    let output = ''
     for (const delta of this.chunks) {
       if (this.opts.delayMs) await new Promise((r) => setTimeout(r, this.opts.delayMs))
+      output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -178,7 +194,10 @@ describe('A2A — AgentCard discovery', () => {
       mpp: {
         realm: 'agents.tangle.tools',
         method: 'blueprintevm',
-        verifySigner: async () => 'mpp-signer',
+        authenticateCredential: async () => ({
+          consumerId: 'mpp-signer',
+          paymentIdentity: 'mpp-signer-payment',
+        }),
       },
     })
     const res = await app.request('/v1/agents/test-agent/.well-known/agent.json')
@@ -414,6 +433,33 @@ describe('A2A — message/stream', () => {
 // ── tasks/get ─────────────────────────────────────────────────────────────
 
 describe('A2A — tasks/get', () => {
+  it('fails closed for production task access without an authorization hook', async () => {
+    const { app } = buildHarness({
+      x402: { operatorAddress, chainId: 3799, verifySigner: async () => true, demoMode: false },
+    })
+    const sendRes = await postJsonRpc(
+      app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('hi') },
+      },
+      apiKeyHeader(),
+    )
+    const sent = (await sendRes.json()) as JSONRPCSuccessResponse<Task>
+
+    const getRes = await postJsonRpc(
+      app,
+      'test-agent',
+      { jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { id: sent.result.id } },
+      apiKeyHeader(),
+    )
+    const body = (await getRes.json()) as JSONRPCErrorResponse
+    expect(body.error.code).toBe(A2A_ERROR_CODES.TASK_ACCESS_DENIED)
+  })
+
   it('returns the task created by a prior message/send', async () => {
     const { app } = buildHarness()
     const sendRes = await postJsonRpc(

@@ -6,10 +6,25 @@
  */
 
 import type { Task } from './types'
+import { inspectTaskExecution } from './execution-fence'
+import { hasPendingPaymentRecovery } from './task-recovery'
+
+export { hasPendingPaymentRecovery } from './task-recovery'
 
 export interface TaskStore {
   get(id: string): Promise<Task | undefined>
   put(task: Task): Promise<void>
+  /** Insert only when the task id is absent. Required outside explicit demo mode. */
+  createIfAbsent?(task: Task): Promise<boolean>
+  /** Replace only when the stored task still equals `expected`. Required for production races. */
+  compareAndSet?(expected: Task, next: Task): Promise<boolean>
+  /** Replace an execution marker only while its owner lease is still live. */
+  compareAndSetExecution?(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean>
   delete(id: string): Promise<void>
 }
 
@@ -32,7 +47,47 @@ export class InMemoryTaskStore implements TaskStore {
     this.entries.set(task.id, { task: clone(task), expiresAt: Date.now() + this.ttlMs })
   }
 
+  async createIfAbsent(task: Task): Promise<boolean> {
+    this.gc()
+    if (this.entries.has(task.id)) return false
+    this.entries.set(task.id, { task: clone(task), expiresAt: Date.now() + this.ttlMs })
+    return true
+  }
+
+  async compareAndSet(expected: Task, next: Task): Promise<boolean> {
+    this.gc()
+    const entry = this.entries.get(expected.id)
+    if (!entry || JSON.stringify(entry.task) !== JSON.stringify(expected)) return false
+    this.entries.set(expected.id, { task: clone(next), expiresAt: Date.now() + this.ttlMs })
+    return true
+  }
+
+  async compareAndSetExecution(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean> {
+    this.gc()
+    const entry = this.entries.get(expected.id)
+    if (!entry || JSON.stringify(entry.task) !== JSON.stringify(expected)) return false
+    const expectedMarker = inspectTaskExecution(expected)
+    const nextMarker = inspectTaskExecution(next)
+    if (
+      expectedMarker.state !== 'valid' ||
+      nextMarker.state !== 'valid' ||
+      expectedMarker.marker.requestId !== requestId ||
+      nextMarker.marker.requestId !== requestId ||
+      expectedMarker.marker.lease.expiresAt <= now ||
+      nextMarker.marker.lease.expiresAt <= now
+    ) return false
+    this.entries.set(expected.id, { task: clone(next), expiresAt: Date.now() + this.ttlMs })
+    return true
+  }
+
   async delete(id: string): Promise<void> {
+    const entry = this.entries.get(id)
+    if (entry && hasPendingPaymentRecovery(entry.task)) return
     this.entries.delete(id)
   }
 
@@ -43,7 +98,9 @@ export class InMemoryTaskStore implements TaskStore {
   private gc(): void {
     const now = Date.now()
     for (const [id, entry] of this.entries) {
-      if (entry.expiresAt <= now) this.entries.delete(id)
+      if (entry.expiresAt <= now && !hasPendingPaymentRecovery(entry.task)) {
+        this.entries.delete(id)
+      }
     }
   }
 }

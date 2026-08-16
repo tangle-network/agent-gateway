@@ -6,12 +6,22 @@ import {
   type AuthorizedRequest,
   type GatewayState,
   authenticateAndGuard,
-  dispatchSandboxStream,
-  estimateTokens,
+  beginPaymentExecution,
+  markPaymentExecutionStarted,
+  renewPaymentExecution,
+  claimPayment,
+  dispatchSandboxStreamRich,
+  releasePayment,
+  releasePaymentAfterFailure,
   settleAndRecord,
 } from './dispatch'
-import { MemoryNonceStore } from './nonce-store'
+import { isAtomicNonceStore, MemoryNonceStore } from './nonce-store'
 import { type GatewayObserver, type RequestContext, generateRequestId } from './observer'
+import {
+  MemoryPaymentRecoveryStore,
+  PaymentRecoveryReplayError,
+  assertPaymentRecoveryConfig,
+} from './payment-recovery'
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import type { ChatCompletionChunk, ChatCompletionRequest, GatewayConfig } from './types'
 import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
@@ -26,7 +36,8 @@ import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
  *   GET  /:slug/chat/completions  — agent discovery metadata (Tangle-native shape)
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
-export function createAgentGateway(config: GatewayConfig) {
+export function createAgentGateway(inputConfig: GatewayConfig) {
+  let config = inputConfig
   // Production gateways must verify x402 signatures. Tests and local
   // dev can opt into the explicit demo path.
   if (!config.x402.verifySigner && !config.x402.demoMode) {
@@ -35,6 +46,120 @@ export function createAgentGateway(config: GatewayConfig) {
         'For tests, set x402.demoMode: true explicitly.',
     )
   }
+  const maxOutputTokens = config.maxOutputTokens ?? 4096
+  const defaultOutputTokens = config.defaultOutputTokens ?? 1024
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    throw new Error('createAgentGateway: maxOutputTokens must be a positive integer')
+  }
+  if (
+    !Number.isSafeInteger(defaultOutputTokens) ||
+    defaultOutputTokens <= 0 ||
+    defaultOutputTokens > maxOutputTokens
+  ) {
+    throw new Error(
+      'createAgentGateway: defaultOutputTokens must be a positive integer no greater than maxOutputTokens',
+    )
+  }
+  if (
+    config.x402.currencyDecimals !== undefined &&
+    (!Number.isInteger(config.x402.currencyDecimals) ||
+      config.x402.currencyDecimals < 0 ||
+      config.x402.currencyDecimals > 18)
+  ) {
+    throw new Error('createAgentGateway: x402.currencyDecimals must be an integer between 0 and 18')
+  }
+  const executionBudget = config.executionBudget
+  for (const [name, value] of [
+    ['maxReasoningTokens', executionBudget?.maxReasoningTokens ?? maxOutputTokens],
+    ['maxToolTokens', executionBudget?.maxToolTokens ?? maxOutputTokens],
+    ['maxToolCalls', executionBudget?.maxToolCalls ?? 8],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`createAgentGateway: executionBudget.${name} must be a non-negative safe integer`)
+    }
+  }
+  if (
+    executionBudget?.maxProviderCostUsd !== undefined &&
+    (!Number.isFinite(executionBudget.maxProviderCostUsd) || executionBudget.maxProviderCostUsd < 0)
+  ) {
+    throw new Error('createAgentGateway: executionBudget.maxProviderCostUsd must be finite and non-negative')
+  }
+  if (config.x402.paymentOperations && config.x402.paymentProtocolVersion === undefined) {
+    throw new Error('createAgentGateway: paymentProtocolVersion must be explicit when durable payment operations are configured')
+  }
+  if (
+    config.x402.authorizePayment &&
+    config.x402.paymentProtocolVersion !== 2 &&
+    !config.x402.demoMode
+  ) {
+    throw new Error(
+      'createAgentGateway: production x402 version 1 cannot use authorizePayment; ' +
+        'use paymentProtocolVersion: 2 with paymentOperations for durable payment ownership',
+    )
+  }
+  if (config.x402.paymentProtocolVersion === 2 &&
+      (!config.x402.paymentOperations || config.x402.paymentOperations.protocolVersion !== 2)) {
+    throw new Error('createAgentGateway: payment protocol version 2 requires durable payment operations')
+  }
+  if (config.x402.paymentProtocolVersion === 1 && config.x402.paymentOperations) {
+    throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
+  }
+  if (
+    config.a2a?.pushStore &&
+    !config.x402.demoMode &&
+    (!config.a2a.webhookSecret || config.a2a.webhookSecret.trim().length === 0)
+  ) {
+    throw new Error('createAgentGateway: production A2A push requires a webhookSecret')
+  }
+  const mppMethod = (config.mpp?.method ?? 'blueprintevm').toLowerCase()
+  if (config.mpp?.authenticateCredential !== undefined &&
+      typeof config.mpp.authenticateCredential !== 'function') {
+    throw new Error('createAgentGateway: mpp.authenticateCredential must be a function')
+  }
+  if (config.mpp?.verifySigner !== undefined && typeof config.mpp.verifySigner !== 'function') {
+    throw new Error('createAgentGateway: mpp.verifySigner must be a function')
+  }
+  const mppAuthenticator = typeof config.mpp?.authenticateCredential === 'function'
+    ? config.mpp.authenticateCredential
+    : typeof config.mpp?.verifySigner === 'function'
+      ? config.mpp.verifySigner
+      : undefined
+  if (config.mpp?.charge && config.mpp.charge.protocolVersion !== 1) {
+    throw new Error('createAgentGateway: unsupported MPP charge lifecycle version')
+  }
+  if (
+    config.mpp?.charge &&
+    mppMethod !== 'blueprintevm' &&
+    !mppAuthenticator
+  ) {
+    throw new Error('createAgentGateway: generic MPP methods require credential authentication')
+  }
+  if (
+    config.mpp &&
+    mppMethod !== 'blueprintevm' &&
+    mppAuthenticator &&
+    !config.mpp.charge
+  ) {
+    throw new Error('createAgentGateway: generic MPP methods require a charge lifecycle')
+  }
+  if (config.mpp && mppMethod !== 'blueprintevm' && !mppAuthenticator) {
+    throw new Error('createAgentGateway: generic MPP methods require credential authentication')
+  }
+  if (config.nonceStore && !isAtomicNonceStore(config.nonceStore)) {
+    throw new Error('createAgentGateway: durable payment ownership requires an atomic nonce store')
+  }
+  const needsRecovery = config.x402.paymentProtocolVersion === 2 ||
+    (mppMethod !== 'blueprintevm' && config.mpp?.charge !== undefined)
+  if (needsRecovery && !config.paymentRecovery) {
+    if (!config.x402.demoMode) {
+      throw new Error('createAgentGateway: durable payment recovery is required in production')
+    }
+    config = {
+      ...config,
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    }
+  }
+  if (config.paymentRecovery) assertPaymentRecoveryConfig(config.paymentRecovery)
   const gw = new Hono()
   const rateLimitStore: RateLimitStore = config.rateLimitStore ?? new MemoryRateLimitStore()
   const state: GatewayState = {
@@ -43,6 +168,12 @@ export function createAgentGateway(config: GatewayConfig) {
     globalRateLimit: config.rateLimit ?? { limit: 60, windowSeconds: 60 },
     requiredScope: config.requiredScope ?? 'chat',
     maxLen: config.maxMessageLength ?? 8000,
+    maxOutputTokens,
+    defaultOutputTokens,
+    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? maxOutputTokens,
+    maxToolTokens: config.executionBudget?.maxToolTokens ?? maxOutputTokens,
+    maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
+    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd,
     obs: config.observer,
   }
   const obs: GatewayObserver | undefined = state.obs
@@ -125,9 +256,62 @@ export function createAgentGateway(config: GatewayConfig) {
       )
     }
 
-    const guard = await authenticateAndGuard(c, slug, body.messages, config, state)
+    const guard = await authenticateAndGuard(
+      c,
+      slug,
+      body.messages,
+      config,
+      state,
+      body.max_tokens,
+    )
     if (guard instanceof Response) return guard
     const authz = guard
+    try {
+      await claimPayment(authz, config, state)
+    } catch (error) {
+      const replayedGenericMpp = error instanceof PaymentRecoveryReplayError &&
+        authz.paymentMethod === 'mpp' &&
+        authz.mppMethod !== 'blueprintevm'
+      try {
+        await releasePayment(authz, config, 'payment authorization failed')
+      } catch (releaseError) {
+        console.error(
+          `[agent-gateway] payment release failed for ${authz.requestId}:`,
+          releaseError instanceof Error ? releaseError.message : String(releaseError),
+        )
+      }
+      await obs?.onAuthFailure?.(
+        {
+          requestId: authz.requestId,
+          agentSlug: authz.agent.slug,
+          startMs: authz.startMs,
+        },
+        {
+          method: authz.paymentMethod,
+          code: replayedGenericMpp ? 'invalid_mpp_credential' : 'payment_authorization_failed',
+          httpStatus: replayedGenericMpp ? 401 : 402,
+        },
+      )
+      const status = replayedGenericMpp ? 401 : 402
+      return c.json(
+        {
+          error: {
+            message: replayedGenericMpp ? 'Invalid Payment credential' : 'Payment authorization failed',
+            type: replayedGenericMpp ? 'authentication_error' : 'payment_required',
+            code: replayedGenericMpp ? 'invalid_mpp_credential' : 'payment_authorization_failed',
+          },
+        },
+        replayedGenericMpp
+          ? {
+              status,
+              headers: {
+                'WWW-Authenticate': `Payment realm="${config.mpp!.realm}", method="${config.mpp!.method ?? 'blueprintevm'}"`,
+                'X-Request-Id': authz.requestId,
+              },
+            }
+          : { status, headers: { 'X-Payment-Required': 'spendauth', 'X-Request-Id': authz.requestId } },
+      )
+    }
 
     return streamChatCompletions(c, authz, config, obs)
   })
@@ -139,11 +323,35 @@ export function createAgentGateway(config: GatewayConfig) {
   // regardless of which protocol the caller used.
   const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
   const pushStore = config.a2a?.pushStore
-  const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
-  gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
-  gw.post('/:slug', a2a.handleJsonRpc)
+  try {
+    const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
+    gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
+    gw.post('/:slug', a2a.handleJsonRpc)
+  } catch (error) {
+    // An older custom store must not take down the OpenAI surface. Keep the
+    // A2A surface unavailable until its owner supplies atomic methods.
+    console.error(
+      '[agent-gateway] A2A is unavailable until its task store is upgraded:',
+      error instanceof Error ? error.message : String(error),
+    )
+    const unavailable = (c: import('hono').Context) => c.json(
+      { error: 'A2A task persistence is not configured for concurrent workers' },
+      503,
+    )
+    gw.get('/:slug/.well-known/agent.json', unavailable)
+    gw.post('/:slug', unavailable)
+  }
 
   return gw
+}
+
+// Consumers that bind the gateway through a package boundary can fail closed
+// when an old binary ignores the version 2 operation contract.
+Object.assign(createAgentGateway, { paymentProtocolVersion: 2 as const })
+
+/** Public package-boundary version marker for durable payment operations. */
+export namespace createAgentGateway {
+  export const paymentProtocolVersion = 2 as const
 }
 
 /**
@@ -158,9 +366,23 @@ function streamChatCompletions(
   config: GatewayConfig,
   obs: GatewayObserver | undefined,
 ): Response {
-  const { agent, consumerId, paymentMethod, requestId, userMessage, rateLimitRemaining } = authz
-  const inputTokens = estimateTokens(userMessage)
-  let outputTokens = 0
+  const {
+    agent,
+    consumerId,
+    paymentMethod,
+    requestId,
+    userMessage,
+    rateLimitRemaining,
+    maxOutputTokens,
+  } = authz
+  let outputText = ''
+  let usage: import('./types').SandboxUsageReceipt | undefined
+  let workObserved = false
+  const requestSignal = c.req.raw.signal
+  const abortController = new AbortController()
+  const abortFromRequest = () => abortController.abort()
+  if (requestSignal.aborted) abortFromRequest()
+  else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -171,7 +393,8 @@ function streamChatCompletions(
     async start(controller) {
       const encoder = new TextEncoder()
       const sendChunk = (delta: string) => {
-        outputTokens += estimateTokens(delta)
+        if (controller.desiredSize === null) return
+        outputText += delta
         const chunk: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -183,9 +406,40 @@ function streamChatCompletions(
       }
 
       try {
-        for await (const delta of dispatchSandboxStream(agent, userMessage, consumerId, config)) {
-          sendChunk(delta)
+        for await (const event of dispatchSandboxStreamRich(
+          agent,
+          userMessage,
+          consumerId,
+          config,
+          abortController.signal,
+          undefined,
+          maxOutputTokens,
+          () => beginPaymentExecution(authz, config),
+          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
+          async () => {
+            if (authz.paymentRecoveryId) workObserved = true
+            await markPaymentExecutionStarted(authz, config)
+          },
+          authz.executionBudget.maxInputTokens,
+          () => renewPaymentExecution(authz, config),
+        )) {
+          if (event.kind === 'text') {
+            sendChunk(event.delta)
+            workObserved = true
+          }
+          if (event.kind === 'activity') workObserved = true
+          if (event.kind === 'usage') usage = event.usage
         }
+
+        if (!usage) throw new Error('sandbox did not provide a usage receipt')
+
+        await settleAndRecord(
+          agent,
+          authz,
+          usage,
+          config,
+          obs,
+        )
 
         const done: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
@@ -194,10 +448,10 @@ function streamChatCompletions(
           model: agent.slug,
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-
-        await settleAndRecord(agent, authz, inputTokens, outputTokens, config, obs)
+        if (controller.desiredSize !== null) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        }
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err)
         // Never expose stack traces / absolute paths from sandbox internals.
@@ -205,15 +459,36 @@ function streamChatCompletions(
           rawMessage.includes('/') || rawMessage.includes('\\')
             ? 'Internal agent error'
             : rawMessage
-        await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
-          ),
-        )
+        try {
+          await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
+        } catch (observerError) {
+          console.error(
+            `[agent-gateway] stream observer failed for ${requestId}:`,
+            observerError instanceof Error ? observerError.message : String(observerError),
+          )
+        }
+        try {
+          await releasePaymentAfterFailure(authz, config, rawMessage, workObserved || usage !== undefined)
+        } catch (releaseError) {
+          console.error(
+            `[agent-gateway] payment release failed for ${authz.requestId}:`,
+            releaseError instanceof Error ? releaseError.message : String(releaseError),
+          )
+        }
+        if (!abortController.signal.aborted && controller.desiredSize !== null) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
+            ),
+          )
+        }
       } finally {
-        controller.close()
+        requestSignal.removeEventListener('abort', abortFromRequest)
+        if (controller.desiredSize !== null) controller.close()
       }
+    },
+    cancel() {
+      abortController.abort()
     },
   })
 
@@ -225,7 +500,13 @@ function streamChatCompletions(
       'X-Agent-Slug': agent.slug,
       'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
       'X-Payment-Method': paymentMethod,
-      'X-Payment-Settled': paymentMethod === 'x402' ? 'pending' : 'true',
+      'X-Payment-Settled': paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
+      ...(authz.mppChargeOperation
+        ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
+        : {}),
+      ...(authz.paymentRecoveryId
+        ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
+        : {}),
       ...(rateLimitRemaining !== undefined
         ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
         : {}),

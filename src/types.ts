@@ -1,3 +1,25 @@
+import type {
+  PaymentAuthorizationContext,
+  PaymentOperation,
+  PaymentOperations,
+} from './payment-operations'
+import type { MppAuthenticatedCredential, MppChargeLifecycle } from './mpp-payment'
+import type { PaymentRecoveryConfig } from './payment-recovery'
+import type { GatewayObserver } from './observer-types'
+import type {
+  GatewayUsageEvent,
+  PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
+} from './payment-types'
+
+export type {
+  GatewayUsageEvent,
+  PaymentMethod,
+  SandboxExecutionBudget,
+  SandboxUsageReceipt,
+} from './payment-types'
+
 // --- Agent resolution ---
 
 export interface AgentMeta {
@@ -71,8 +93,6 @@ export interface AgentMeta {
 
 // --- Payment ---
 
-export type PaymentMethod = 'x402' | 'mpp' | 'apikey' | 'none'
-
 export interface X402Config {
   /** Ethereum operator address for SpendAuth verification */
   operatorAddress: string
@@ -84,8 +104,35 @@ export interface X402Config {
   rpcUrl?: string
   /** Demo mode: skip signature verification (default: false). NEVER enable in production. */
   demoMode?: boolean
-  /** Production signer verification. Called with the raw SpendAuth payload. Return true if signature is valid. */
-  verifySigner?: (payload: Record<string, unknown>) => Promise<boolean>
+  /** Protocol version for new durable payment operations. Production version 1 is read-only. */
+  paymentProtocolVersion?: 1 | 2
+  /**
+   * Production signature verification. This callback must not reserve, claim,
+   * or mutate payment state.
+   */
+  verifySigner?: (
+    payload: Record<string, unknown>,
+    context?: { protocolVersion: 1 | 2; requestId?: string },
+  ) => Promise<boolean>
+  /**
+   * Claim the verified payment after all request checks pass and immediately
+   * before sandbox work starts. Version 2 returns durable operation ownership.
+   * A boolean return is the version 1 demo-only compatibility path.
+   * Production version 1 must omit this callback because it has no durable
+   * provider operation or recovery identity.
+   */
+  authorizePayment?: (
+    payload: Record<string, unknown>,
+    context: PaymentAuthorizationContext,
+  ) => Promise<boolean | PaymentOperation>
+  /** Version 2 operation store. It owns claim, settle, release, and reclaim. */
+  paymentOperations?: PaymentOperations
+  /**
+   * Number of base-unit decimals used by the payment token. Defaults to 6.
+   * The gateway uses this value to reject a payment that cannot cover the
+   * request's maximum token charge before it calls `verifySigner`.
+   */
+  currencyDecimals?: number
 }
 
 export interface MppConfig {
@@ -94,17 +141,24 @@ export interface MppConfig {
   /** MPP method name (default: "blueprintevm") */
   method?: string
   /**
-   * Production verifier for the method-specific credential. Return the
-   * authenticated consumer id, or null when the credential is invalid.
-   * The callback receives the decoded JSON payload when one exists plus the
-   * original decoded credential so non-JSON methods can verify their own form.
-   * Omit only when x402.demoMode is explicitly enabled for local testing, or
-   * when x402.verifySigner handles an x402-compatible MPP credential.
+   * Pure credential authentication. Return stable method-owned identity, or null.
+   * This callback must not consume a credential, create a processor object,
+   * reserve funds, confirm payment, or perform any other financial mutation.
+   */
+  authenticateCredential?: (
+    payload: Record<string, unknown>,
+    context: { method: string; credential: string },
+  ) => Promise<MppAuthenticatedCredential | null>
+  /**
+   * @deprecated Use authenticateCredential and return a stable payment identity.
+   * This 0.7.1 callback remains supported through an explicit compatibility adapter.
    */
   verifySigner?: (
     payload: Record<string, unknown>,
     context: { method: string; credential: string },
   ) => Promise<string | null>
+  /** Required immediate-charge lifecycle for every non-BlueprinTEVM method. */
+  charge?: MppChargeLifecycle
 }
 
 export interface PaymentResult {
@@ -133,30 +187,6 @@ export interface ApiKeyInfo {
   dailyLimit?: number
 }
 
-// --- Usage tracking ---
-
-export interface GatewayUsageEvent {
-  /**
-   * Per-request id (matches `RequestContext.requestId`). Lets
-   * `recordUsage` correlate the usage row to the same request that
-   * `settlePayment` settles, observability hooks observe, and
-   * `onRequestComplete` reports — without re-deriving from a
-   * synthetic key. Required field as of 0.4.0; the gateway always has
-   * it in scope at the recordUsage call site.
-   */
-  requestId: string
-  agentId: string
-  agentSlug: string
-  consumerId: string
-  paymentMethod: PaymentMethod
-  inputTokens: number
-  outputTokens: number
-  totalCostUsd: number
-  ownerEarnedUsd: number
-  platformFeeUsd: number
-  durationMs: number
-}
-
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
@@ -174,11 +204,25 @@ export interface SandboxStreamEvent {
      * the caller (rendered as the input-required message body).
      */
     inputRequired?: { prompt?: string }
+    /** Provider receipt fields. Version 2 operations require every field. */
+    usage?: Partial<SandboxUsageReceipt>
+    /** Tool or reasoning events may carry hidden usage without visible text. */
+    tool?: { name?: string; inputTokens?: number; outputTokens?: number }
+    reasoning?: { tokens?: number }
   }
 }
 
 export interface SandboxBox {
-  streamPrompt(message: string, opts?: { sessionId?: string; systemPrompt?: string }): AsyncIterable<SandboxStreamEvent>
+  streamPrompt(
+    message: string,
+    opts?: {
+      sessionId?: string
+      systemPrompt?: string
+      maxOutputTokens?: number
+      executionBudget?: SandboxExecutionBudget
+      signal?: AbortSignal
+    },
+  ): AsyncIterable<SandboxStreamEvent>
 }
 
 // --- Gateway config ---
@@ -200,7 +244,12 @@ export interface GatewayConfig {
     consumer: { method: PaymentMethod; consumerId: string; keyId?: string; requestId: string },
   ) => Promise<{ allow: true } | { allow: false; reason: string; code: string }>
 
-  /** Record a usage event after request completes. */
+  /**
+   * Record a usage event after request completes.
+   * The implementation must atomically upsert by requestId and return
+   * success when the row already exists. Recovery may retry after an
+   * acknowledgement is lost, so one request ID must produce one usage row.
+   */
   recordUsage: (event: GatewayUsageEvent) => Promise<void>
 
   /** x402 payment configuration */
@@ -210,6 +259,12 @@ export interface GatewayConfig {
   mpp?: MppConfig
 
   /**
+   * Durable payment recovery outbox. Production payment protocol version 2
+   * and generic MPP charge methods require this configuration.
+   */
+  paymentRecovery?: PaymentRecoveryConfig
+
+  /**
    * Verify an API key. Return key info if valid, null if invalid.
    * In explicit x402 demo mode, the built-in verifier accepts `sk_agent_*` keys.
    * Production gateways must provide this callback.
@@ -217,10 +272,11 @@ export interface GatewayConfig {
   verifyApiKey?: (authHeader: string) => Promise<ApiKeyInfo | null>
 
   /**
-   * Settle payment after successful response.
-   * For x402: call ShieldedCredits.claimPayment()
-   * For API key: deduct from spending limit
-   * Default: no-op (demo mode).
+   * Settle a legacy payment after usage attribution is recorded.
+   * Version 2 x402 operations use `x402.paymentOperations` instead.
+   * Production x402 version 1 rejects this callback before nonce claim.
+   * For API keys, deduct from the spending limit.
+   * Default: no-op in explicit demo mode.
    */
   settlePayment?: (payment: PaymentResult, cost: number) => Promise<void>
 
@@ -229,6 +285,29 @@ export interface GatewayConfig {
 
   /** Max message length in chars (default: 8000) */
   maxMessageLength?: number
+
+  /** Maximum output token request the gateway accepts. Defaults to 4096. */
+  maxOutputTokens?: number
+
+  /** Output token limit used when a request omits `max_tokens`. Defaults to 1024. */
+  defaultOutputTokens?: number
+
+  /**
+   * Return a safe upper bound for the complete provider input.
+   * Include system, chat framing, retained history, tools, harness, and workspace context.
+   */
+  inputTokenBound?: (input: {
+    agent: AgentMeta
+    messages: ChatMessage[]
+  }) => number
+
+  /** Hidden provider spend limits included in the pre-execution payment quote. */
+  executionBudget?: {
+    maxReasoningTokens?: number
+    maxToolTokens?: number
+    maxToolCalls?: number
+    maxProviderCostUsd?: number
+  }
 
   /** Required scope for chat endpoint (default: "chat"). API keys must include this scope. */
   requiredScope?: string
@@ -251,19 +330,33 @@ export interface GatewayConfig {
    * and settlement failures. See ./observer.ts for the interface and
    * ConsoleObserver / CompositeObserver implementations.
    */
-  observer?: import('./observer').GatewayObserver
+  observer?: GatewayObserver
 
   /**
-   * A2A protocol configuration. When set, the gateway exposes the A2A
-   * surface alongside its OpenAI-compatible endpoints:
+   * A2A protocol configuration. The gateway exposes A2A with an in-memory
+   * task store by default. Set this object to provide durable storage or push:
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel
    * Auth + rate-limit + injection-filter + authorization all share the
    * same pipeline as the OpenAI-compat path. `taskStore` defaults to
    * `InMemoryTaskStore`; swap in D1/postgres/DO for durable deployments.
-   */
+  */
   a2a?: {
+    /**
+     * Authorize reads, cancellation, resubscription, and push configuration
+     * for an existing task. Production control methods fail closed when this
+     * hook is absent; explicit demo mode permits local tests.
+     */
+    authorizeTaskAccess?: (
+      task: import('./a2a/types').Task,
+      context: {
+        method: string
+        agentSlug: string
+        authorization: string
+        paymentSignature: string
+      },
+    ) => Promise<boolean>
     /**
      * Where tasks live. Defaults to `InMemoryTaskStore`; swap in
      * `SqlTaskStore` (D1, postgres, sqlite, libSQL) for durability across
@@ -282,8 +375,8 @@ export interface GatewayConfig {
      * Shared HMAC secret used to sign webhook deliveries (`X-A2A-Signature:
      * sha256=<hex>`). The consumer's webhook verifies the body against this
      * secret to confirm the call originated from this gateway. Required when
-     * `pushStore` is set; without it, deliveries fire unsigned and a
-     * malicious party that knows the webhook URL can forge deliveries.
+     * `pushStore` is set in production. Explicit demo mode may omit it for
+     * local tests; production deliveries never run unsigned.
      */
     webhookSecret?: string
     /**
@@ -291,6 +384,11 @@ export interface GatewayConfig {
      * `fetch`. Override for tests or to wire a queue-backed sender.
      */
     pushFetcher?: typeof fetch
+    /**
+     * DNS-aware policy for push destinations. Required when production
+     * push delivery is enabled so private DNS names cannot receive task data.
+     */
+    pushUrlValidator?: (url: URL) => boolean | Promise<boolean>
   }
 }
 

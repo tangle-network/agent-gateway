@@ -16,28 +16,81 @@ import type {
   GatewayUsageEvent,
   ApiKeyInfo,
 } from '../src/types'
-import { MemoryNonceStore } from '../src/nonce-store'
+import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
+import { MemoryPaymentOperations } from '../src/payment-operations'
+import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
+import type { MppChargeLifecycle } from '../src/mpp-payment'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
+const fundedRequestAmount = '1000000'
+
+function mppChargeLifecycle(onConfirm?: (credential: string) => void): MppChargeLifecycle {
+  const operations = new Map<string, Awaited<ReturnType<MppChargeLifecycle['confirmPayment']>>>()
+  return {
+    protocolVersion: 1,
+    async confirmPayment(request) {
+      onConfirm?.(request.credential)
+      const operation = {
+        protocolVersion: 1 as const,
+        operationId: request.operationId,
+        acquiredByRequestId: request.requestId,
+        method: request.method,
+        receipt: `receipt=${request.operationId}`,
+        state: 'confirmed' as const,
+      }
+      operations.set(operation.operationId, operation)
+      return operation
+    },
+    async releasePayment(operation) {
+      const released = { ...operation, state: 'released' as const }
+      operations.set(operation.operationId, released)
+      return released
+    },
+    async recoverPayment(operationId) {
+      return operations.get(operationId) ?? { operationId, state: 'not-found' as const }
+    },
+  }
+}
 
 /** Sandbox that emits a fixed reply, captures the prompt + opts for assertion */
 class StubSandbox implements SandboxBox {
   receivedPrompt: string | null = null
-  receivedOpts: { sessionId?: string; systemPrompt?: string } | undefined
+  receivedOpts: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number; executionBudget?: unknown } | undefined
   constructor(private chunks: string[]) {}
 
   async *streamPrompt(
     message: string,
-    opts?: { sessionId?: string; systemPrompt?: string },
+    opts?: { sessionId?: string; systemPrompt?: string; maxOutputTokens?: number; executionBudget?: unknown },
   ): AsyncIterable<SandboxStreamEvent> {
     this.receivedPrompt = message
     this.receivedOpts = opts
+    let remaining = (opts?.maxOutputTokens ?? 1024) * 4
+    let output = ''
     for (const delta of this.chunks) {
+      const bounded = delta.slice(0, remaining)
+      remaining -= bounded.length
+      output += bounded
+      if (!bounded) break
       yield {
         type: 'message.part.updated',
-        data: { part: { type: 'text' }, delta },
+        data: { part: { type: 'text' }, delta: bounded },
       }
+      if (bounded.length < delta.length) break
+    }
+    yield {
+      type: 'sandbox.usage',
+      data: {
+        usage: {
+          inputTokens: 1,
+          outputTokens: Math.ceil(output.length / 4),
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 0,
+          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
+          budgetEnforced: true,
+        },
+      },
     }
   }
 }
@@ -137,7 +190,7 @@ function buildSpendAuth(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     commitment: '0xCommitmentAlice',
     signature: '0xSignatureBytes',
-    amount: '20000',
+    amount: fundedRequestAmount,
     nonce: String(Math.floor(Math.random() * 1e9)),
     operator: operatorAddress,
     expiry: String(now + 600),
@@ -205,8 +258,8 @@ describe('GET /:slug/chat/completions (discovery)', () => {
     expect(response.status).toBe(401)
   })
 
-  it('does not advertise an MPP method without a compatible verifier', async () => {
-    const { app } = buildHarness({
+  it('rejects an MPP method without a compatible verifier at gateway construction', () => {
+    expect(() => buildHarness({
       mpp: { realm: 'agents.tangle.tools', method: 'stripe' },
       x402: {
         operatorAddress,
@@ -214,10 +267,69 @@ describe('GET /:slug/chat/completions (discovery)', () => {
         demoMode: false,
         verifySigner: async () => true,
       },
-    })
-    const discovery = await app.request('/v1/agents/test-agent/chat/completions')
-    const body = await discovery.json() as { payment_methods: Array<{ type: string }> }
-    expect(body.payment_methods.map((method) => method.type)).not.toContain('mpp')
+    })).toThrow('credential authentication')
+  })
+
+  it('rejects malformed MPP callback values at gateway construction', () => {
+    expect(() => buildHarness({
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        authenticateCredential: 'not-a-function' as unknown as NonNullable<GatewayConfig['mpp']>['authenticateCredential'],
+      },
+    })).toThrow('must be a function')
+  })
+
+  it('rejects an old generic MPP verifier without a charge lifecycle instead of silently disabling MPP', () => {
+    expect(() => buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:legacy',
+      },
+    })).toThrow('charge lifecycle')
+  })
+
+  it('accepts the old generic MPP verifier when its charge lifecycle is explicit', () => {
+    expect(() => buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+      },
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        verifySigner: async () => 'mpp:legacy',
+        charge: mppChargeLifecycle(),
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    })).not.toThrow()
+  })
+
+  it('rejects a legacy nonce store for version 2 payment ownership', () => {
+    expect(() => buildHarness({
+      nonceStore: {
+        hasSeen: async () => false,
+        markSeen: async () => undefined,
+      } as unknown as NonceStore,
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: false,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+      paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
+    })).toThrow('atomic nonce')
   })
 
   it('does not serve an agent whose resolver marks it disabled', async () => {
@@ -249,6 +361,84 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     const body = await res.json() as { error: { payment_methods: string[]; x402: Record<string, unknown> } }
     expect(body.error.payment_methods).toContain('x402')
     expect(body.error.x402.operator).toBe(operatorAddress)
+    expect(body.error.x402.required_amount).toBe('185460')
+    expect(body.error.x402.max_output_tokens).toBe(1024)
+  })
+
+  it('rejects an underfunded payment before the production verifier can reserve funds', async () => {
+    let verifierCalls = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => {
+          verifierCalls += 1
+          return true
+        },
+      },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ amount: '21019' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(402)
+    expect(verifierCalls).toBe(0)
+  })
+
+  it('enforces the paid max_tokens limit on the actual sandbox stream', async () => {
+    const { app, sandbox, usage } = buildHarness({}, ['abcdefgh', 'ijklmnop'])
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ amount: '1000000' }),
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 2,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const streamed = await readSse(res)
+    expect(streamed.combinedText).toBe('abcdefgh')
+    expect(sandbox.receivedOpts?.maxOutputTokens).toBe(2)
+    expect(usage[0]?.outputTokens).toBe(2)
+  })
+
+  it('rejects max_tokens above the configured ceiling before verification', async () => {
+    let verifierCalls = 0
+    const { app } = buildHarness({
+      maxOutputTokens: 8,
+      defaultOutputTokens: 4,
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => {
+          verifierCalls += 1
+          return true
+        },
+      },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth(),
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 9,
+      }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(verifierCalls).toBe(0)
   })
 
   it('returns 402 with invalid_spend_auth on bad X-Payment-Signature — regression: silent bypass of failed sig', async () => {
@@ -308,6 +498,357 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     // FIFO queue keyed by consumerId.
     expect(usage[0].requestId).toMatch(/.+/)
     expect(settlements[0].requestId).toBe(usage[0].requestId)
+  })
+
+  it('does not signal a successful stream before settlement succeeds', async () => {
+    const { app } = buildHarness({
+      settlePayment: async () => { throw new Error('settlement unavailable') },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9001' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const body = await res.text()
+    expect(res.status).toBe(200)
+    expect(body).toContain('settlement unavailable')
+    expect(body).not.toContain('data: [DONE]')
+  })
+
+  it('aborts and closes the sandbox iterator when an HTTP reader cancels', async () => {
+    let sandboxSignal: AbortSignal | undefined
+    let finishCleanup!: () => void
+    const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve })
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt(_message: string, opts?: { signal?: AbortSignal }) {
+          sandboxSignal = opts?.signal
+          try {
+            yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'partial' } }
+            await new Promise<void>((resolve) => {
+              opts?.signal?.addEventListener('abort', () => resolve(), { once: true })
+            })
+          } finally {
+            finishCleanup()
+          }
+        },
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_cancel',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const reader = response.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    await cleanup
+
+    expect(sandboxSignal?.aborted).toBe(true)
+  })
+
+  it('releases a durable payment when cancellation wins after authorization but before sandbox start', async () => {
+    const controller = new AbortController()
+    const operations = new MemoryPaymentOperations()
+    const originalBegin = operations.beginPaymentExecution.bind(operations)
+    operations.beginPaymentExecution = async (operation) => {
+      const executing = await originalBegin(operation)
+      controller.abort()
+      return executing
+    }
+    let sandboxCalls = 0
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          sandboxCalls += 1
+          yield { type: 'sandbox.usage', data: { usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            reasoningTokens: 0,
+            toolTokens: 0,
+            toolCallCount: 0,
+            providerCostUsd: 0,
+            budgetEnforced: true,
+          } } }
+        },
+      }),
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9003' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await response.text()
+
+    expect(sandboxCalls).toBe(0)
+    expect(operations.get('x402:0xcommitmentalice:9003')?.state).toBe('released')
+  })
+
+  it('records attribution before settlement so adapters can resolve the charge', async () => {
+    const order: string[] = []
+    const { app } = buildHarness({
+      recordUsage: async () => { order.push('record') },
+      settlePayment: async () => { order.push('settle') },
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9002' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    await res.text()
+    expect(order).toEqual(['record', 'settle'])
+  })
+
+  it('keeps legacy sandbox adapters working with visible-token estimates', async () => {
+    const { app, usage, settlements } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'legacy' } }
+        },
+      }),
+    })
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_legacy',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const streamed = await readSse(res)
+    expect(res.status).toBe(200)
+    expect(streamed.combinedText).toBe('legacy')
+    expect(streamed.done).toBe(true)
+    expect(usage[0]?.outputTokens).toBe(2)
+    expect(settlements).toHaveLength(1)
+  })
+
+  it('durably claims an x402-compatible MPP receipt and rejects its replay', async () => {
+    const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
+    const nonceStore: NonceStore = {
+      hasSeen: async () => false,
+      claim: async () => true,
+    }
+    const credential = Buffer.from(JSON.stringify({
+      payload: {
+        commitment: '0xCommitmentAlice',
+        signature: '0xSignatureBytes',
+        operator: operatorAddress,
+        amount: fundedRequestAmount,
+        nonce: '901',
+        expiry: String(Math.floor(Date.now() / 1000) + 600),
+      },
+    })).toString('base64url')
+    const { app } = buildHarness({
+      nonceStore,
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'blueprintevm',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: `${String(payload.commitment)}:${String(payload.nonce)}`,
+        }),
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const request = () => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment blueprintevm ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const first = await request()
+    await first.text()
+    const second = await request()
+    await second.text()
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(402)
+    expect(operations.get('x402:0xcommitmentalice:901')?.state).toBe('settled')
+  })
+
+  it('keeps a generic Stripe MPP receipt on its method-specific path', async () => {
+    const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
+    const credential = Buffer.from(JSON.stringify({
+      from: 'stripe-customer',
+      amount: fundedRequestAmount,
+      nonce: '902',
+      expiry: String(Math.floor(Date.now() / 1000) + 600),
+      receiptId: 'stripe-receipt-902',
+    })).toString('base64url')
+    const { app, settlements, usage } = buildHarness({
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:stripe-customer',
+          paymentIdentity: String(payload.receiptId),
+        }),
+        charge: mppChargeLifecycle(),
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const streamed = await readSse(response)
+
+    expect(response.status).toBe(200)
+    expect(streamed.combinedText).toBe('Hello, world!')
+    expect(streamed.done).toBe(true)
+    expect(operations.get('x402:stripe-customer:902')).toBeUndefined()
+    expect(settlements).toHaveLength(0)
+    expect(response.headers.get('Payment-Receipt')).toContain('receipt=')
+    expect(usage).toHaveLength(1)
+  })
+
+  it('claims an identical generic MPP receipt without a payload nonce only once', async () => {
+    let executions = 0
+    const credential = Buffer.from(JSON.stringify({ receiptId: 'receipt-1' })).toString('base64url')
+    const { app, settlements } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          executions += 1
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'generic' } }
+          yield {
+            type: 'sandbox.usage',
+            data: {
+              usage: {
+                inputTokens: 1,
+                outputTokens: 1,
+                reasoningTokens: 0,
+                toolTokens: 0,
+                toolCallCount: 0,
+                providerCostUsd: 0,
+                budgetEnforced: true,
+              },
+            },
+          }
+        },
+      }),
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: String(payload.receiptId),
+        }),
+        charge: mppChargeLifecycle(),
+      },
+    })
+    const request = () => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${credential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const responses = await Promise.all([request(), request()])
+    await Promise.all(responses.map((response) => response.text()))
+
+    const statuses = responses.map((response) => response.status)
+    expect(statuses.filter((status) => status === 200)).toHaveLength(1)
+    expect(statuses.filter((status) => status === 401 || status === 402)).toHaveLength(1)
+    expect(executions).toBe(1)
+    expect(settlements).toHaveLength(0)
+  })
+
+  it('requires complete receipts for every durable x402 or generic MPP payment', async () => {
+    const operations = new MemoryPaymentOperations()
+    const { app } = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'legacy' } }
+        },
+      }),
+      verifyApiKey: async () => ({ consumerId: 'api-consumer', keyId: 'api-key', scopes: ['chat'] }),
+      mpp: {
+        realm: 'agents.tangle.tools',
+        method: 'stripe',
+        authenticateCredential: async (payload) => ({
+          consumerId: 'mpp:consumer',
+          paymentIdentity: String(payload.receiptId ?? 'empty-receipt'),
+        }),
+        charge: mppChargeLifecycle(),
+      },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const apiKeyResponse = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_legacy',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const mppCredential = Buffer.from(JSON.stringify({})).toString('base64url')
+    const mppResponse = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Payment stripe ${mppCredential}`,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const [apiKeyStream, mppStream] = await Promise.all([
+      readSse(apiKeyResponse),
+      readSse(mppResponse),
+    ])
+    expect(apiKeyResponse.status).toBe(200)
+    expect(mppResponse.status).toBe(200)
+    expect(apiKeyStream.combinedText).toBe('legacy')
+    expect(mppStream.combinedText).toBe('legacy')
+    expect(apiKeyStream.done).toBe(true)
+    expect(mppStream.done).toBe(false)
   })
 
   it('threads a unique requestId per concurrent request — regression: two same-consumer requests get distinct ids', async () => {
@@ -569,6 +1110,65 @@ describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
     })
     expect(getSandboxCalls).toBe(0)
   })
+
+  it('does not reserve x402 funds until every request check allows the call', async () => {
+    let paymentAuthorizations = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        verifySigner: async () => true,
+        authorizePayment: async () => {
+          paymentAuthorizations += 1
+          return true
+        },
+      },
+      authorizeConsumer: async () => ({ allow: false, reason: 'no', code: 'denied' }),
+    })
+
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '5004' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(403)
+    expect(paymentAuthorizations).toBe(0)
+  })
+
+  it('reserves one x402 payment immediately before allowed sandbox work', async () => {
+    let paymentAuthorizations = 0
+    const { app } = buildHarness({
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        verifySigner: async () => true,
+        authorizePayment: async () => {
+          paymentAuthorizations += 1
+          return true
+        },
+      },
+      authorizeConsumer: async () => ({ allow: true }),
+    })
+
+    const res = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '5005' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    expect(res.status).toBe(200)
+    await readSse(res)
+    expect(paymentAuthorizations).toBe(1)
+  })
 })
 
 describe('createAgentGateway — production-config guard', () => {
@@ -596,6 +1196,51 @@ describe('createAgentGateway — production-config guard', () => {
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
       x402: { operatorAddress, chainId: 3799, verifySigner: async () => true },
+    })).not.toThrow()
+  })
+
+  it('requires an explicit version when durable payment operations are configured', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        demoMode: true,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+    })).toThrow(/paymentProtocolVersion must be explicit/)
+  })
+
+  it('requires a durable recovery outbox for production payment protocol version 2', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: {
+        operatorAddress,
+        chainId: 3799,
+        verifySigner: async () => true,
+        paymentProtocolVersion: 2,
+        paymentOperations: new MemoryPaymentOperations(),
+      },
+    })).toThrow(/durable payment recovery is required in production/)
+  })
+
+  it('keeps older custom A2A task stores source-compatible', () => {
+    expect(() => createAgentGateway({
+      resolveAgent: async () => null,
+      getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+      recordUsage: async () => { /* unused */ },
+      x402: { operatorAddress, chainId: 3799, demoMode: true },
+      a2a: {
+        taskStore: {
+          get: async () => undefined,
+          put: async () => undefined,
+          delete: async () => undefined,
+        },
+      },
     })).not.toThrow()
   })
 })

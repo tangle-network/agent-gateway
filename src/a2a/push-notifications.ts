@@ -90,6 +90,84 @@ export interface PushNotificationStore {
   delete(taskId: string, configId: string): Promise<void>
 }
 
+/**
+ * Validate a push destination before the gateway sends task data to it.
+ *
+ * The default policy rejects URL credentials, non-HTTPS schemes, IP literals
+ * in reserved ranges, and common private hostnames. Production deployments
+ * should also provide `GatewayConfig.a2a.pushUrlValidator` for DNS policy.
+ */
+export function validatePushNotificationUrl(value: string): URL | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    isPrivatePushHostname(url.hostname)
+  ) {
+    return undefined
+  }
+  return url
+}
+
+function isPrivatePushHostname(value: string): boolean {
+  const hostname = value.toLowerCase().replace(/\.$/, '')
+  const ipv4 = parseIpv4(hostname)
+  if (ipv4) {
+    const [first, second] = ipv4
+    return first === 0 ||
+      first === 10 ||
+      first === 127 ||
+      (first === 100 && second >= 64 && second <= 127) ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 0) ||
+      (first === 192 && second === 168) ||
+      (first === 198 && (second === 18 || second === 19)) ||
+      (first === 203 && second === 0) ||
+      first >= 224
+  }
+  const ipv6 = hostname.replace(/^\[|\]$/g, '')
+  if (
+    ipv6 === '::' ||
+    ipv6 === '::1' ||
+    ipv6.startsWith('fc') ||
+    ipv6.startsWith('fd') ||
+    ipv6.startsWith('fe8') ||
+    ipv6.startsWith('fe9') ||
+    ipv6.startsWith('fea') ||
+    ipv6.startsWith('feb') ||
+    // WHATWG URL normalizes dotted IPv4-mapped IPv6 literals to hexadecimal.
+    // Reject the whole mapped range instead of matching only dotted forms.
+    ipv6.startsWith('::ffff:') ||
+    // IPv4-compatible IPv6 literals can also embed loopback/private IPv4.
+    (ipv6.startsWith('::') && ipv6 !== '::1')
+  ) return true
+  return hostname === 'localhost' ||
+    hostname === 'localhost.localdomain' ||
+    hostname === 'metadata' ||
+    hostname === 'metadata.google.internal' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal') ||
+    hostname.endsWith('.intranet') ||
+    hostname.endsWith('.lan') ||
+    hostname.endsWith('.home')
+}
+
+function parseIpv4(value: string): [number, number, number, number] | undefined {
+  const parts = value.split('.')
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return undefined
+  const numbers = parts.map(Number)
+  if (numbers.some((part) => part > 255)) return undefined
+  return numbers as [number, number, number, number]
+}
+
 export class InMemoryPushNotificationStore implements PushNotificationStore {
   private readonly byTask = new Map<string, Map<string, PushNotificationConfig>>()
 
@@ -145,16 +223,14 @@ export class SqlPushNotificationStore implements PushNotificationStore {
 
   async set(taskId: string, config: PushNotificationConfig): Promise<void> {
     const auth = config.authentication ? JSON.stringify(config.authentication) : null
-    const updated = await this.db.exec(
-      `UPDATE ${this.table} SET url = ?, token = ?, authentication = ? WHERE task_id = ? AND config_id = ?`,
-      [config.url, config.token ?? null, auth, taskId, config.id],
+    await this.db.exec(
+      `INSERT INTO ${this.table} (task_id, config_id, url, token, authentication) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (task_id, config_id) DO UPDATE SET
+         url = excluded.url,
+         token = excluded.token,
+         authentication = excluded.authentication`,
+      [taskId, config.id, config.url, config.token ?? null, auth],
     )
-    if (updated.rowsAffected === 0) {
-      await this.db.exec(
-        `INSERT INTO ${this.table} (task_id, config_id, url, token, authentication) VALUES (?, ?, ?, ?, ?)`,
-        [taskId, config.id, config.url, config.token ?? null, auth],
-      )
-    }
   }
 
   async get(taskId: string, configId: string): Promise<PushNotificationConfig | undefined> {
@@ -207,24 +283,57 @@ export class SqlPushNotificationStore implements PushNotificationStore {
   }
 }
 
-/**
- * Send the webhook for each registered config on a task. Signs the body with
- * HMAC-SHA256 against `webhookSecret` so the consumer can verify authenticity.
- * Fire-and-forget per the design note above — the function awaits delivery
- * (so observability hooks see the result) but does not retry on failure.
- *
- * The caller decides *when* to deliver — typically on terminal-state
- * transitions emitted from `message/send` and `message/stream`.
- */
-export async function deliverPushNotifications(args: {
+interface PushDeliveryOptions {
   task: Task
   store: PushNotificationStore
-  webhookSecret: string | undefined
+  webhookSecret?: string
+  /** Atomically claim one terminal delivery before its external side effect. */
+  claimDelivery?: (
+    taskId: string,
+    configId: string,
+    terminalState: Task['status']['state'],
+  ) => Promise<boolean>
   /** Inject for tests. Defaults to global `fetch`. */
   fetcher?: typeof fetch
+  /** Optional DNS-aware host policy for production deployments. */
+  urlValidator?: (url: URL) => boolean | Promise<boolean>
+  /** Require `urlValidator` before sending from a production gateway. */
+  requireUrlValidator?: boolean
   /** Optional callback so the gateway's observer can log delivery outcomes. */
   onDelivery?: (result: PushDeliveryResult) => void
-}): Promise<PushDeliveryResult[]> {
+}
+
+export type PushNotificationDeliveryOptions = Omit<PushDeliveryOptions, 'webhookSecret'> & {
+  webhookSecret: string
+}
+
+/**
+ * Send signed webhooks for a terminal task.
+ *
+ * A non-empty HMAC secret is mandatory. This public production path cannot
+ * send an unsigned request.
+ */
+export async function deliverPushNotifications(
+  args: PushNotificationDeliveryOptions,
+): Promise<PushDeliveryResult[]> {
+  if (typeof args.webhookSecret !== 'string' || args.webhookSecret.trim().length === 0) {
+    throw new Error('deliverPushNotifications requires a non-empty webhookSecret')
+  }
+  return deliverPushNotificationsInternal(args)
+}
+
+/**
+ * Deliver unsigned webhooks only for explicit local demo mode.
+ *
+ * Production callers must use `deliverPushNotifications`.
+ */
+export async function deliverDemoPushNotifications(
+  args: Omit<PushNotificationDeliveryOptions, 'webhookSecret'>,
+): Promise<PushDeliveryResult[]> {
+  return deliverPushNotificationsInternal(args)
+}
+
+async function deliverPushNotificationsInternal(args: PushDeliveryOptions): Promise<PushDeliveryResult[]> {
   const fetcher = args.fetcher ?? fetch
   const configs = await args.store.list(args.task.id)
   const body = JSON.stringify({
@@ -238,6 +347,37 @@ export async function deliverPushNotifications(args: {
 
   const results: PushDeliveryResult[] = []
   for (const config of configs) {
+    // Validate before claiming so policy rejection remains retryable.
+    try {
+      const url = validatePushNotificationUrl(config.url)
+      if (!url) {
+        throw new Error('push notification URL is not a safe HTTPS destination')
+      }
+      if (args.requireUrlValidator && !args.urlValidator) {
+        throw new Error('push notification URL validation is not configured')
+      }
+      if (args.urlValidator && !await args.urlValidator(url)) {
+        throw new Error('push notification URL was rejected by host policy')
+      }
+    } catch (err) {
+      const result: PushDeliveryResult = {
+        taskId: args.task.id,
+        configId: config.id,
+        url: config.url,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      }
+      args.onDelivery?.(result)
+      results.push(result)
+      continue
+    }
+
+    if (
+      args.claimDelivery &&
+      !await args.claimDelivery(args.task.id, config.id, args.task.status.state)
+    ) {
+      continue
+    }
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (config.token) headers['X-A2A-Notification-Token'] = config.token
     if (signature) headers['X-A2A-Signature'] = signature
@@ -248,13 +388,23 @@ export async function deliverPushNotifications(args: {
 
     let result: PushDeliveryResult
     try {
-      const res = await fetcher(config.url, { method: 'POST', headers, body })
+      const res = await fetcher(config.url, {
+        method: 'POST',
+        headers,
+        body,
+        // Never follow a user-controlled redirect. The redirected destination
+        // could be an internal HTTP service or instance metadata endpoint.
+        redirect: 'manual',
+      })
       result = {
         taskId: args.task.id,
         configId: config.id,
         url: config.url,
         ok: res.ok,
         status: res.status,
+        ...(res.status >= 300 && res.status < 400
+          ? { error: 'push notification redirect rejected' }
+          : {}),
       }
     } catch (err) {
       result = {

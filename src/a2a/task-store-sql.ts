@@ -9,9 +9,8 @@
  * Schema is one table: tasks keyed by id with the full JSON payload, plus a
  * secondary index on `context_id` so `tasks/resubscribe` and conversational
  * lookups by context are O(log n). TTL is enforced at read time the same way
- * `InMemoryTaskStore` does — the gateway is single-writer per task id so a
- * stale row is invisible to callers regardless of when the row is physically
- * deleted.
+ * `InMemoryTaskStore` does — `createIfAbsent` and `compareAndSet` make task
+ * ownership safe when multiple gateway workers share the database.
  *
  * Why not bake in a specific driver? Hono workers run on Cloudflare (D1),
  * Node (pg / sqlite), Bun, Deno. Burning a hard dependency on one client
@@ -41,7 +40,8 @@
  *   await store.migrate()
  */
 
-import type { TaskStore } from './task-store'
+import { inspectTaskExecution } from './execution-fence'
+import { hasPendingPaymentRecovery, type TaskStore } from './task-store'
 import type { Task } from './types'
 
 /**
@@ -98,7 +98,9 @@ const TASKS_TABLE_DDL = (table: string) => `
     context_id TEXT NOT NULL,
     state TEXT NOT NULL,
     payload TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    execution_request_id TEXT,
+    execution_lease_expires_at REAL
   )
 `
 const CTX_INDEX_DDL = (table: string) => `
@@ -124,50 +126,236 @@ export class SqlTaskStore implements TaskStore {
     return this.opts.table ?? 'a2a_tasks'
   }
 
+  private async readRow(id: string): Promise<{
+    payload: string
+    updatedAt: number
+    executionRequestId: string | null
+    executionLeaseExpiresAt: number | null
+  } | undefined> {
+    const rows = await this.db.query<{
+      payload: string
+      updated_at: number
+      execution_request_id?: string | null
+      execution_lease_expires_at?: number | null
+    }>(
+      `SELECT payload, updated_at, execution_request_id, execution_lease_expires_at FROM ${this.table} WHERE id = ?`,
+      [id],
+    )
+    const row = rows[0]
+    return row
+      ? {
+          payload: row.payload,
+          updatedAt: row.updated_at,
+          executionRequestId: row.execution_request_id ?? null,
+          executionLeaseExpiresAt: row.execution_lease_expires_at ?? null,
+        }
+      : undefined
+  }
+
+  private isExpired(updatedAt: number, task: Task): boolean {
+    return Date.now() - updatedAt > this.ttlMs && !hasPendingPaymentRecovery(task)
+  }
+
+  private async deleteObservedRow(
+    id: string,
+    payload: string,
+    updatedAt: number,
+  ): Promise<number> {
+    const result = await this.db.exec(
+      `DELETE FROM ${this.table} WHERE id = ? AND payload = ? AND updated_at = ?`,
+      [id, payload, updatedAt],
+    )
+    return result.rowsAffected
+  }
+
   /** Idempotent. Call once at deploy. */
   async migrate(): Promise<void> {
     await this.db.exec(TASKS_TABLE_DDL(this.table))
+    for (const column of [
+      'execution_request_id TEXT',
+      'execution_lease_expires_at REAL',
+    ]) {
+      try {
+        await this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN ${column}`)
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
+        if (!message.includes('duplicate column') && !message.includes('already exists')) throw error
+      }
+    }
     await this.db.exec(CTX_INDEX_DDL(this.table))
   }
 
   async get(id: string): Promise<Task | undefined> {
-    const rows = await this.db.query<{ payload: string; updated_at: number }>(
-      `SELECT payload, updated_at FROM ${this.table} WHERE id = ?`,
-      [id],
-    )
-    const row = rows[0]
+    const row = await this.readRow(id)
     if (!row) return undefined
-    if (Date.now() - row.updated_at > this.ttlMs) {
-      // Lazy GC. If the delete loses a race with another reader, that reader
-      // observes either the stale-then-deleted task (returning undefined here)
-      // or, after this delete commits, observes undefined directly — either
-      // way callers see consistent "expired" semantics.
-      void this.db.exec(`DELETE FROM ${this.table} WHERE id = ?`, [id])
+    const task = JSON.parse(row.payload) as Task
+    if (this.isExpired(row.updatedAt, task)) {
+      // Delete only the version that was observed as stale. A refresh can reuse
+      // the same payload, so payload equality and updated_at both fence the row.
+      await this.deleteObservedRow(id, row.payload, row.updatedAt)
       return undefined
     }
-    return JSON.parse(row.payload) as Task
+    return task
+  }
+
+  private async insert(task: Task): Promise<number> {
+    const payload = JSON.stringify(task)
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(task)
+    const result = await this.db.exec(
+      `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at, execution_request_id, execution_lease_expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        task.id,
+        task.contextId,
+        task.status.state,
+        payload,
+        Date.now(),
+        executionRequestId,
+        executionLeaseExpiresAt,
+      ],
+    )
+    return result.rowsAffected
   }
 
   async put(task: Task): Promise<void> {
     const payload = JSON.stringify(task)
     const updatedAt = Date.now()
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(task)
     // Adapter-agnostic upsert: try update, fall back to insert if no row
     // existed. Avoids needing ON CONFLICT (postgres) vs INSERT OR REPLACE
     // (sqlite/libSQL) divergence at the SQL layer.
     const updated = await this.db.exec(
-      `UPDATE ${this.table} SET context_id = ?, state = ?, payload = ?, updated_at = ? WHERE id = ?`,
-      [task.contextId, task.status.state, payload, updatedAt, task.id],
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ?`,
+      [
+        task.contextId,
+        task.status.state,
+        payload,
+        updatedAt,
+        executionRequestId,
+        executionLeaseExpiresAt,
+        task.id,
+      ],
     )
     if (updated.rowsAffected === 0) {
       await this.db.exec(
-        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at) VALUES (?, ?, ?, ?, ?)`,
-        [task.id, task.contextId, task.status.state, payload, updatedAt],
+        `INSERT INTO ${this.table} (id, context_id, state, payload, updated_at, execution_request_id, execution_lease_expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          task.id,
+          task.contextId,
+          task.status.state,
+          payload,
+          updatedAt,
+          executionRequestId,
+          executionLeaseExpiresAt,
+        ],
       )
     }
   }
 
+  async createIfAbsent(task: Task): Promise<boolean> {
+    try {
+      return (await this.insert(task)) === 1
+    } catch (error) {
+      // SQL dialects report duplicate primary keys as errors. Inspect the raw
+      // row so an expired row can be removed and retried in the same call.
+      const row = await this.readRow(task.id)
+      if (!row) throw error
+      const existing = JSON.parse(row.payload) as Task
+      if (!this.isExpired(row.updatedAt, existing)) return false
+
+      await this.deleteObservedRow(task.id, row.payload, row.updatedAt)
+      try {
+        return (await this.insert(task)) === 1
+      } catch (retryError) {
+        // Another writer may have won the retry after the stale row was
+        // removed. Return the normal idempotency result in that case.
+        if (await this.get(task.id)) return false
+        throw retryError
+      }
+    }
+  }
+
+  async compareAndSet(expected: Task, next: Task): Promise<boolean> {
+    const expectedPayload = JSON.stringify(expected)
+    const payload = JSON.stringify(next)
+    const [executionRequestId, executionLeaseExpiresAt] = executionColumns(next)
+    const result = await this.db.exec(
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ? AND payload = ?`,
+      [
+        next.contextId,
+        next.status.state,
+        payload,
+        Date.now(),
+        executionRequestId,
+        executionLeaseExpiresAt,
+        expected.id,
+        expectedPayload,
+      ],
+    )
+    return result.rowsAffected === 1
+  }
+
+  async compareAndSetExecution(
+    expected: Task,
+    next: Task,
+    requestId: string,
+    now: number,
+  ): Promise<boolean> {
+    const expectedMarker = inspectTaskExecution(expected)
+    const nextMarker = inspectTaskExecution(next)
+    if (
+      expectedMarker.state !== 'valid' ||
+      nextMarker.state !== 'valid' ||
+      expectedMarker.marker.requestId !== requestId ||
+      nextMarker.marker.requestId !== requestId ||
+      expectedMarker.marker.lease.expiresAt <= now ||
+      nextMarker.marker.lease.expiresAt <= now
+    ) return false
+    const expectedPayload = JSON.stringify(expected)
+    const payload = JSON.stringify(next)
+    const updatedAt = Date.now()
+    // Both NULL columns identify a legacy row whose payload still owns the fence.
+    const result = await this.db.exec(
+      `UPDATE ${this.table}
+       SET context_id = ?, state = ?, payload = ?, updated_at = ?,
+           execution_request_id = ?, execution_lease_expires_at = ?
+       WHERE id = ?
+         AND payload = ?
+         AND state = 'working'
+         AND (
+           (execution_request_id = ? AND execution_lease_expires_at > ?)
+           OR (execution_request_id IS NULL AND execution_lease_expires_at IS NULL)
+         )`,
+      [
+        next.contextId,
+        next.status.state,
+        payload,
+        updatedAt,
+        nextMarker.marker.requestId,
+        nextMarker.marker.lease.expiresAt,
+        expected.id,
+        expectedPayload,
+        requestId,
+        now,
+      ],
+    )
+    return result.rowsAffected === 1
+  }
+
   async delete(id: string): Promise<void> {
-    await this.db.exec(`DELETE FROM ${this.table} WHERE id = ?`, [id])
+    const task = await this.get(id)
+    if (!task || hasPendingPaymentRecovery(task)) return
+    await this.db.exec(
+      `DELETE FROM ${this.table} WHERE id = ? AND payload = ?`,
+      [id, JSON.stringify(task)],
+    )
   }
 
   /**
@@ -183,7 +371,17 @@ export class SqlTaskStore implements TaskStore {
     )
     const now = Date.now()
     return rows
-      .filter((r) => now - r.updated_at <= this.ttlMs)
-      .map((r) => JSON.parse(r.payload) as Task)
+      .map((r) => ({ task: JSON.parse(r.payload) as Task, updatedAt: r.updated_at }))
+      .filter(({ task, updatedAt }) =>
+        now - updatedAt <= this.ttlMs || hasPendingPaymentRecovery(task),
+      )
+      .map(({ task }) => task)
   }
+}
+
+function executionColumns(task: Task): [string | null, number | null] {
+  const inspection = inspectTaskExecution(task)
+  return inspection.state === 'valid'
+    ? [inspection.marker.requestId, inspection.marker.lease.expiresAt]
+    : [null, null]
 }
