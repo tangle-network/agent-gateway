@@ -7,6 +7,7 @@ import {
 import type {
   AgentMeta,
   GatewayConfig,
+  GatewaySandboxContext,
   SandboxExecutionBudget,
   SandboxStreamEvent,
   SandboxUsageReceipt,
@@ -58,9 +59,10 @@ export async function* dispatchSandboxStreamRich(
   onSandboxStart?: () => void | Promise<void>,
   maxInputTokens?: number,
   onExecutionHeartbeat?: () => Promise<void>,
+  sandboxContext?: GatewaySandboxContext,
 ): AsyncIterable<A2ADispatchEvent> {
   if (signal?.aborted) return
-  const box = await config.getSandbox(agent)
+  const box = await config.getSandbox(agent, sandboxContext)
   if (signal?.aborted) return
   const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
   if (!Number.isSafeInteger(outputLimit) || outputLimit <= 0) {

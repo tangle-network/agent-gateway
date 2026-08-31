@@ -225,14 +225,28 @@ export interface SandboxBox {
   ): AsyncIterable<SandboxStreamEvent>
 }
 
+/** Authenticated request identity supplied when the host resolves a sandbox. */
+export interface GatewaySandboxContext {
+  consumerId: string
+  paymentMethod: PaymentMethod
+  keyInfo: ApiKeyInfo | null
+  requestId: string
+  messages: ChatMessage[]
+  /** Stable UI conversation id when `conversationMode` is `thread`. */
+  threadId?: string
+}
+
 // --- Gateway config ---
 
 export interface GatewayConfig {
   /** Resolve agent metadata by slug. Return null if not found or not published. */
   resolveAgent: (slug: string) => Promise<AgentMeta | null>
 
-  /** Get a sandbox instance for the agent. Called after payment is verified. */
-  getSandbox: (agent: AgentMeta) => Promise<SandboxBox>
+  /**
+   * Get the agent execution adapter after payment is verified.
+   * Hosts that use agent-app can drive their normal persisted chat route here.
+   */
+  getSandbox: (agent: AgentMeta, context?: GatewaySandboxContext) => Promise<SandboxBox>
 
   /**
    * Optional host authorization hook fired after payment verification
@@ -241,7 +255,14 @@ export interface GatewayConfig {
    */
   authorizeConsumer?: (
     agent: AgentMeta,
-    consumer: { method: PaymentMethod; consumerId: string; keyId?: string; requestId: string },
+    consumer: {
+      method: PaymentMethod
+      consumerId: string
+      keyId?: string
+      requestId: string
+      /** Requested stable conversation id, after syntax validation. */
+      threadId?: string
+    },
   ) => Promise<{ allow: true } | { allow: false; reason: string; code: string }>
 
   /**
@@ -282,6 +303,16 @@ export interface GatewayConfig {
 
   /** Base URL for API key purchase links (e.g. "https://film.tangle.tools") */
   baseUrl?: string
+
+  /** Public API key prefix shown by discovery. Defaults to `sk_agent_`. */
+  apiKeyPrefix?: string
+
+  /**
+   * `consumer` keeps the historical session per API consumer.
+   * `thread` accepts `X-Tangle-Thread-Id` or creates one per request and returns
+   * it in the response, so a host can display the same conversation.
+   */
+  conversationMode?: 'consumer' | 'thread'
 
   /** Max message length in chars (default: 8000) */
   maxMessageLength?: number
@@ -391,6 +422,16 @@ export interface GatewayConfig {
     pushUrlValidator?: (url: URL) => boolean | Promise<boolean>
   }
 }
+
+/** API-key-only gateway input. Payment transports stay disabled. */
+export type ApiKeyGatewayConfig = Omit<GatewayConfig, 'mpp' | 'verifyApiKey' | 'x402'> & {
+  mpp?: never
+  verifyApiKey: NonNullable<GatewayConfig['verifyApiKey']>
+  x402?: never
+}
+
+/** Configuration accepted by `createAgentGateway`. */
+export type CreateAgentGatewayConfig = GatewayConfig | ApiKeyGatewayConfig
 
 // --- Chat completion types (OpenAI-compatible) ---
 

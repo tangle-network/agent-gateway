@@ -19,6 +19,7 @@ import {
   defaultVerifyApiKey,
   isApiKeyAuthEnabled,
   isMppAuthEnabled,
+  isX402AuthEnabled,
   mppPaymentPayload,
   mppPaymentCredential,
   verifyMppCredential,
@@ -47,6 +48,18 @@ export async function authenticateAndGuard(
   const requestId = generateRequestId()
   const ctx: RequestContext = { requestId, agentSlug: slug, startMs }
   await state.obs?.onRequestStart?.(ctx)
+
+  let threadId: string | undefined
+  if (config.conversationMode === 'thread') {
+    const requestedThreadId = c.req.header('X-Tangle-Thread-Id')?.trim()
+    if (requestedThreadId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestedThreadId)) {
+      return c.json(
+        { error: { message: 'Invalid X-Tangle-Thread-Id', type: 'invalid_request' } },
+        { status: 400, headers: { 'X-Request-Id': requestId } },
+      )
+    }
+    threadId = requestedThreadId || requestId
+  }
 
   const agent = await config.resolveAgent(slug)
   if (!agent || !agent.enabled) {
@@ -83,10 +96,14 @@ export async function authenticateAndGuard(
     messages,
     state.maxLen,
   )
-  const userMessage = filtered
+  const userMessages = filtered
     .filter((m) => m.role === 'user')
-    .map((m) => m.content)
-    .join('\n\n')
+  // A thread-backed host already owns the persisted history. Send only the
+  // new turn to avoid storing the caller's full history as one new user row.
+  // Keep the historical concatenation for the default consumer session.
+  const userMessage = config.conversationMode === 'thread'
+    ? userMessages[userMessages.length - 1]?.content ?? ''
+    : userMessages.map((m) => m.content).join('\n\n')
   if (!userMessage) {
     return c.json(
       { error: { message: 'No user message provided', type: 'invalid_request' } },
@@ -176,6 +193,12 @@ export async function authenticateAndGuard(
   let mppPaymentIdentity: string | undefined
 
   if (spendAuthHeader) {
+    if (!isX402AuthEnabled(config)) {
+      return c.json(
+        { error: { message: 'x402 authentication is not configured', type: 'authentication_error' } },
+        { status: 401, headers: { 'X-Request-Id': requestId } },
+      )
+    }
     const signer = await verifyX402(
       spendAuthHeader,
       config.x402,
@@ -301,7 +324,8 @@ export async function authenticateAndGuard(
       code: 'payment_required',
       httpStatus: 402,
     })
-    const methods: string[] = ['x402']
+    const methods: string[] = []
+    if (isX402AuthEnabled(config)) methods.push('x402')
     if (isMppAuthEnabled(config)) methods.push('mpp')
     if (isApiKeyAuthEnabled(config)) methods.push('api_key')
     const headers: Record<string, string> = {
@@ -318,14 +342,18 @@ export async function authenticateAndGuard(
           message: 'Payment required',
           type: 'payment_required',
           payment_methods: methods,
-          x402: {
-            operator: config.x402.operatorAddress,
-            chain_id: config.x402.chainId,
-            credits_address: config.x402.creditsAddress,
-            required_amount: requiredPaymentAmount.toString(),
-            currency_decimals: config.x402.currencyDecimals ?? 6,
-            max_output_tokens: maxOutputTokens,
-          },
+          ...(isX402AuthEnabled(config)
+            ? {
+                x402: {
+                  operator: config.x402.operatorAddress,
+                  chain_id: config.x402.chainId,
+                  credits_address: config.x402.creditsAddress,
+                  required_amount: requiredPaymentAmount.toString(),
+                  currency_decimals: config.x402.currencyDecimals ?? 6,
+                  max_output_tokens: maxOutputTokens,
+                },
+              }
+            : {}),
           ...(isMppAuthEnabled(config) && config.mpp
             ? { mpp: { realm: config.mpp.realm, method: config.mpp.method ?? 'blueprintevm' } }
             : {}),
@@ -399,6 +427,7 @@ export async function authenticateAndGuard(
       consumerId: consumerId,
       keyId: keyInfo?.keyId,
       requestId,
+      ...(threadId ? { threadId } : {}),
     })
     if (!authz.allow) {
       return c.json(
@@ -422,6 +451,8 @@ export async function authenticateAndGuard(
     userMessage,
     rateLimitRemaining: rl.remaining,
     requestId,
+    messages: filtered,
+    ...(threadId ? { threadId } : {}),
     startMs,
     maxOutputTokens,
     executionBudget,

@@ -43,7 +43,8 @@ app.route('/v1/agents', createAgentGateway({
 }))
 ```
 
-`x402.verifySigner` is required for production.
+Production requires either `x402.verifySigner` or `verifyApiKey`.
+API-key-only apps can omit `x402` entirely.
 Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
 Keep `verifySigner` free of side effects.
 Use version 2's `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
@@ -108,6 +109,11 @@ The 0.7.1 `mpp.verifySigner` callback is also supported; the gateway derives a s
 
 The same authentication, authorization, rate-limit, filtering, sandbox, settlement, and usage-recording pipeline is used by the OpenAI-compatible and A2A endpoints.
 Wire protocol handlers only translate their request and response shapes.
+
+Set `conversationMode: 'thread'` when API calls must use the app's visible conversations.
+The gateway accepts an optional `X-Tangle-Thread-Id` and returns the resolved ID in the same response header.
+Its authenticated `getSandbox` context contains that thread ID, the API-key identity, and the filtered messages.
+An `agent-app` host can use this context to drive its normal persisted chat route instead of opening a second sandbox session.
 
 ## A2A protocol
 
