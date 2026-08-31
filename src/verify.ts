@@ -108,6 +108,13 @@ export function isApiKeyAuthEnabled(
   return config.verifyApiKey !== undefined || config.x402.demoMode === true
 }
 
+/** x402 is advertised only when the gateway can authenticate it. */
+export function isX402AuthEnabled(
+  config: Pick<GatewayConfig, 'x402'>,
+): boolean {
+  return config.x402.verifySigner !== undefined || config.x402.demoMode === true
+}
+
 /** MPP is enabled only when authentication and method settlement are complete. */
 export function isMppAuthEnabled(
   config: Pick<GatewayConfig, 'mpp' | 'x402'>,

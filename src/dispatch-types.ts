@@ -7,6 +7,7 @@ import type { PaymentSettlementBasis } from './payment-recovery'
 import type {
   AgentMeta,
   ApiKeyInfo,
+  ChatMessage,
   PaymentMethod,
   SandboxExecutionBudget,
   SandboxUsageReceipt,
@@ -37,6 +38,8 @@ export interface AuthorizedRequest {
   userMessage: string
   rateLimitRemaining: number | undefined
   requestId: string
+  messages?: ChatMessage[]
+  threadId?: string
   startMs: number
   maxOutputTokens: number
   executionBudget: SandboxExecutionBudget

@@ -23,8 +23,13 @@ import {
   assertPaymentRecoveryConfig,
 } from './payment-recovery'
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
-import type { ChatCompletionChunk, ChatCompletionRequest, GatewayConfig } from './types'
-import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
+import type {
+  ChatCompletionChunk,
+  ChatCompletionRequest,
+  CreateAgentGatewayConfig,
+  GatewayConfig,
+} from './types'
+import { isApiKeyAuthEnabled, isMppAuthEnabled, isX402AuthEnabled } from './verify'
 
 /**
  * Create a Hono router that serves the agent gateway.
@@ -36,13 +41,19 @@ import { isApiKeyAuthEnabled, isMppAuthEnabled } from './verify'
  *   GET  /:slug/chat/completions  — agent discovery metadata (Tangle-native shape)
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
-export function createAgentGateway(inputConfig: GatewayConfig) {
-  let config = inputConfig
+export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
+  let config: GatewayConfig = inputConfig.x402
+    ? inputConfig
+    : {
+        ...inputConfig,
+        x402: { operatorAddress: '', chainId: 0 },
+      }
   // Production gateways must verify x402 signatures. Tests and local
   // dev can opt into the explicit demo path.
-  if (!config.x402.verifySigner && !config.x402.demoMode) {
+  if (!isX402AuthEnabled(config) && !config.verifyApiKey) {
     throw new Error(
-      'createAgentGateway: x402.verifySigner is required in production. ' +
+      'createAgentGateway: verifySigner is required in production unless verifyApiKey is configured; ' +
+        'configure x402.verifySigner or verifyApiKey. ' +
         'For tests, set x402.demoMode: true explicitly.',
     )
   }
@@ -185,14 +196,15 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
     const agent = await config.resolveAgent(slug)
     if (!agent || !agent.enabled) return c.json({ error: 'Agent not found or not published' }, 404)
 
-    const paymentMethods: Array<Record<string, unknown>> = [
-      {
+    const paymentMethods: Array<Record<string, unknown>> = []
+    if (isX402AuthEnabled(config)) {
+      paymentMethods.push({
         type: 'x402',
         operator: config.x402.operatorAddress,
         chain_id: config.x402.chainId,
         credits_contract: config.x402.creditsAddress,
-      },
-    ]
+      })
+    }
     if (isMppAuthEnabled(config)) {
       paymentMethods.push({
         type: 'mpp',
@@ -200,7 +212,9 @@ export function createAgentGateway(inputConfig: GatewayConfig) {
         method: config.mpp!.method ?? 'blueprintevm',
       })
     }
-    if (isApiKeyAuthEnabled(config)) paymentMethods.push({ type: 'api_key', prefix: 'sk_agent_' })
+    if (isApiKeyAuthEnabled(config)) {
+      paymentMethods.push({ type: 'api_key', prefix: config.apiKeyPrefix ?? 'sk_agent_' })
+    }
 
     return c.json({
       slug: agent.slug,
@@ -412,7 +426,7 @@ function streamChatCompletions(
           consumerId,
           config,
           abortController.signal,
-          undefined,
+          authz.threadId,
           maxOutputTokens,
           () => beginPaymentExecution(authz, config),
           authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
@@ -422,6 +436,14 @@ function streamChatCompletions(
           },
           authz.executionBudget.maxInputTokens,
           () => renewPaymentExecution(authz, config),
+          {
+            consumerId,
+            paymentMethod,
+            keyInfo: authz.keyInfo,
+            requestId,
+            messages: authz.messages ?? [],
+            ...(authz.threadId ? { threadId: authz.threadId } : {}),
+          },
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)
@@ -499,6 +521,7 @@ function streamChatCompletions(
       'X-Request-Id': requestId,
       'X-Agent-Slug': agent.slug,
       'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
+      ...(authz.threadId ? { 'X-Tangle-Thread-Id': authz.threadId } : {}),
       'X-Payment-Method': paymentMethod,
       'X-Payment-Settled': paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
       ...(authz.mppChargeOperation

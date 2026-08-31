@@ -15,6 +15,7 @@ import type {
   SandboxStreamEvent,
   GatewayUsageEvent,
   ApiKeyInfo,
+  GatewaySandboxContext,
 } from '../src/types'
 import { MemoryNonceStore, type NonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
@@ -258,6 +259,27 @@ describe('GET /:slug/chat/completions (discovery)', () => {
     expect(response.status).toBe(401)
   })
 
+  it('supports production API-key-only gateways without advertising x402', async () => {
+    const sandbox = new StubSandbox(['api only'])
+    const gateway = createAgentGateway({
+      resolveAgent: async (slug) => slug === 'test-agent' ? makeAgent() : null,
+      getSandbox: async () => sandbox,
+      recordUsage: async () => undefined,
+      verifyApiKey: async () => ({
+        consumerId: 'api-consumer',
+        keyId: 'api-key',
+        scopes: ['chat'],
+      }),
+    })
+    const app = new Hono().route('/v1/agents', gateway)
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions')
+    const body = await response.json() as { payment_methods: Array<{ type: string }> }
+
+    expect(response.status).toBe(200)
+    expect(body.payment_methods.map((method) => method.type)).toEqual(['api_key'])
+  })
+
   it('rejects an MPP method without a compatible verifier at gateway construction', () => {
     expect(() => buildHarness({
       mpp: { realm: 'agents.tangle.tools', method: 'stripe' },
@@ -349,6 +371,92 @@ describe('GET /:slug/chat/completions (discovery)', () => {
 })
 
 describe('POST /:slug/chat/completions — auth paths', () => {
+  it('returns the UI thread id and supplies the authenticated request to the host adapter', async () => {
+    let executionContext: GatewaySandboxContext | undefined
+    const sandbox = new StubSandbox(['threaded'])
+    const { app } = buildHarness({
+      conversationMode: 'thread',
+      x402: { operatorAddress, chainId: 3799 },
+      verifyApiKey: async () => ({
+        consumerId: 'api-consumer',
+        keyId: 'api-key',
+        scopes: ['chat'],
+      }),
+      getSandbox: async (_agent, context) => {
+        executionContext = context
+        return sandbox
+      },
+    })
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer agent-key',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'do real work' }] }),
+    })
+    const threadId = response.headers.get('X-Tangle-Thread-Id')
+    const streamed = await readSse(response)
+
+    expect(response.status).toBe(200)
+    expect(threadId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]+$/)
+    expect(streamed.combinedText).toBe('threaded')
+    expect(executionContext).toMatchObject({
+      consumerId: 'api-consumer',
+      paymentMethod: 'apikey',
+      requestId: threadId,
+      threadId,
+      messages: [{ role: 'user', content: 'do real work' }],
+      keyInfo: { keyId: 'api-key' },
+    })
+    expect(sandbox.receivedOpts?.sessionId).toBe(threadId)
+  })
+
+  it('continues a requested UI thread and rejects unsafe thread ids', async () => {
+    const { app } = buildHarness({ conversationMode: 'thread' })
+    const request = (threadId: string) => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_thread',
+        'X-Tangle-Thread-Id': threadId,
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'continue' }] }),
+    })
+
+    const continued = await request('thread-existing-1')
+    await continued.text()
+    const rejected = await request('../another workspace')
+
+    expect(continued.headers.get('X-Tangle-Thread-Id')).toBe('thread-existing-1')
+    expect(rejected.status).toBe(400)
+  })
+
+  it('sends only the newest user turn to a thread-backed sandbox', async () => {
+    const { app, sandbox } = buildHarness({ conversationMode: 'thread' })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_thread-history',
+        'X-Tangle-Thread-Id': 'thread-history-1',
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: 'first question' },
+          { role: 'assistant', content: 'first answer' },
+          { role: 'user', content: 'latest question' },
+        ],
+      }),
+    })
+
+    await readSse(response)
+
+    expect(response.status).toBe(200)
+    expect(sandbox.receivedPrompt).toBe('latest question')
+  })
+
   it('returns 402 when no payment header present — regression: free rides would drain compute', async () => {
     const { app } = buildHarness()
     const res = await app.request('/v1/agents/test-agent/chat/completions', {
@@ -1060,6 +1168,30 @@ describe('POST /:slug/chat/completions — injection blocking', () => {
 })
 
 describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
+  it('passes the validated thread id to host authorization before sandbox lookup', async () => {
+    let authorizedThread: string | undefined
+    const { app } = buildHarness({
+      conversationMode: 'thread',
+      authorizeConsumer: async (_agent, consumer) => {
+        authorizedThread = consumer.threadId
+        return { allow: false, reason: 'thread not owned by consumer', code: 'thread_not_owned' }
+      },
+    })
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_thread-owner',
+        'X-Tangle-Thread-Id': 'thread-owned-by-someone-else',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'continue' }] }),
+    })
+
+    expect(response.status).toBe(403)
+    expect(authorizedThread).toBe('thread-owned-by-someone-else')
+  })
+
   it('blocks consumers an authorizeConsumer hook denies — regression: hosts must be able to allowlist', async () => {
     const calls: Array<{ agentId: string; consumerId: string; requestId: string }> = []
     const { app } = buildHarness({
@@ -1178,7 +1310,7 @@ describe('createAgentGateway — production-config guard', () => {
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
       x402: { operatorAddress, chainId: 3799 }, // no verifySigner, no demoMode
-    })).toThrow(/verifySigner is required in production/)
+    })).toThrow(/configure x402\.verifySigner or verifyApiKey/)
   })
 
   it('boots when demoMode: true is set explicitly (test path)', () => {
