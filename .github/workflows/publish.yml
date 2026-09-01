@@ -66,11 +66,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
 
-      - name: Configure npm trusted publishing
-        run: |
-          npm install --global npm@^11.5.1
-          sed -i '/_authToken/d' "$HOME/.npmrc" 2>/dev/null || true
-
       # Idempotent: re-running a tag whose npm version is already published
       # must not fail the workflow.
       - name: Publish to npm (skip if already published)
@@ -82,3 +77,5 @@ jobs:
           else
             pnpm publish --no-git-checks --access public --provenance
           fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
