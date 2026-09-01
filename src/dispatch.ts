@@ -31,6 +31,7 @@ export {
 } from './dispatch-payment'
 
 export {
+  buildGatewaySandboxContext,
   dispatchSandboxStream,
   dispatchSandboxStreamRich,
 } from './dispatch-sandbox'

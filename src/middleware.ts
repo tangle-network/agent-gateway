@@ -10,6 +10,7 @@ import {
   markPaymentExecutionStarted,
   renewPaymentExecution,
   claimPayment,
+  buildGatewaySandboxContext,
   dispatchSandboxStreamRich,
   releasePayment,
   releasePaymentAfterFailure,
@@ -436,14 +437,7 @@ function streamChatCompletions(
           },
           authz.executionBudget.maxInputTokens,
           () => renewPaymentExecution(authz, config),
-          {
-            consumerId,
-            paymentMethod,
-            keyInfo: authz.keyInfo,
-            requestId,
-            messages: authz.messages ?? [],
-            ...(authz.threadId ? { threadId: authz.threadId } : {}),
-          },
+          buildGatewaySandboxContext(authz, authz.threadId),
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)

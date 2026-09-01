@@ -2,6 +2,7 @@ import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
   beginPaymentExecution,
+  buildGatewaySandboxContext,
   dispatchSandboxStreamRich,
   markPaymentExecutionStarted,
   renewPaymentExecution,
@@ -95,6 +96,9 @@ export async function executeMessageStream(
   let responseText = ''
   let usage: SandboxUsageReceipt | undefined
   let workObserved = false
+  const sandboxContext = deps.config.conversationMode === 'thread'
+    ? buildGatewaySandboxContext(authz, authz.threadId)
+    : undefined
 
   const stream = new ReadableStream({
     start(ctrl) {
@@ -137,6 +141,7 @@ export async function executeMessageStream(
               workingTask = await renewTaskExecution(deps.taskStore, task.id, authz.requestId)
               await renewPaymentExecution(authz, deps.config)
             },
+            sandboxContext,
           )) {
             if (event.kind === 'text') {
               responseText += event.delta

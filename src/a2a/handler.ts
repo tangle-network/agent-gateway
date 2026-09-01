@@ -317,6 +317,7 @@ async function guardMessageRequest(
   }
 
   let billingMessages: ChatMessage[] = [{ role: 'user', content: extracted.text }]
+  let knownTaskContextId: string | undefined
   if (typeof params.message.taskId === 'string') {
     const storedForQuote = await deps.taskStore.get(params.message.taskId)
     if (storedForQuote) {
@@ -329,8 +330,16 @@ async function guardMessageRequest(
           { role: 'user', content: extracted.text },
         ]
       }
+      knownTaskContextId = quotedTask.contextId
     }
   }
+
+  const messageContextId = typeof params.message.contextId === 'string'
+    ? params.message.contextId
+    : undefined
+  const requestedThreadId = deps.config.conversationMode === 'thread'
+    ? knownTaskContextId ?? messageContextId
+    : undefined
 
   const guard = await authenticateAndGuard(
     c,
@@ -338,6 +347,8 @@ async function guardMessageRequest(
     billingMessages,
     deps.config,
     deps.state,
+    undefined,
+    requestedThreadId,
   )
   if (guard instanceof Response) return guard
   const authz = guard
@@ -391,7 +402,11 @@ async function guardMessageRequest(
   }
 
   const taskId = params.message.taskId ?? `task_${cryptoRandomId()}`
-  const contextId = params.message.contextId ?? `ctx_${cryptoRandomId()}`
+  const contextId = knownTaskContextId ?? (
+    deps.config.conversationMode === 'thread'
+      ? authz.threadId ?? `ctx_${cryptoRandomId()}`
+      : messageContextId ?? `ctx_${cryptoRandomId()}`
+  )
   const initialMessage = {
     ...params.message,
     taskId,

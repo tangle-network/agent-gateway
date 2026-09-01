@@ -24,6 +24,7 @@ import type {
   AgentMeta,
   ApiKeyInfo,
   GatewayConfig,
+  GatewaySandboxContext,
   GatewayUsageEvent,
   SandboxBox,
   SandboxStreamEvent,
@@ -146,13 +147,14 @@ function apiKeyHeader(): Record<string, string> {
   return { Authorization: 'Bearer sk_agent_test_key_1' }
 }
 
-function textMessage(text: string, taskId?: string) {
+function textMessage(text: string, taskId?: string, contextId?: string) {
   return {
     kind: 'message' as const,
     role: 'user' as const,
     parts: [{ kind: 'text' as const, text }],
     messageId: `msg_${Math.random().toString(36).slice(2)}`,
     ...(taskId ? { taskId } : {}),
+    ...(contextId ? { contextId } : {}),
   }
 }
 
@@ -427,6 +429,123 @@ describe('A2A — message/stream', () => {
     // Settlement + usage fire after stream completes.
     expect(harness.usage).toHaveLength(1)
     expect(harness.settlements).toHaveLength(1)
+  })
+})
+
+describe('A2A — authenticated sandbox context', () => {
+  it('passes task identity and authenticated context to send and stream adapters', async () => {
+    const contexts: Array<GatewaySandboxContext | undefined> = []
+    const authorizedThreads: Array<string | undefined> = []
+    const calls: Array<{ message: string; sessionId?: string }> = []
+    const sandbox: SandboxBox = {
+      async *streamPrompt(message, opts) {
+        calls.push({ message, ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}) })
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'done' } }
+        yield {
+          type: 'sandbox.usage',
+          data: {
+            usage: {
+              inputTokens: 1,
+              outputTokens: 1,
+              reasoningTokens: 0,
+              toolTokens: 0,
+              toolCallCount: 0,
+              providerCostUsd: 0.00004,
+              budgetEnforced: true,
+            },
+          },
+        }
+      },
+    }
+    const harness = buildHarness({
+      conversationMode: 'thread',
+      authorizeConsumer: async (_agent, consumer) => {
+        authorizedThreads.push(consumer.threadId)
+        return { allow: true }
+      },
+      getSandbox: async (_agent, context) => {
+        contexts.push(context)
+        return sandbox
+      },
+    })
+
+    const sendResponse = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('send', 'send-task', 'send-context') },
+      },
+      apiKeyHeader(),
+    )
+    expect(sendResponse.status).toBe(200)
+    await sendResponse.text()
+
+    const streamResponse = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'message/stream',
+        params: { message: textMessage('stream', 'stream-task', 'stream-context') },
+      },
+      apiKeyHeader(),
+    )
+    expect(streamResponse.status).toBe(200)
+    await parseSseEvents(streamResponse)
+
+    expect(contexts).toHaveLength(2)
+    expect(authorizedThreads).toEqual(['send-context', 'stream-context'])
+    expect(contexts[0]).toMatchObject({
+      consumerId: 'consumer_sk_agent_test_key_1',
+      paymentMethod: 'apikey',
+      keyInfo: { keyId: 'sk_agent_test_key_1' },
+      messages: [{ role: 'user', content: 'send' }],
+      threadId: 'send-context',
+    })
+    expect(contexts[1]).toMatchObject({
+      consumerId: 'consumer_sk_agent_test_key_1',
+      paymentMethod: 'apikey',
+      keyInfo: { keyId: 'sk_agent_test_key_1' },
+      messages: [{ role: 'user', content: 'stream' }],
+      threadId: 'stream-context',
+    })
+    expect(calls).toEqual([
+      { message: 'send', sessionId: 'send-task' },
+      { message: 'stream', sessionId: 'stream-task' },
+    ])
+  })
+
+  it('rejects a header thread that disagrees with the A2A context before sandbox access', async () => {
+    let sandboxAccesses = 0
+    const harness = buildHarness({
+      conversationMode: 'thread',
+      getSandbox: async () => {
+        sandboxAccesses += 1
+        return new StubSandbox(['unreachable'])
+      },
+    })
+
+    const response = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('send', 'mismatch-task', 'a2a-context') },
+      },
+      { ...apiKeyHeader(), 'X-Tangle-Thread-Id': 'header-context' },
+    )
+
+    expect(response.status).toBe(400)
+    expect(sandboxAccesses).toBe(0)
+    expect(await response.json()).toMatchObject({
+      error: { message: 'Thread identity does not match A2A context' },
+    })
   })
 })
 

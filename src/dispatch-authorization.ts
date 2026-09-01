@@ -35,6 +35,8 @@ import {
  * Body parsing is the caller's responsibility — different wire formats
  * (OpenAI chat completions vs A2A JSON-RPC) have different envelopes; both
  * still ultimately produce a `ChatMessage[]`.
+ * A2A may provide its durable context ID so authorization and adapter access
+ * use the same thread identity.
  */
 export async function authenticateAndGuard(
   c: Context,
@@ -43,6 +45,7 @@ export async function authenticateAndGuard(
   config: GatewayConfig,
   state: GatewayState,
   requestedMaxOutputTokens?: number,
+  requestedThreadId?: string,
 ): Promise<AuthorizedRequest | Response> {
   const startMs = Date.now()
   const requestId = generateRequestId()
@@ -51,14 +54,28 @@ export async function authenticateAndGuard(
 
   let threadId: string | undefined
   if (config.conversationMode === 'thread') {
-    const requestedThreadId = c.req.header('X-Tangle-Thread-Id')?.trim()
-    if (requestedThreadId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestedThreadId)) {
+    const headerThreadId = c.req.header('X-Tangle-Thread-Id')?.trim()
+    const requestedContextThreadId = typeof requestedThreadId === 'string'
+      ? requestedThreadId.trim()
+      : undefined
+    if (
+      headerThreadId &&
+      requestedContextThreadId &&
+      headerThreadId !== requestedContextThreadId
+    ) {
+      return c.json(
+        { error: { message: 'Thread identity does not match A2A context', type: 'invalid_request' } },
+        { status: 400, headers: { 'X-Request-Id': requestId } },
+      )
+    }
+    const requestedThread = headerThreadId || requestedContextThreadId
+    if (requestedThread && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestedThread)) {
       return c.json(
         { error: { message: 'Invalid X-Tangle-Thread-Id', type: 'invalid_request' } },
         { status: 400, headers: { 'X-Request-Id': requestId } },
       )
     }
-    threadId = requestedThreadId || requestId
+    threadId = requestedThread || requestId
   }
 
   const agent = await config.resolveAgent(slug)

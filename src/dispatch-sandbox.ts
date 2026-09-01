@@ -1,5 +1,5 @@
 import { redactSystemPromptFromOutput } from './filter'
-import type { A2ADispatchEvent } from './dispatch-types'
+import type { A2ADispatchEvent, AuthorizedRequest } from './dispatch-types'
 import {
   estimateTokens,
   maximumBillableInputTokens,
@@ -12,6 +12,21 @@ import type {
   SandboxStreamEvent,
   SandboxUsageReceipt,
 } from './types'
+
+/** Build the adapter context from the request's authenticated identity. */
+export function buildGatewaySandboxContext(
+  authz: Pick<AuthorizedRequest, 'consumerId' | 'paymentMethod' | 'keyInfo' | 'requestId' | 'messages'>,
+  threadId?: string,
+): GatewaySandboxContext {
+  return {
+    consumerId: authz.consumerId,
+    paymentMethod: authz.paymentMethod,
+    keyInfo: authz.keyInfo,
+    requestId: authz.requestId,
+    messages: authz.messages ?? [],
+    ...(threadId !== undefined ? { threadId } : {}),
+  }
+}
 
 export async function* dispatchSandboxStream(
   agent: AgentMeta,
