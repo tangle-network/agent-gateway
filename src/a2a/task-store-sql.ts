@@ -70,7 +70,9 @@ export function d1ToSqlAdapter(db: D1DatabaseLike): SqlAdapter {
       const bound = params.length > 0 ? stmt.bind(...params) : stmt
       const result = await bound.run()
       const meta = (result as { meta?: { rows_written?: number; changes?: number } }).meta
-      return { rowsAffected: meta?.rows_written ?? meta?.changes ?? 0 }
+      // D1's rows_written is a billing counter and includes index writes. The
+      // adapter contract needs SQLite's affected-row count instead.
+      return { rowsAffected: meta?.changes ?? meta?.rows_written ?? 0 }
     },
     async query<TRow>(sql: string, params: readonly unknown[] = []): Promise<TRow[]> {
       const stmt = db.prepare(sql)
