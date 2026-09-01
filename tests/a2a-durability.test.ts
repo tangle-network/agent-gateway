@@ -15,7 +15,13 @@ import {
   SqlPushNotificationStore,
 } from '../src/a2a/push-notifications'
 import { claimTaskExecution, renewTaskExecution } from '../src/a2a/execution-fence'
-import { d1ToSqlAdapter, type D1DatabaseLike, type SqlAdapter, SqlTaskStore } from '../src/a2a/task-store-sql'
+import {
+  d1ToSqlAdapter,
+  type D1DatabaseLike,
+  type SqlAdapter,
+  SqlTaskStore,
+  sqlTaskStoreSchemaStatements,
+} from '../src/a2a/task-store-sql'
 import type { Task } from '../src/a2a/types'
 
 interface FakeTaskRow {
@@ -178,6 +184,16 @@ function makeTask(id: string, state: Task['status']['state'] = 'submitted'): Tas
 }
 
 describe('SqlTaskStore', () => {
+  it('exports its deploy-time schema and rejects unsafe table names', () => {
+    const statements = sqlTaskStoreSchemaStatements()
+    expect(statements).toHaveLength(2)
+    expect(statements[0]).toContain('CREATE TABLE IF NOT EXISTS a2a_tasks')
+    expect(statements[1]).toContain('idx_a2a_tasks_context')
+    expect(() => sqlTaskStoreSchemaStatements('tasks; DROP TABLE tasks')).toThrow(/table name/)
+    expect(() => new SqlTaskStore({} as SqlAdapter, { table: 'tasks; DROP TABLE tasks' }))
+      .toThrow(/table name/)
+  })
+
   it('uses D1 changes instead of indexed billing rows for affected writes', async () => {
     const db: D1DatabaseLike = {
       prepare() {

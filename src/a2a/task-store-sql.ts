@@ -43,6 +43,7 @@
 import { inspectTaskExecution } from './execution-fence'
 import { hasPendingPaymentRecovery, type TaskStore } from './task-store'
 import type { Task } from './types'
+import { requireSqlIdentifier } from '../sql'
 
 /**
  * Minimal SQL driver shape — identical to agent-runtime's `SqlAdapter` so the
@@ -94,20 +95,21 @@ export interface D1StmtLike {
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000
 
-const TASKS_TABLE_DDL = (table: string) => `
-  CREATE TABLE IF NOT EXISTS ${table} (
-    id TEXT PRIMARY KEY,
-    context_id TEXT NOT NULL,
-    state TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    execution_request_id TEXT,
-    execution_lease_expires_at REAL
-  )
-`
-const CTX_INDEX_DDL = (table: string) => `
-  CREATE INDEX IF NOT EXISTS idx_${table}_context ON ${table} (context_id, updated_at)
-`
+export function sqlTaskStoreSchemaStatements(tableName = 'a2a_tasks'): readonly [string, string] {
+  const table = requireSqlIdentifier(tableName)
+  return [
+    `CREATE TABLE IF NOT EXISTS ${table} (
+      id TEXT PRIMARY KEY,
+      context_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      execution_request_id TEXT,
+      execution_lease_expires_at REAL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_${table}_context ON ${table} (context_id, updated_at)`,
+  ]
+}
 
 /**
  * SQL-backed TaskStore. Stores the full Task JSON; reads return a deep clone
@@ -116,18 +118,18 @@ const CTX_INDEX_DDL = (table: string) => `
  * in-memory store's semantics so behavior is portable across both adapters.
  */
 export class SqlTaskStore implements TaskStore {
+  private readonly table: string
+
   constructor(
     private readonly db: SqlAdapter,
     private readonly opts: { ttlMs?: number; table?: string } = {},
-  ) {}
+  ) {
+    this.table = requireSqlIdentifier(opts.table ?? 'a2a_tasks')
+  }
 
   private get ttlMs(): number {
     return this.opts.ttlMs ?? DEFAULT_TTL_MS
   }
-  private get table(): string {
-    return this.opts.table ?? 'a2a_tasks'
-  }
-
   private async readRow(id: string): Promise<{
     payload: string
     updatedAt: number
@@ -172,7 +174,8 @@ export class SqlTaskStore implements TaskStore {
 
   /** Idempotent. Call once at deploy. */
   async migrate(): Promise<void> {
-    await this.db.exec(TASKS_TABLE_DDL(this.table))
+    const [createTable, createContextIndex] = sqlTaskStoreSchemaStatements(this.table)
+    await this.db.exec(createTable)
     for (const column of [
       'execution_request_id TEXT',
       'execution_lease_expires_at REAL',
@@ -184,7 +187,7 @@ export class SqlTaskStore implements TaskStore {
         if (!message.includes('duplicate column') && !message.includes('already exists')) throw error
       }
     }
-    await this.db.exec(CTX_INDEX_DDL(this.table))
+    await this.db.exec(createContextIndex)
   }
 
   async get(id: string): Promise<Task | undefined> {

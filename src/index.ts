@@ -76,6 +76,11 @@ export {
   type ApiKeyRoutesConfig,
 } from './api-keys'
 export {
+  SqlApiKeyStore,
+  sqlApiKeyStoreSchemaStatements,
+  type SqlApiKeyStoreOptions,
+} from './api-key-store-sql'
+export {
   MemoryNonceStore,
   KvNonceStore,
   isAtomicNonceStore,
@@ -130,6 +135,7 @@ export {
   type D1DatabaseLike,
   type D1StmtLike,
   d1ToSqlAdapter,
+  sqlTaskStoreSchemaStatements,
   type SqlAdapter,
   SqlTaskStore,
 } from './a2a/task-store-sql'

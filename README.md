@@ -15,6 +15,7 @@ npm install @tangle-network/agent-gateway
 import {
   createAgentGateway,
   recoverPayments,
+  SqlApiKeyStore,
   SqlPaymentRecoveryStore,
   verifyApiKeyFromStore,
 } from '@tangle-network/agent-gateway'
@@ -23,6 +24,8 @@ import { Hono } from 'hono'
 const app = new Hono()
 const paymentRecoveryStore = new SqlPaymentRecoveryStore(sqlAdapter)
 await paymentRecoveryStore.migrate()
+const apiKeyStore = new SqlApiKeyStore(sqlAdapter)
+await apiKeyStore.migrate()
 app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
@@ -42,6 +45,10 @@ app.route('/v1/agents', createAgentGateway({
   verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
+
+Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
+Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
+The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
 
 Production requires either `x402.verifySigner` or `verifyApiKey`.
 API-key-only apps can omit `x402` entirely.

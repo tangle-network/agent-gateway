@@ -6,7 +6,7 @@
  * - A Hono router for CRUD (createApiKeyRoutes)
  * - A verifyApiKey function that checks against the store
  *
- * Each agent implements ApiKeyStore against their own DB.
+ * Apps can use SqlApiKeyStore or provide a store for another database.
  */
 
 import { Hono } from 'hono'
@@ -38,7 +38,7 @@ export interface ApiKeyCreateRequest {
   expiresAt?: string
 }
 
-/** Each agent implements this against their DB */
+/** Persistent storage contract for API keys. */
 export interface ApiKeyStore {
   create(userId: string, data: {
     name: string
