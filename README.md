@@ -74,7 +74,8 @@ Sandbox adapters should emit a complete `sandbox.usage` receipt.
 Requests with a version 2 operation or generic MPP charge reject missing receipts.
 API-key requests keep the legacy visible-token estimate path.
 recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.
-The default gateway still exposes A2A with an in-memory task store.
+Explicit demo mode exposes A2A with an in-memory task store.
+Production must configure an atomic durable task store; otherwise A2A returns `503` while the OpenAI surface remains available.
 Older custom A2A task stores remain source-compatible at the type boundary.
 The OpenAI surface stays available when such a store is configured, while A2A returns `503` until its owner supplies atomic methods.
 Use an atomic task store for multi-worker production deployments.

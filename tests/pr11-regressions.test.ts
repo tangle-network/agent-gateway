@@ -1111,8 +1111,9 @@ describe('PR #11 production regressions', () => {
     expect(await store.hasSeen('compatibility')).toBe(true)
   })
 
-  it('does not initialize A2A when an OpenAI-only gateway omits it', () => {
-    expect(() => createAgentGateway({
+  it('keeps A2A unavailable when production omits its task store', async () => {
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
       resolveAgent: async () => agent,
       getSandbox: async () => sandbox(),
       recordUsage: async () => undefined,
@@ -1122,7 +1123,15 @@ describe('PR #11 production regressions', () => {
         demoMode: false,
         verifySigner: async () => true,
       },
-    })).not.toThrow()
+    }))
+
+    const discovery = await app.request('/v1/agents/pr11/chat/completions')
+    const card = await app.request('/v1/agents/pr11/.well-known/agent.json')
+    const a2a = await app.request('/v1/agents/pr11', { method: 'POST', body: '{}' })
+
+    expect(discovery.status).toBe(200)
+    expect(card.status).toBe(503)
+    expect(a2a.status).toBe(503)
   })
 
   it('keeps the OpenAI surface available when an old A2A store is configured', async () => {

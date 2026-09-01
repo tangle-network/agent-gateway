@@ -122,8 +122,8 @@ export type {
 
 // --- A2A protocol surface (Google Agent-to-Agent) ---
 // Types + task-store adapter. Handlers are wired automatically by
-// createAgentGateway with an in-memory store by default;
-// consumers only import these to BYO a durable TaskStore (D1, postgres, DO)
+// createAgentGateway with an in-memory store only in explicit demo mode;
+// production consumers must BYO an atomic durable TaskStore (D1, postgres, DO)
 // or to declare richer AgentMeta.skills for the Agent Card.
 export { InMemoryTaskStore, type TaskStore } from './a2a/task-store'
 export {

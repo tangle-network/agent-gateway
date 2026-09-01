@@ -364,14 +364,16 @@ export interface GatewayConfig {
   observer?: GatewayObserver
 
   /**
-   * A2A protocol configuration. The gateway exposes A2A with an in-memory
-   * task store by default. Set this object to provide durable storage or push:
+   * A2A protocol configuration. Explicit demo mode uses an in-memory task
+   * store by default. Production must provide an atomic durable task store;
+   * without one, A2A returns 503 while the OpenAI surface remains available.
+   * Set this object to provide durable storage or push:
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel
    * Auth + rate-limit + injection-filter + authorization all share the
-   * same pipeline as the OpenAI-compat path. `taskStore` defaults to
-   * `InMemoryTaskStore`; swap in D1/postgres/DO for durable deployments.
+   * same pipeline as the OpenAI-compat path. Demo mode defaults to
+   * `InMemoryTaskStore`; production must configure D1/postgres/DO storage.
   */
   a2a?: {
     /**
@@ -389,7 +391,8 @@ export interface GatewayConfig {
       },
     ) => Promise<boolean>
     /**
-     * Where tasks live. Defaults to `InMemoryTaskStore`; swap in
+     * Where tasks live. Required in production and must implement the
+     * atomic methods. Demo mode defaults to `InMemoryTaskStore`; swap in
      * `SqlTaskStore` (D1, postgres, sqlite, libSQL) for durability across
      * gateway restarts.
      */

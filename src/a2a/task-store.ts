@@ -1,8 +1,7 @@
 /**
- * Task persistence behind the JSON-RPC dispatcher. Default adapter is in
- * memory with a 1-hour TTL — adequate for tests, scratch, and Workers with
- * a short-lived process. Production deployments wire their own
- * `TaskStore` (D1, postgres, Durable Object) via `GatewayConfig.a2a`.
+ * Task persistence behind the JSON-RPC dispatcher. The in-memory adapter has
+ * a 1-hour TTL and is for explicit demo or test mode. Production deployments
+ * wire their own `TaskStore` (D1, postgres, Durable Object) via `GatewayConfig.a2a`.
  */
 
 import type { Task } from './types'
