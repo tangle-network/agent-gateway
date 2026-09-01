@@ -30,10 +30,11 @@ const INJECTION_PATTERNS = [
   // Tool-call / JSON-shaped spoofs
   /"(?:tool|function|action|call)"\s*:\s*"[^"]*(exfiltrate|leak|reveal|dump|extract|steal)[^"]*"/i,
   /exfiltrate[_\s]*(system|prompt|secret|vault|config|data)/i,
-  // Data exfiltration
-  /read\s+(the\s+)?(vault|workspace|config|secret|\.env)/i,
-  /cat\s+\/home\/agent\/(vault|config|\.env|secrets?)/i,
-  /list\s+(all\s+)?(vault|workspace|secret)\s+(files?|contents?|data)/i,
+  // Credential-file exfiltration. Workspace and vault access are normal agent
+  // operations; authorization belongs to the host's tools, not keyword rules.
+  /read\s+(the\s+)?(?:\.env|\/home\/agent\/(?:config|secrets?))(?:\b|\/)/i,
+  /cat\s+\/home\/agent\/(?:config|\.env|secrets?)(?:\b|\/)/i,
+  /list\s+(all\s+)?(?:secret|credential)\s+(files?|contents?|data)/i,
   // i18n — Spanish
   /ignor[ae]\s+(todas?\s+)?(las\s+)?(instrucciones?|indicaciones?|órdenes?)\s+(previas?|anteriores?)/i,
   /olvid[ae]\s+(todas?\s+|tus\s+)?(instrucciones?|indicaciones?)/i,
@@ -197,11 +198,24 @@ export function filterConsumerMessages(
     .filter((m) => m.role !== 'system')
     .map((m) => {
       const normalized = normalizeUnicode(m.content)
-      const redacted = normalized
-        .replace(/\b(vault|workspace|owner|admin|secret|\.env|config\.json)[\s/:][^\s]*/gi, '[REDACTED]')
-        .slice(0, maxLength)
+      const redacted = redactCredentialValues(normalized).slice(0, maxLength)
       return { role: m.role, content: redacted }
     })
+}
+
+/** Mask credential values without deleting ordinary product vocabulary. */
+function redactCredentialValues(content: string): string {
+  return content
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+={0,2}/gi, '$1 [REDACTED]')
+    .replace(
+      /(\b(?:api[_ -]?key|access[_ -]?token|session[_ -]?token|password|secret)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      '$1[REDACTED]',
+    )
+    .replace(
+      /(\bauthorization\s*[:=]\s*)(?!Bearer\b|Basic\b)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      '$1[REDACTED]',
+    )
+    .replace(/\b(?:sk|pk|tc|ghp|xoxb)[_-][A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]')
 }
 
 /**
@@ -213,9 +227,12 @@ export function filterConsumerMessagesStrict(
   messages: ChatMessage[],
   maxLength = 8000,
 ): { messages: ChatMessage[]; injectionWarnings: string[] } {
-  const filtered = filterConsumerMessages(messages, maxLength)
-  const allContent = filtered.map(m => m.content).join(' ')
+  const allContent = messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => message.content)
+    .join(' ')
   const injectionWarnings = detectInjection(allContent)
+  const filtered = filterConsumerMessages(messages, maxLength)
   return { messages: filtered, injectionWarnings }
 }
 
