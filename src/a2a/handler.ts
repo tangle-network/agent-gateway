@@ -320,18 +320,21 @@ async function guardMessageRequest(
   let knownTaskContextId: string | undefined
   if (typeof params.message.taskId === 'string') {
     const storedForQuote = await deps.taskStore.get(params.message.taskId)
-    if (storedForQuote) {
-      const accessError = await authorizeTaskAccess(c, req, storedForQuote, deps)
-      if (accessError) return accessError
-      const quotedTask = await recoverTaskIfNeeded(storedForQuote, deps, slug)
-      if (quotedTask.status.state === 'input-required') {
-        billingMessages = [
-          ...taskHistoryAsChatMessages(quotedTask),
-          { role: 'user', content: extracted.text },
-        ]
-      }
-      knownTaskContextId = quotedTask.contextId
+    if (!storedForQuote) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.message.taskId}' not found`),
+      )
     }
+    const accessError = await authorizeTaskAccess(c, req, storedForQuote, deps)
+    if (accessError) return accessError
+    const quotedTask = await recoverTaskIfNeeded(storedForQuote, deps, slug)
+    if (quotedTask.status.state === 'input-required') {
+      billingMessages = [
+        ...taskHistoryAsChatMessages(quotedTask),
+        { role: 'user', content: extracted.text },
+      ]
+    }
+    knownTaskContextId = quotedTask.contextId
   }
 
   const messageContextId = typeof params.message.contextId === 'string'
@@ -360,48 +363,49 @@ async function guardMessageRequest(
   // currently in `input-required`, append the new message and reserve it as
   // `submitted`. The handler transitions it to `working` only after payment
   // succeeds, so cancellation during payment cannot start sandbox work.
-  // Any other taskId (unknown OR pointing at a terminal/working
-  // task) means the caller is starting a fresh task and we mint a new id.
+  // A supplied taskId must identify an existing task. Only `input-required`
+  // tasks accept a follow-up message.
   if (typeof params.message.taskId === 'string') {
     const storedExisting = await deps.taskStore.get(params.message.taskId)
-    if (storedExisting) {
-      const accessError = await authorizeTaskAccess(c, req, storedExisting, deps)
-      if (accessError) return accessError
-      const existing = await recoverTaskIfNeeded(storedExisting, deps, slug)
-      if (existing.status.state !== 'input-required') {
-        return c.json(
-          fail(
-            req.id,
-            A2A_ERROR_CODES.INVALID_PARAMS,
-            `task '${existing.id}' is in state '${existing.status.state}'; only 'input-required' tasks accept follow-up messages`,
-          ),
-        )
-      }
-      const appendedMessage: Message = {
-        ...params.message,
-        taskId: existing.id,
-        contextId: existing.contextId,
-      }
-      const continued: Task = {
-        ...existing,
-        status: { state: 'submitted', timestamp: nowIso() },
-        history: [...(existing.history ?? []), appendedMessage],
-        metadata: withTaskSubmission(existing.metadata, authz),
-      }
-      if (!await compareAndSetTask(deps.taskStore, existing, continued)) {
-        return c.json(
-          fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${existing.id}' changed before continuation`),
-        )
-      }
-      const claimedTask = await claimTaskPayment(c, req, continued, authz, deps, existing)
-      if (claimedTask instanceof Response) return claimedTask
-      return { authz, task: claimedTask }
+    if (!storedExisting) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.TASK_NOT_FOUND, `task '${params.message.taskId}' not found`),
+      )
     }
-    // Unknown taskId in params: fall through and mint a fresh task with that
-    // exact id so callers that pre-allocate ids (idempotency) get them.
+    const accessError = await authorizeTaskAccess(c, req, storedExisting, deps)
+    if (accessError) return accessError
+    const existing = await recoverTaskIfNeeded(storedExisting, deps, slug)
+    if (existing.status.state !== 'input-required') {
+      return c.json(
+        fail(
+          req.id,
+          A2A_ERROR_CODES.UNSUPPORTED_OPERATION,
+          `task '${existing.id}' is in state '${existing.status.state}'; only 'input-required' tasks accept follow-up messages`,
+        ),
+      )
+    }
+    const appendedMessage: Message = {
+      ...params.message,
+      taskId: existing.id,
+      contextId: existing.contextId,
+    }
+    const continued: Task = {
+      ...existing,
+      status: { state: 'submitted', timestamp: nowIso() },
+      history: [...(existing.history ?? []), appendedMessage],
+      metadata: withTaskSubmission(existing.metadata, authz),
+    }
+    if (!await compareAndSetTask(deps.taskStore, existing, continued)) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${existing.id}' changed before continuation`),
+      )
+    }
+    const claimedTask = await claimTaskPayment(c, req, continued, authz, deps, existing)
+    if (claimedTask instanceof Response) return claimedTask
+    return { authz, task: claimedTask }
   }
 
-  const taskId = params.message.taskId ?? `task_${cryptoRandomId()}`
+  const taskId = `task_${cryptoRandomId()}`
   const contextId = knownTaskContextId ?? (
     deps.config.conversationMode === 'thread'
       ? authz.threadId ?? `ctx_${cryptoRandomId()}`

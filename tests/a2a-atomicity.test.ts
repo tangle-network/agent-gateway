@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { createAgentGateway } from '../src/middleware'
@@ -52,7 +52,7 @@ function paymentHeader(nonce: string): string {
   })
 }
 
-function requestBody(taskId: string, text: string) {
+function requestBody(text: string) {
   return {
     jsonrpc: '2.0',
     id: text,
@@ -61,7 +61,6 @@ function requestBody(taskId: string, text: string) {
       message: {
         kind: 'message',
         role: 'user',
-        taskId,
         contextId: 'ctx-atomicity',
         messageId: `message-${text}`,
         parts: [{ kind: 'text', text }],
@@ -187,31 +186,36 @@ describe('A2A task atomicity and restart recovery', () => {
     first.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters, true)))
     second.route('/v1/agents', createAgentGateway(atomicityConfig(taskStore, counters, true)))
 
-    const request = (app: Hono, nonce: string, text: string) => app.request(
-      `/v1/agents/${agent.slug}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Payment-Signature': paymentHeader(nonce),
+    const randomUUID = vi.spyOn(globalThis.crypto, 'randomUUID').mockReturnValue('a'.repeat(32))
+    try {
+      const request = (app: Hono, nonce: string, text: string) => app.request(
+        `/v1/agents/${agent.slug}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Payment-Signature': paymentHeader(nonce),
+          },
+          body: JSON.stringify(requestBody(text)),
         },
-        body: JSON.stringify(requestBody('task-two-workers', text)),
-      },
-    )
+      )
 
-    const [firstResponse, secondResponse] = await Promise.all([
-      request(first, '101', 'one'),
-      request(second, '102', 'two'),
-    ])
-    const bodies = await Promise.all([
-      firstResponse.json(),
-      secondResponse.json(),
-    ]) as Array<{ result?: { status?: { state?: string } }; error?: { code?: number } }>
-    expect(bodies.filter((body) => body.result?.status?.state === 'completed')).toHaveLength(1)
-    expect(bodies.filter((body) => body.error?.code === -32602)).toHaveLength(1)
-    expect(counters.runs).toBe(1)
-    expect(counters.records).toBe(1)
-    expect(counters.settlements).toBe(1)
+      const [firstResponse, secondResponse] = await Promise.all([
+        request(first, '101', 'one'),
+        request(second, '102', 'two'),
+      ])
+      const bodies = await Promise.all([
+        firstResponse.json(),
+        secondResponse.json(),
+      ]) as Array<{ result?: { status?: { state?: string } }; error?: { code?: number } }>
+      expect(bodies.filter((body) => body.result?.status?.state === 'completed')).toHaveLength(1)
+      expect(bodies.filter((body) => body.error?.code === -32602)).toHaveLength(1)
+      expect(counters.runs).toBe(1)
+      expect(counters.records).toBe(1)
+      expect(counters.settlements).toBe(1)
+    } finally {
+      randomUUID.mockRestore()
+    }
   })
 
   it('replays a crashed finalization after restart and clears the lease marker', async () => {

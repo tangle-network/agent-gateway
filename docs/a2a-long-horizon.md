@@ -394,7 +394,8 @@ Sandboxes that never emit input-required see identical behavior to before.
 //                  history: [ msg_1, msg_2 ], artifacts: [...] }
 ```
 
-A follow-up against a task in any state other than `input-required` is rejected with `INVALID_PARAMS` ("only 'input-required' tasks accept follow-up messages"). The gateway never silently re-runs or merges into a terminal task.
+Initial messages omit `taskId`; the gateway assigns the task ID. A supplied unknown task ID returns `TASK_NOT_FOUND` for both messaging methods.
+A follow-up against a task in any state other than `input-required` is rejected with `UNSUPPORTED_OPERATION` ("only 'input-required' tasks accept follow-up messages"). The gateway never silently re-runs or merges into a terminal task.
 
 ## Putting it all together — long-horizon agent loop
 

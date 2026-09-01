@@ -87,56 +87,123 @@ describe('final payment boundary protocol guards', () => {
     expect(claims).toBe(0)
   })
 
-  it('checks an A2A task state before claiming a payment', async () => {
-    const taskStore = new InMemoryTaskStore()
-    const terminal: Task = {
-      kind: 'task',
-      id: 'existing-task',
-      contextId: 'ctx',
-      status: { state: 'completed', timestamp: new Date().toISOString() },
-      history: [],
-    }
-    await taskStore.put(terminal)
-    let claims = 0
-    const app = new Hono()
-    app.route('/v1/agents', createAgentGateway({
-      resolveAgent: async () => agent,
-      getSandbox: async () => box(),
-      recordUsage: async () => undefined,
-      x402: {
-        operatorAddress,
-        chainId: 1,
-        demoMode: true,
-        authorizePayment: async () => {
-          claims += 1
-          return true
-        },
-      },
-      nonceStore: new MemoryNonceStore(),
-      a2a: { taskStore },
-    }))
-
-    const response = await app.request('/v1/agents/guards', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('3') },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'message/send',
-        params: {
-          message: {
-            kind: 'message',
-            role: 'user',
-            taskId: terminal.id,
-            parts: [{ kind: 'text', text: 'retry' }],
+  it.each(['message/send', 'message/stream'] as const)(
+    'checks an A2A task state before payment or sandbox work for %s',
+    async (method) => {
+      const taskStore = new InMemoryTaskStore()
+      const terminal: Task = {
+        kind: 'task',
+        id: 'existing-task',
+        contextId: 'ctx',
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+        history: [],
+      }
+      await taskStore.put(terminal)
+      let claims = 0
+      let sandboxRuns = 0
+      const app = new Hono()
+      app.route('/v1/agents', createAgentGateway({
+        resolveAgent: async () => agent,
+        getSandbox: async () => ({
+          async *streamPrompt() {
+            sandboxRuns += 1
+            yield* box().streamPrompt()
+          },
+        }),
+        recordUsage: async () => undefined,
+        x402: {
+          operatorAddress,
+          chainId: 1,
+          demoMode: true,
+          authorizePayment: async () => {
+            claims += 1
+            return true
           },
         },
-      }),
-    })
-    const body = await response.json() as { error?: { code: number } }
-    expect(body.error?.code).toBe(A2A_ERROR_CODES.INVALID_PARAMS)
-    expect(claims).toBe(0)
-  })
+        nonceStore: new MemoryNonceStore(),
+        a2a: { taskStore },
+      }))
+
+      const response = await app.request('/v1/agents/guards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('3') },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method,
+          params: {
+            message: {
+              kind: 'message',
+              role: 'user',
+              taskId: terminal.id,
+              parts: [{ kind: 'text', text: 'retry' }],
+            },
+          },
+        }),
+      })
+      const body = await response.json() as { error?: { code: number } }
+      expect(body.error?.code).toBe(A2A_ERROR_CODES.UNSUPPORTED_OPERATION)
+      expect(claims).toBe(0)
+      expect(sandboxRuns).toBe(0)
+    },
+  )
+
+  it.each(['message/send', 'message/stream'] as const)(
+    'rejects an unknown taskId before payment or sandbox work for %s',
+    async (method) => {
+      const taskStore = new InMemoryTaskStore()
+      let claims = 0
+      let sandboxRuns = 0
+      const app = new Hono()
+      app.route('/v1/agents', createAgentGateway({
+        resolveAgent: async () => agent,
+        getSandbox: async () => ({
+          async *streamPrompt() {
+            sandboxRuns += 1
+            yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'unexpected' } }
+          },
+        }),
+        recordUsage: async () => undefined,
+        x402: {
+          operatorAddress,
+          chainId: 1,
+          demoMode: true,
+          authorizePayment: async () => {
+            claims += 1
+            return true
+          },
+        },
+        nonceStore: new MemoryNonceStore(),
+        a2a: { taskStore },
+      }))
+      const taskId = `unknown-${method.replace('/', '-')}`
+
+      const response = await app.request('/v1/agents/guards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('4') },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: method,
+          method,
+          params: {
+            message: {
+              kind: 'message',
+              role: 'user',
+              taskId,
+              messageId: `message-${method}`,
+              parts: [{ kind: 'text', text: 'retry' }],
+            },
+          },
+        }),
+      })
+      const body = await response.json() as { error?: { code: number } }
+      expect(response.status).toBe(200)
+      expect(body.error?.code).toBe(A2A_ERROR_CODES.TASK_NOT_FOUND)
+      expect(claims).toBe(0)
+      expect(sandboxRuns).toBe(0)
+      expect(await taskStore.get(taskId)).toBeUndefined()
+    },
+  )
 
   it('rejects a continuation before it can mutate another caller task', async () => {
     const taskStore = new InMemoryTaskStore()

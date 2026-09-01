@@ -6,6 +6,7 @@ import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
 import type { Task } from '../src/a2a/types'
+import { ServerAssignedTaskStore } from './server-assigned-task-store'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ef'.repeat(32)}`
@@ -46,21 +47,20 @@ function paymentHeader(nonce: string): string {
   })
 }
 
-function message(taskId: string, text = 'hello') {
+function message(taskId: string | undefined, text = 'hello') {
   return {
     kind: 'message',
     role: 'user',
-    taskId,
-    contextId: `context-${taskId}`,
-    messageId: `message-${taskId}-${text}`,
+    ...(taskId ? { taskId, contextId: `context-${taskId}` } : {}),
+    messageId: `message-${taskId ?? 'new'}-${text}`,
     parts: [{ kind: 'text', text }],
   }
 }
 
-function body(method: string, taskId: string, text = 'hello') {
+function body(method: string, taskId?: string, text = 'hello') {
   return {
     jsonrpc: '2.0',
-    id: `${method}-${taskId}`,
+    id: `${method}-${taskId ?? 'new'}`,
     method,
     params: method.startsWith('tasks/') ? { id: taskId } : { message: message(taskId, text) },
   }
@@ -97,7 +97,10 @@ async function post(app: Hono, slug: string, requestBody: unknown, headers: Reco
 
 describe('A2A lifecycle recovery and ownership', () => {
   it('retries legacy settlement from the durable task record after a crash', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-legacy-recovery',
+    )
     let settlementCalls = 0
     let usageCalls = 0
     const app = new Hono()
@@ -122,7 +125,7 @@ describe('A2A lifecycle recovery and ownership', () => {
     const first = await post(
       app,
       agentA.slug,
-      body('message/send', 'task-legacy-recovery'),
+      body('message/send'),
       { 'X-Payment-Signature': paymentHeader('901') },
     )
     const firstBody = await first.json() as { error?: { code?: number } }
@@ -213,7 +216,10 @@ describe('A2A lifecycle recovery and ownership', () => {
       }
     }
 
-    const taskStore = new InterleavingFailureStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InterleavingFailureStore(),
+      'task-stale-failure',
+    )
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
       getSandbox: async () => ({
@@ -226,7 +232,7 @@ describe('A2A lifecycle recovery and ownership', () => {
     const response = await post(
       app,
       agentA.slug,
-      body('message/send', 'task-stale-failure'),
+      body('message/send'),
       { 'X-Payment-Signature': paymentHeader('902') },
     )
     expect((await response.json() as { error?: unknown }).error).toBeDefined()
@@ -237,7 +243,10 @@ describe('A2A lifecycle recovery and ownership', () => {
   })
 
   it('rejects task access and continuation through a different originating agent', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-origin-bound',
+    )
     let resolvedOriginAgent = agentA
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
@@ -252,7 +261,7 @@ describe('A2A lifecycle recovery and ownership', () => {
     const created = await post(
       app,
       agentA.slug,
-      body('message/send', 'task-origin-bound'),
+      body('message/send'),
       { 'X-Payment-Signature': paymentHeader('903') },
     )
     expect((await created.json() as { result?: Task }).result?.status.state).toBe('completed')
@@ -304,14 +313,17 @@ describe('A2A lifecycle recovery and ownership', () => {
       }
     }
 
-    const taskStore = new CrashAfterCreateStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new CrashAfterCreateStore(),
+      'task-created-before-claim',
+    )
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore)))
 
     await post(
       app,
       agentA.slug,
-      body('message/send', 'task-created-before-claim'),
+      body('message/send'),
       { 'X-Payment-Signature': paymentHeader('904') },
     )
 
@@ -375,7 +387,7 @@ describe('A2A client disconnect cancellation', () => {
     const response = await post(
       app,
       agentA.slug,
-      body('message/stream', 'task-reader-disconnect'),
+      body('message/stream'),
       { 'X-Payment-Signature': paymentHeader('905') },
     )
     const reader = response.body!.getReader()
@@ -395,7 +407,7 @@ describe('A2A client disconnect cancellation', () => {
         'Content-Type': 'application/json',
         'X-Payment-Signature': paymentHeader('906'),
       },
-      body: JSON.stringify(body('message/stream', 'task-request-disconnect')),
+      body: JSON.stringify(body('message/stream')),
       signal: requestAbort.signal,
     })
     const response = await app.fetch(request)
