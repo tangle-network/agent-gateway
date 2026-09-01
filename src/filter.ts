@@ -206,16 +206,19 @@ export function filterConsumerMessages(
 /** Mask credential values without deleting ordinary product vocabulary. */
 function redactCredentialValues(content: string): string {
   return content
+    .replace(
+      /(\bauthorization\s*[:=]\s*)(?:(?:Bearer|Basic|Token)\s+[^\s,;]+|Digest[^\r\n]*|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+      '$1[REDACTED]',
+    )
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+={0,2}/gi, '$1 [REDACTED]')
     .replace(
       /(\b(?:api[_ -]?key|access[_ -]?token|session[_ -]?token|password|secret)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
       '$1[REDACTED]',
     )
     .replace(
-      /(\bauthorization\s*[:=]\s*)(?!Bearer\b|Basic\b)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      '$1[REDACTED]',
+      /(?<![A-Za-z0-9_./-])(?:sk|pk|tc|ghp|xoxb)[_-][A-Za-z0-9_-]{8,}(?=(?:[.,;:!?]?(?:\s|$)|[)}\]]))/gi,
+      '[REDACTED]',
     )
-    .replace(/\b(?:sk|pk|tc|ghp|xoxb)[_-][A-Za-z0-9_-]{8,}\b/gi, '[REDACTED]')
 }
 
 /**
@@ -229,7 +232,7 @@ export function filterConsumerMessagesStrict(
 ): { messages: ChatMessage[]; injectionWarnings: string[] } {
   const allContent = messages
     .filter((message) => message.role !== 'system')
-    .map((message) => message.content)
+    .map((message) => message.content.slice(0, maxLength))
     .join(' ')
   const injectionWarnings = detectInjection(allContent)
   const filtered = filterConsumerMessages(messages, maxLength)
