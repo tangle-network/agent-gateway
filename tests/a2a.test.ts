@@ -21,6 +21,7 @@ import type {
 import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
+import { ServerAssignedTaskStore } from './server-assigned-task-store'
 import type {
   AgentMeta,
   ApiKeyInfo,
@@ -430,7 +431,12 @@ describe('A2A — message/send', () => {
   })
 
   it('persists an A2A task as failed for the structured sandbox error shape', async () => {
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'structured-failure-task',
+    )
     const harness = buildHarness({
+      a2a: { taskStore },
       getSandbox: async () => ({
         async *streamPrompt() {
           yield structuredSandboxFailure
@@ -446,7 +452,7 @@ describe('A2A — message/send', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: textMessage('connect', 'structured-failure-task', 'structured-failure-context') },
+        params: { message: textMessage('connect', undefined, 'structured-failure-context') },
       },
       apiKeyHeader(),
     )
@@ -464,6 +470,7 @@ describe('A2A — message/send', () => {
     )
     const task = (await taskResponse.json() as JSONRPCSuccessResponse<Task>).result
     expect(task.status.state).toBe('failed')
+    expect(task.id).not.toBe('structured-failure-task')
     expect(task.artifacts).toBeUndefined()
     expect(harness.usage).toHaveLength(0)
     expect(harness.settlements).toHaveLength(0)
