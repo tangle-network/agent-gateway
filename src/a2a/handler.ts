@@ -554,9 +554,6 @@ async function authorizeTaskAccess(
   const requestedAgentSlug = c.req.param('slug') ?? ''
   const origin = readTaskOrigin(task)
   if (origin) {
-    if (origin.agentSlug !== requestedAgentSlug) {
-      return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task belongs to a different agent'), 403)
-    }
     const requestedAgent = await deps.config.resolveAgent(requestedAgentSlug)
     if (!requestedAgent || requestedAgent.id !== origin.agentId) {
       return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task belongs to a different agent'), 403)
