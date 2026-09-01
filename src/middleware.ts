@@ -336,17 +336,21 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   // Both surfaces share authenticateAndGuard + dispatchSandboxStream +
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
-  const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
   const pushStore = config.a2a?.pushStore
   try {
+    // Do not create process-local state for production A2A.
+    if (!config.x402.demoMode && !config.a2a?.taskStore) {
+      throw new Error('A2A production requires an explicitly configured atomic task store')
+    }
+    const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
     const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
     gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
     gw.post('/:slug', a2a.handleJsonRpc)
   } catch (error) {
-    // An older custom store must not take down the OpenAI surface. Keep the
-    // A2A surface unavailable until its owner supplies atomic methods.
+    // A missing or older custom store must not take down the OpenAI surface.
+    // Keep A2A unavailable until its owner supplies atomic methods.
     console.error(
-      '[agent-gateway] A2A is unavailable until its task store is upgraded:',
+      '[agent-gateway] A2A is unavailable until its task store is configured with atomic methods:',
       error instanceof Error ? error.message : String(error),
     )
     const unavailable = (c: import('hono').Context) => c.json(

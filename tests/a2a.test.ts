@@ -10,6 +10,7 @@ import { Hono } from 'hono'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { A2A_ERROR_CODES } from '../src/a2a/types'
+import { InMemoryTaskStore } from '../src/a2a/task-store'
 import type {
   AgentCard,
   JSONRPCErrorResponse,
@@ -540,6 +541,7 @@ describe('A2A — tasks/get', () => {
   it('fails closed for production task access without an authorization hook', async () => {
     const { app } = buildHarness({
       x402: { operatorAddress, chainId: 3799, verifySigner: async () => true, demoMode: false },
+      a2a: { taskStore: new InMemoryTaskStore() },
     })
     const sendRes = await postJsonRpc(
       app,
