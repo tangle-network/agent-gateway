@@ -34,6 +34,7 @@ export {
   buildGatewaySandboxContext,
   dispatchSandboxStream,
   dispatchSandboxStreamRich,
+  SandboxStreamError,
 } from './dispatch-sandbox'
 
 export { settleAndRecord } from './dispatch-settlement'
