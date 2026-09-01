@@ -7,7 +7,7 @@
  */
 
 import { Hono } from 'hono'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { A2A_ERROR_CODES } from '../src/a2a/types'
 import { InMemoryTaskStore } from '../src/a2a/task-store'
@@ -430,6 +430,66 @@ describe('A2A — message/stream', () => {
     // Settlement + usage fire after stream completes.
     expect(harness.usage).toHaveLength(1)
     expect(harness.settlements).toHaveLength(1)
+  })
+
+  it('emits a timer keepalive while the sandbox is silent and clears it on completion', async () => {
+    vi.useFakeTimers()
+    let release!: () => void
+    const released = new Promise<void>((resolve) => { release = resolve })
+    let sandboxStarted!: () => void
+    const started = new Promise<void>((resolve) => { sandboxStarted = resolve })
+    const sandbox: SandboxBox = {
+      async *streamPrompt() {
+        sandboxStarted()
+        await released
+        yield {
+          type: 'sandbox.usage',
+          data: {
+            usage: {
+              inputTokens: 1,
+              outputTokens: 0,
+              reasoningTokens: 0,
+              toolTokens: 0,
+              toolCallCount: 1,
+              providerCostUsd: 0.00002,
+              budgetEnforced: true,
+            },
+          },
+        }
+      },
+    }
+
+    try {
+      const harness = buildHarness({ getSandbox: async () => sandbox })
+      const response = await postJsonRpc(
+        harness.app,
+        'test-agent',
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'message/stream',
+          params: { message: textMessage('search') },
+        },
+        apiKeyHeader(),
+      )
+      expect(response.status).toBe(200)
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      expect(decoder.decode((await reader.read()).value)).toContain('"state":"working"')
+      await started
+
+      const keepaliveRead = reader.read()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(decoder.decode((await keepaliveRead).value)).toBe(': keep-alive\n\n')
+
+      release()
+      while (!(await reader.read()).done) {
+        // Drain the response so the stream cleanup runs.
+      }
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

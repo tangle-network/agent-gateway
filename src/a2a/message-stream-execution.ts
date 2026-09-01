@@ -109,6 +109,15 @@ export async function executeMessageStream(
             // The client can cancel between the desiredSize check and enqueue.
           }
         }
+        const sendKeepalive = () => {
+          if (ctrl.desiredSize === null) return
+          try {
+            ctrl.enqueue(encoder.encode(': keep-alive\n\n'))
+          } catch {
+            // The client can cancel between the desiredSize check and enqueue.
+          }
+        }
+        const keepaliveTimer = setInterval(sendKeepalive, 15_000)
 
         let inputRequiredPrompt: string | undefined
         let inputRequiredSeen = false
@@ -361,6 +370,7 @@ export async function executeMessageStream(
             )
           }
         } finally {
+          clearInterval(keepaliveTimer)
           detachRequestAbort()
           deps.cancels.clear(task.id)
           try {
