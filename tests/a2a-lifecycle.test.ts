@@ -290,6 +290,32 @@ describe('A2A lifecycle recovery and ownership', () => {
     expect((await taskStore.get('task-origin-bound'))?.status.state).toBe('completed')
   })
 
+  it('allows task access through an alias that resolves to the originating agent', async () => {
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-alias-bound',
+    )
+    const alias = 'workspace-agent-alias'
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway({
+      ...gatewayConfig(taskStore),
+      resolveAgent: async (slug) => slug === agentA.slug || slug === alias ? agentA : null,
+    }))
+
+    const created = await post(
+      app,
+      agentA.slug,
+      body('message/send'),
+      { 'X-Payment-Signature': paymentHeader('904') },
+    )
+    const createdBody = await created.json() as { result?: Task }
+    expect(createdBody).toMatchObject({ result: { status: { state: 'completed' } } })
+
+    const fetched = await post(app, alias, body('tasks/get', 'task-alias-bound'))
+    expect(fetched.status).toBe(200)
+    expect((await fetched.json() as { result?: Task }).result?.id).toBe(taskStore.serverAssignedId)
+  })
+
   it('expires a task created before payment authorization can finish', async () => {
     class CrashAfterCreateStore implements TaskStore {
       private readonly inner = new InMemoryTaskStore()
