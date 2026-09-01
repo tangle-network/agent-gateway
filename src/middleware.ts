@@ -10,6 +10,7 @@ import {
   markPaymentExecutionStarted,
   renewPaymentExecution,
   claimPayment,
+  buildGatewaySandboxContext,
   dispatchSandboxStreamRich,
   releasePayment,
   releasePaymentAfterFailure,
@@ -406,7 +407,7 @@ function streamChatCompletions(
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder()
-      const sendChunk = (delta: string) => {
+      const sendChunk = (delta: string, role?: string) => {
         if (controller.desiredSize === null) return
         outputText += delta
         const chunk: ChatCompletionChunk = {
@@ -414,12 +415,18 @@ function streamChatCompletions(
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
           model: agent.slug,
-          choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+          choices: [{ index: 0, delta: role ? { role } : { content: delta }, finish_reason: null }],
         }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
       }
+      const sendKeepalive = () => {
+        if (controller.desiredSize === null) return
+        controller.enqueue(encoder.encode(': keep-alive\n\n'))
+      }
+      const keepaliveTimer = setInterval(sendKeepalive, 15_000)
 
       try {
+        sendChunk('', 'assistant')
         for await (const event of dispatchSandboxStreamRich(
           agent,
           userMessage,
@@ -436,14 +443,7 @@ function streamChatCompletions(
           },
           authz.executionBudget.maxInputTokens,
           () => renewPaymentExecution(authz, config),
-          {
-            consumerId,
-            paymentMethod,
-            keyInfo: authz.keyInfo,
-            requestId,
-            messages: authz.messages ?? [],
-            ...(authz.threadId ? { threadId: authz.threadId } : {}),
-          },
+          buildGatewaySandboxContext(authz),
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)
@@ -505,6 +505,7 @@ function streamChatCompletions(
           )
         }
       } finally {
+        clearInterval(keepaliveTimer)
         requestSignal.removeEventListener('abort', abortFromRequest)
         if (controller.desiredSize !== null) controller.close()
       }

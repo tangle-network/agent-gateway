@@ -2,6 +2,7 @@ import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
   beginPaymentExecution,
+  buildGatewaySandboxContext,
   dispatchSandboxStreamRich,
   markPaymentExecutionStarted,
   renewPaymentExecution,
@@ -137,6 +138,7 @@ export async function executeMessageStream(
               workingTask = await renewTaskExecution(deps.taskStore, task.id, authz.requestId)
               await renewPaymentExecution(authz, deps.config)
             },
+            buildGatewaySandboxContext(authz),
           )) {
             if (event.kind === 'text') {
               responseText += event.delta

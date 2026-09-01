@@ -5,7 +5,7 @@
  * These tests exercise the full payment/auth/rate-limit/filter/stream pipeline.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Hono } from 'hono'
 import { createAgentGateway } from '../src/middleware'
 import type {
@@ -519,6 +519,62 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(usage[0]?.outputTokens).toBe(2)
   })
 
+  it('emits an assistant role and timer keepalive while the sandbox is silent', async () => {
+    vi.useFakeTimers()
+    let release!: () => void
+    const released = new Promise<void>((resolve) => { release = resolve })
+    let sandboxStarted!: () => void
+    const started = new Promise<void>((resolve) => { sandboxStarted = resolve })
+    const sandbox: SandboxBox = {
+      async *streamPrompt() {
+        sandboxStarted()
+        await released
+        yield { type: 'sandbox.usage', data: { usage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 1,
+          providerCostUsd: 0.00002,
+          budgetEnforced: true,
+        } } }
+      },
+    }
+    try {
+      const { app } = buildHarness({ getSandbox: async () => sandbox })
+      const response = await app.request('/v1/agents/test-agent/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Payment-Signature': buildSpendAuth({ nonce: '9004' }),
+        },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'search' }] }),
+      })
+      expect(response.status).toBe(200)
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      const roleChunk = await reader.read()
+      expect(decoder.decode(roleChunk.value)).toContain('"role":"assistant"')
+      await started
+
+      const keepaliveRead = reader.read()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(decoder.decode((await keepaliveRead).value)).toBe(': keep-alive\n\n')
+
+      release()
+      let body = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        body += decoder.decode(value)
+      }
+      expect(body).toContain('data: [DONE]')
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('rejects max_tokens above the configured ceiling before verification', async () => {
     let verifierCalls = 0
     const { app } = buildHarness({
@@ -654,7 +710,14 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
     })
     const reader = response.body!.getReader()
-    await reader.read()
+    const decoder = new TextDecoder()
+    let received = ''
+    while (!received.includes('partial')) {
+      const { value, done } = await reader.read()
+      if (done) break
+      received += decoder.decode(value)
+    }
+    expect(received).toContain('partial')
     await reader.cancel()
     await cleanup
 
