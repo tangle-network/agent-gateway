@@ -423,6 +423,7 @@ function streamChatCompletions(
         if (controller.desiredSize === null) return
         controller.enqueue(encoder.encode(': keep-alive\n\n'))
       }
+      const keepaliveTimer = setInterval(sendKeepalive, 15_000)
 
       try {
         sendChunk('', 'assistant')
@@ -448,10 +449,7 @@ function streamChatCompletions(
             sendChunk(event.delta)
             workObserved = true
           }
-          if (event.kind === 'activity') {
-            sendKeepalive()
-            workObserved = true
-          }
+          if (event.kind === 'activity') workObserved = true
           if (event.kind === 'usage') usage = event.usage
         }
 
@@ -507,6 +505,7 @@ function streamChatCompletions(
           )
         }
       } finally {
+        clearInterval(keepaliveTimer)
         requestSignal.removeEventListener('abort', abortFromRequest)
         if (controller.desiredSize !== null) controller.close()
       }
