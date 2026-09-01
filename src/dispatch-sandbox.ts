@@ -27,6 +27,29 @@ export function buildGatewaySandboxContext(
   }
 }
 
+/** Terminal failure reported by the sandbox event protocol. */
+export class SandboxStreamError extends Error {
+  readonly eventType: string
+  readonly code?: string
+  readonly details?: Record<string, unknown>
+
+  constructor(event: SandboxStreamEvent) {
+    const rawMessage = event.data?.message
+    const message = typeof rawMessage === 'string' && rawMessage.trim().length > 0
+      ? rawMessage.trim()
+      : 'Sandbox stream failed'
+    super(message)
+    this.name = 'SandboxStreamError'
+    this.eventType = event.type ?? 'unknown'
+    if (typeof event.data?.code === 'string' && event.data.code.length > 0) {
+      this.code = event.data.code
+    }
+    if (event.data?.details && typeof event.data.details === 'object' && !Array.isArray(event.data.details)) {
+      this.details = event.data.details
+    }
+  }
+}
+
 export async function* dispatchSandboxStream(
   agent: AgentMeta,
   userMessage: string,
@@ -157,6 +180,9 @@ export async function* dispatchSandboxStreamRich(
       }
       if (next.done) break
       const event = next.value
+      if (event.type === 'error' || event.type === 'session.run.failed') {
+        throw new SandboxStreamError(event)
+      }
       if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
       if (event.data?.reasoning?.tokens !== undefined) {
         observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')

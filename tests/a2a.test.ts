@@ -148,6 +148,15 @@ function apiKeyHeader(): Record<string, string> {
   return { Authorization: 'Bearer sk_agent_test_key_1' }
 }
 
+const structuredSandboxFailure: SandboxStreamEvent = {
+  type: 'error',
+  data: {
+    code: 'sandbox.provisioning_failed',
+    message: 'Unable to connect',
+    details: { supportDetails: 'sandbox unavailable' },
+  },
+}
+
 function textMessage(text: string, taskId?: string, contextId?: string) {
   return {
     kind: 'message' as const,
@@ -387,6 +396,77 @@ describe('A2A — message/send', () => {
     expect(res.status).toBe(400)
     const body = (await res.json()) as { error: { type: string } }
     expect(body.error.type).toBe('content_policy_violation')
+  })
+
+  it.each([
+    structuredSandboxFailure,
+    {
+      type: 'session.run.failed',
+      data: structuredSandboxFailure.data,
+    },
+  ] as const)('fails the OpenAI stream on terminal sandbox event %s', async (failureEvent) => {
+    const harness = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield failureEvent
+          yield { type: 'session.run.completed', data: {} }
+        },
+      }),
+    })
+
+    const response = await harness.app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...apiKeyHeader() },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'connect' }], stream: true }),
+    })
+    const body = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(body).toContain('"type":"server_error"')
+    expect(body).toContain('Unable to connect')
+    expect(body).not.toContain('[DONE]')
+    expect(harness.usage).toHaveLength(0)
+    expect(harness.settlements).toHaveLength(0)
+  })
+
+  it('persists an A2A task as failed for the structured sandbox error shape', async () => {
+    const harness = buildHarness({
+      getSandbox: async () => ({
+        async *streamPrompt() {
+          yield structuredSandboxFailure
+          yield { type: 'session.run.completed', data: {} }
+        },
+      }),
+    })
+
+    const response = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('connect', 'structured-failure-task', 'structured-failure-context') },
+      },
+      apiKeyHeader(),
+    )
+    const body = (await response.json()) as JSONRPCErrorResponse
+
+    expect(response.status).toBe(200)
+    expect(body.error.code).toBe(A2A_ERROR_CODES.INTERNAL_ERROR)
+    expect(body.error.message).toBe('Unable to connect')
+
+    const taskResponse = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      { jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { id: 'structured-failure-task' } },
+      apiKeyHeader(),
+    )
+    const task = (await taskResponse.json() as JSONRPCSuccessResponse<Task>).result
+    expect(task.status.state).toBe('failed')
+    expect(task.artifacts).toBeUndefined()
+    expect(harness.usage).toHaveLength(0)
+    expect(harness.settlements).toHaveLength(0)
   })
 })
 

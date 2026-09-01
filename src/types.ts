@@ -195,6 +195,10 @@ export interface SandboxStreamEvent {
     part?: { type?: string; text?: string }
     delta?: string
     finalText?: string
+    /** Structured failure fields emitted by terminal `error` events. */
+    code?: string
+    message?: string
+    details?: Record<string, unknown>
     /**
      * Optional sandbox-side signal that the agent has paused and is waiting
      * for additional input from the caller. The A2A gateway translates this
