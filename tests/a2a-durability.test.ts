@@ -15,7 +15,7 @@ import {
   SqlPushNotificationStore,
 } from '../src/a2a/push-notifications'
 import { claimTaskExecution, renewTaskExecution } from '../src/a2a/execution-fence'
-import { type SqlAdapter, SqlTaskStore } from '../src/a2a/task-store-sql'
+import { d1ToSqlAdapter, type D1DatabaseLike, type SqlAdapter, SqlTaskStore } from '../src/a2a/task-store-sql'
 import type { Task } from '../src/a2a/types'
 
 interface FakeTaskRow {
@@ -178,6 +178,26 @@ function makeTask(id: string, state: Task['status']['state'] = 'submitted'): Tas
 }
 
 describe('SqlTaskStore', () => {
+  it('uses D1 changes instead of indexed billing rows for affected writes', async () => {
+    const db: D1DatabaseLike = {
+      prepare() {
+        const statement = {
+          bind: (..._params: unknown[]) => statement,
+          async run() {
+            return { meta: { changes: 1, rows_written: 3 } }
+          },
+          async all<TRow>() {
+            return { results: [] as TRow[] }
+          },
+        }
+        return statement
+      },
+    }
+
+    expect((await d1ToSqlAdapter(db).exec('INSERT INTO a2a_tasks (...) VALUES (...)')).rowsAffected)
+      .toBe(1)
+  })
+
   it('rejects a stale SQL renewal while expiry recovery claims the same row', async () => {
     const db = new DatabaseSync(':memory:')
     try {
