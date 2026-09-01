@@ -225,6 +225,27 @@ describe('verifyMpp', () => {
     expect(seen[0].credential).toContain('commitment')
   })
 
+  it('preserves Unicode in a web-compatible Base64URL credential', async () => {
+    const header = buildCredential({
+      commitment: '0xAlice',
+      operator: operatorAddress,
+      amount: '1000',
+      nonce: '601',
+      note: 'こんにちは 👋',
+    })
+    let credential = ''
+    const result = await verifyMppCredential(header, {
+      ...mppConfig,
+      authenticateCredential: async (_payload, context) => {
+        credential = context.credential
+        return { consumerId: 'mpp:alice', paymentIdentity: 'payment:alice:601' }
+      },
+    }, { ...baseConfig, demoMode: false })
+
+    expect(result?.consumerId).toBe('mpp:alice')
+    expect(credential).toContain('こんにちは 👋')
+  })
+
   it('adapts the 0.7.1 mpp.verifySigner contract to a stable payment identity', async () => {
     const header = buildCredential({
       commitment: '0xAlice',
