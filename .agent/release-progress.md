@@ -9,8 +9,8 @@
 - Credential files: GitHub trusted publishing and npm provenance workflow
 
 ## Local State
-- Branch: fix/gateway-structured-failure
-- Commit: ce3b7ac (v0.8.8)
+- Branch: chore/release-agent-gateway-0.8.9
+- Commit: b39a117 (merged failure-contract fix)
 - Dirty files: clean at start
 - Gates planned: focused failure tests, full typecheck/test/build, PR review, npm version proof
 
@@ -27,4 +27,5 @@
 - Fallback/rollback: retain v0.8.8 and diagnose failed workflow before retrying
 
 ## Timeline
-- 2026-09-01: confirmed branch starts at origin/main v0.8.8; implementation pending
+- 2026-09-01: confirmed branch starts at origin/main v0.8.8; implementation and release verification in progress
+- 2026-09-01: PR #24 merged as b39a117 after verify passed; release target is 0.8.9
