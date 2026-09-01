@@ -519,6 +519,44 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(usage[0]?.outputTokens).toBe(2)
   })
 
+  it('emits an assistant role and keepalive for activity-only sandbox work', async () => {
+    const sandbox: SandboxBox = {
+      async *streamPrompt() {
+        yield { type: 'tool.started', data: { tool: { name: 'workspace-search' } } }
+        yield { type: 'sandbox.usage', data: { usage: {
+          inputTokens: 1,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          toolTokens: 0,
+          toolCallCount: 1,
+          providerCostUsd: 0.00002,
+          budgetEnforced: true,
+        } } }
+      },
+    }
+    const { app } = buildHarness({ getSandbox: async () => sandbox })
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': buildSpendAuth({ nonce: '9004' }),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'search' }] }),
+    })
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    const frames = body.split('\n\n').filter(Boolean)
+    const firstData = frames[0]!.split('\n').find((line) => line.startsWith('data: '))
+    const first = JSON.parse(firstData!.slice('data: '.length)) as {
+      choices: Array<{ delta: { role?: string; content?: string } }>
+    }
+
+    expect(first.choices[0]?.delta).toEqual({ role: 'assistant' })
+    expect(frames).toContain(': keep-alive')
+    expect(body).toContain('data: [DONE]')
+  })
+
   it('rejects max_tokens above the configured ceiling before verification', async () => {
     let verifierCalls = 0
     const { app } = buildHarness({
@@ -654,7 +692,14 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
     })
     const reader = response.body!.getReader()
-    await reader.read()
+    const decoder = new TextDecoder()
+    let received = ''
+    while (!received.includes('partial')) {
+      const { value, done } = await reader.read()
+      if (done) break
+      received += decoder.decode(value)
+    }
+    expect(received).toContain('partial')
     await reader.cancel()
     await cleanup
 

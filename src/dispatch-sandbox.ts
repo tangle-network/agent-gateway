@@ -15,8 +15,7 @@ import type {
 
 /** Build the adapter context from the request's authenticated identity. */
 export function buildGatewaySandboxContext(
-  authz: Pick<AuthorizedRequest, 'consumerId' | 'paymentMethod' | 'keyInfo' | 'requestId' | 'messages'>,
-  threadId?: string,
+  authz: AuthorizedRequest,
 ): GatewaySandboxContext {
   return {
     consumerId: authz.consumerId,
@@ -24,7 +23,7 @@ export function buildGatewaySandboxContext(
     keyInfo: authz.keyInfo,
     requestId: authz.requestId,
     messages: authz.messages ?? [],
-    ...(threadId !== undefined ? { threadId } : {}),
+    ...(authz.threadId !== undefined ? { threadId: authz.threadId } : {}),
   }
 }
 

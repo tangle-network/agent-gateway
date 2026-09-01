@@ -407,7 +407,7 @@ function streamChatCompletions(
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder()
-      const sendChunk = (delta: string) => {
+      const sendChunk = (delta: string, role?: string) => {
         if (controller.desiredSize === null) return
         outputText += delta
         const chunk: ChatCompletionChunk = {
@@ -415,12 +415,17 @@ function streamChatCompletions(
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
           model: agent.slug,
-          choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+          choices: [{ index: 0, delta: role ? { role } : { content: delta }, finish_reason: null }],
         }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
       }
+      const sendKeepalive = () => {
+        if (controller.desiredSize === null) return
+        controller.enqueue(encoder.encode(': keep-alive\n\n'))
+      }
 
       try {
+        sendChunk('', 'assistant')
         for await (const event of dispatchSandboxStreamRich(
           agent,
           userMessage,
@@ -437,13 +442,16 @@ function streamChatCompletions(
           },
           authz.executionBudget.maxInputTokens,
           () => renewPaymentExecution(authz, config),
-          buildGatewaySandboxContext(authz, authz.threadId),
+          buildGatewaySandboxContext(authz),
         )) {
           if (event.kind === 'text') {
             sendChunk(event.delta)
             workObserved = true
           }
-          if (event.kind === 'activity') workObserved = true
+          if (event.kind === 'activity') {
+            sendKeepalive()
+            workObserved = true
+          }
           if (event.kind === 'usage') usage = event.usage
         }
 

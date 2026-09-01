@@ -469,54 +469,39 @@ describe('A2A — authenticated sandbox context', () => {
       },
     })
 
-    const sendResponse = await postJsonRpc(
-      harness.app,
-      'test-agent',
-      {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'message/send',
-        params: { message: textMessage('send', 'send-task', 'send-context') },
-      },
-      apiKeyHeader(),
-    )
-    expect(sendResponse.status).toBe(200)
-    await sendResponse.text()
+    const requests = [
+      { id: 1, method: 'message/send' as const, text: 'send', taskId: 'send-task', contextId: 'send-context' },
+      { id: 2, method: 'message/stream' as const, text: 'stream', taskId: 'stream-task', contextId: 'stream-context' },
+    ]
+    for (const request of requests) {
+      const response = await postJsonRpc(
+        harness.app,
+        'test-agent',
+        {
+          jsonrpc: '2.0',
+          id: request.id,
+          method: request.method,
+          params: { message: textMessage(request.text, request.taskId, request.contextId) },
+        },
+        apiKeyHeader(),
+      )
+      expect(response.status).toBe(200)
+      if (request.method === 'message/send') await response.text()
+      else await parseSseEvents(response)
+    }
 
-    const streamResponse = await postJsonRpc(
-      harness.app,
-      'test-agent',
-      {
-        jsonrpc: '2.0',
-        id: 2,
-        method: 'message/stream',
-        params: { message: textMessage('stream', 'stream-task', 'stream-context') },
-      },
-      apiKeyHeader(),
-    )
-    expect(streamResponse.status).toBe(200)
-    await parseSseEvents(streamResponse)
-
-    expect(contexts).toHaveLength(2)
-    expect(authorizedThreads).toEqual(['send-context', 'stream-context'])
-    expect(contexts[0]).toMatchObject({
-      consumerId: 'consumer_sk_agent_test_key_1',
-      paymentMethod: 'apikey',
-      keyInfo: { keyId: 'sk_agent_test_key_1' },
-      messages: [{ role: 'user', content: 'send' }],
-      threadId: 'send-context',
-    })
-    expect(contexts[1]).toMatchObject({
-      consumerId: 'consumer_sk_agent_test_key_1',
-      paymentMethod: 'apikey',
-      keyInfo: { keyId: 'sk_agent_test_key_1' },
-      messages: [{ role: 'user', content: 'stream' }],
-      threadId: 'stream-context',
-    })
-    expect(calls).toEqual([
-      { message: 'send', sessionId: 'send-task' },
-      { message: 'stream', sessionId: 'stream-task' },
-    ])
+    expect(contexts).toHaveLength(requests.length)
+    expect(authorizedThreads).toEqual(requests.map(({ contextId }) => contextId))
+    expect(calls).toEqual(requests.map(({ text, taskId }) => ({ message: text, sessionId: taskId })))
+    for (const [index, request] of requests.entries()) {
+      expect(contexts[index]).toMatchObject({
+        consumerId: 'consumer_sk_agent_test_key_1',
+        paymentMethod: 'apikey',
+        keyInfo: { keyId: 'sk_agent_test_key_1' },
+        messages: [{ role: 'user', content: request.text }],
+        threadId: request.contextId,
+      })
+    }
   })
 
   it('rejects a header thread that disagrees with the A2A context before sandbox access', async () => {

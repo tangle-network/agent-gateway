@@ -111,6 +111,7 @@ export type {
   SandboxUsageReceipt,
   SandboxStreamEvent,
   SandboxBox,
+  GatewaySandboxContext,
   ApiKeyGatewayConfig,
   CreateAgentGatewayConfig,
   GatewayConfig,

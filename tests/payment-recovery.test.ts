@@ -875,7 +875,14 @@ describe('durable OpenAI recovery', () => {
       body: requestBody(),
     })
     const reader = response.body!.getReader()
-    expect(new TextDecoder().decode((await reader.read()).value)).toContain('partial')
+    const decoder = new TextDecoder()
+    let received = ''
+    while (!received.includes('partial')) {
+      const { value, done } = await reader.read()
+      if (done) break
+      received += decoder.decode(value)
+    }
+    expect(received).toContain('partial')
     await reader.cancel()
     for (let attempt = 0; attempt < 20; attempt += 1) await Promise.resolve()
 
