@@ -9,6 +9,7 @@ import { MemoryPaymentOperations, type PaymentOperation } from '../src/payment-o
 import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 import { recoverPayment } from '../src/payment-recovery-worker'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
+import { ServerAssignedTaskStore } from './server-assigned-task-store'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
@@ -91,11 +92,11 @@ class A2AChargeLifecycle implements MppChargeLifecycle {
   }
 }
 
-function message(text: string, taskId: string) {
+function message(text: string, taskId?: string) {
   return {
     kind: 'message',
     role: 'user',
-    taskId,
+    ...(taskId ? { taskId } : {}),
     contextId: 'ctx-race',
     messageId: `message-${text}`,
     parts: [{ kind: 'text', text }],
@@ -265,7 +266,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('releases payment when cancellation interrupts execution before sandbox start', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-before-sandbox',
+    )
     let executionStarted!: () => void
     const executionReady = new Promise<void>((resolve) => { executionStarted = resolve })
     let releaseExecution!: () => void
@@ -313,7 +317,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-before-sandbox') },
+        params: { message: message('run') },
       }),
     })
     await executionReady
@@ -396,7 +400,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('returns a canceled synchronous task without losing payment ownership', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-sync-cancel',
+    )
     const operations = new MemoryPaymentOperations()
     let outputSeen!: () => void
     const outputReady = new Promise<void>((resolve) => { outputSeen = resolve })
@@ -432,7 +439,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-sync-cancel') },
+        params: { message: message('run') },
       }),
     })
     await outputReady
@@ -464,7 +471,7 @@ describe('A2A payment ownership races', () => {
     const finalizationReady = new Promise<void>((resolve) => { finalizationSeen = resolve })
     let releaseFinalization!: () => void
     const finalizationReleased = new Promise<void>((resolve) => { releaseFinalization = resolve })
-    const taskStore: TaskStore = {
+    const innerTaskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
@@ -479,6 +486,7 @@ describe('A2A payment ownership races', () => {
       compareAndSetExecution: (expected, next, requestId, now) =>
         innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
+    const taskStore = new ServerAssignedTaskStore(innerTaskStore, 'task-finalization-cancel')
     let settlements = 0
     const operations = new MemoryPaymentOperations({
       onSettle: async () => { settlements += 1 },
@@ -512,7 +520,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-finalization-cancel') },
+        params: { message: message('run') },
       }),
     })
     await finalizationReady
@@ -545,7 +553,7 @@ describe('A2A payment ownership races', () => {
     let releaseCancellation!: () => void
     const cancellationReleased = new Promise<void>((resolve) => { releaseCancellation = resolve })
     let cancellationBlocked = false
-    const taskStore: TaskStore = {
+    const innerTaskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
@@ -562,6 +570,7 @@ describe('A2A payment ownership races', () => {
       compareAndSetExecution: (expected, next, requestId, now) =>
         innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
+    const taskStore = new ServerAssignedTaskStore(innerTaskStore, 'task-stream-finalization-cancel')
     let sandboxDrained!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxDrained = resolve })
     let releaseSandbox!: () => void
@@ -601,7 +610,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/stream',
-        params: { message: message('run', 'task-stream-finalization-cancel') },
+        params: { message: message('run') },
       }),
     })
     const reader = stream.body!.getReader()
@@ -636,7 +645,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('returns after cancel when a sandbox stops emitting events', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-silent-cancel',
+    )
     const operations = new MemoryPaymentOperations()
     let outputSeen!: () => void
     const outputReady = new Promise<void>((resolve) => { outputSeen = resolve })
@@ -672,7 +684,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-silent-cancel') },
+        params: { message: message('run') },
       }),
     })
     await outputReady
@@ -700,7 +712,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('retains ownership when cancellation follows delivered output without a receipt', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-cancel',
+    )
     const operations = new MemoryPaymentOperations()
     let outputSeen!: () => void
     const outputReady = new Promise<void>((resolve) => { outputSeen = resolve })
@@ -739,7 +754,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/stream',
-        params: { message: message('run', 'task-cancel') },
+        params: { message: message('run') },
       }),
     })
     const stream = await streamPromise
@@ -774,7 +789,7 @@ describe('A2A payment ownership races', () => {
     let releaseFinalization!: () => void
     const finalizationReleased = new Promise<void>((resolve) => { releaseFinalization = resolve })
     let firstFinalization = true
-    const taskStore: TaskStore = {
+    const innerTaskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
@@ -790,6 +805,10 @@ describe('A2A payment ownership races', () => {
       compareAndSetExecution: (expected, next, requestId, now) =>
         innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
+    const taskStore = new ServerAssignedTaskStore(
+      innerTaskStore,
+      'task-canceled-settlement-recovery',
+    )
     let settlementAttempts = 0
     let recoveryAttempts = 0
     let records = 0
@@ -829,7 +848,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-canceled-settlement-recovery') },
+        params: { message: message('run') },
       }),
     })
     await finalizationReady
@@ -894,7 +913,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('persists and recovers an ambiguous release acknowledgement', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-release-recovery',
+    )
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let executionStarted!: () => void
     const executionReady = new Promise<void>((resolve) => { executionStarted = resolve })
@@ -952,7 +974,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-release-recovery') },
+        params: { message: message('run') },
       }),
     })
     await executionReady
@@ -1005,7 +1027,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('recovers an ambiguous release after shared nonce ownership fails', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-nonce-release-recovery',
+    )
     const recoveryStore = new MemoryPaymentRecoveryStore()
     const nonceStore = {
       hasSeen: async () => false,
@@ -1060,7 +1085,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-nonce-release-recovery') },
+        params: { message: message('run') },
       }),
     })
     const body = await response.json() as { error?: { code?: number } }
@@ -1098,7 +1123,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('records usage once when an inserted acknowledgement is lost', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-usage-recovery',
+    )
     const operations = new MemoryPaymentOperations({ onReclaim: async () => undefined })
     const usageRequestIds = new Set<string>()
     let recordCalls = 0
@@ -1143,7 +1171,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-usage-recovery') },
+        params: { message: message('run') },
       }),
     })
     const body = await send.json() as { error?: { code?: number } }
@@ -1192,7 +1220,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('cancels during generic MPP confirmation without executing or stranding the charge', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-stripe-confirm-cancel',
+    )
     const lifecycle = new A2AChargeLifecycle()
     let confirmationStarted!: () => void
     const confirmationReady = new Promise<void>((resolve) => { confirmationStarted = resolve })
@@ -1234,7 +1265,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-stripe-confirm-cancel') },
+        params: { message: message('run') },
       }),
     })
     await confirmationReady
@@ -1293,7 +1324,7 @@ describe('A2A payment ownership races', () => {
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(config))
-    const request = (method: 'message/send' | 'message/stream', taskId: string, token: string) =>
+    const request = (method: 'message/send' | 'message/stream', requestId: string, token: string) =>
       app.request('/v1/agents/a2a-races', {
         method: 'POST',
         headers: {
@@ -1302,15 +1333,15 @@ describe('A2A payment ownership races', () => {
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
-          id: taskId,
+          id: requestId,
           method,
-          params: { message: message('run', taskId) },
+          params: { message: message('run') },
         }),
       })
 
-    const sent = await request('message/send', 'task-stripe-send-receipt', 'spt_send_receipt')
+    const sent = await request('message/send', 'send-receipt', 'spt_send_receipt')
     await sent.text()
-    const streamed = await request('message/stream', 'task-stripe-stream-receipt', 'spt_stream_receipt')
+    const streamed = await request('message/stream', 'stream-receipt', 'spt_stream_receipt')
     await streamed.text()
 
     expect(sent.status).toBe(200)
@@ -1323,7 +1354,10 @@ describe('A2A payment ownership races', () => {
   })
 
   it('recovers generic MPP usage acknowledgement loss from the durable task receipt', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'task-stripe-usage-recovery',
+    )
     const recoveryStore = new MemoryPaymentRecoveryStore()
     const lifecycle = new A2AChargeLifecycle()
     const requestIds = new Set<string>()
@@ -1370,7 +1404,7 @@ describe('A2A payment ownership races', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: message('run', 'task-stripe-usage-recovery') },
+        params: { message: message('run') },
       }),
     })
     const failed = await sent.json() as { error?: { code?: number } }

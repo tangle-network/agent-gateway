@@ -531,9 +531,10 @@ describe('A2A — authenticated sandbox context', () => {
     })
 
     const requests = [
-      { id: 1, method: 'message/send' as const, text: 'send', taskId: 'send-task', contextId: 'send-context' },
-      { id: 2, method: 'message/stream' as const, text: 'stream', taskId: 'stream-task', contextId: 'stream-context' },
+      { id: 1, method: 'message/send' as const, text: 'send', contextId: 'send-context' },
+      { id: 2, method: 'message/stream' as const, text: 'stream', contextId: 'stream-context' },
     ]
+    const taskIds: string[] = []
     for (const request of requests) {
       const response = await postJsonRpc(
         harness.app,
@@ -542,18 +543,27 @@ describe('A2A — authenticated sandbox context', () => {
           jsonrpc: '2.0',
           id: request.id,
           method: request.method,
-          params: { message: textMessage(request.text, request.taskId, request.contextId) },
+          params: { message: textMessage(request.text, undefined, request.contextId) },
         },
         apiKeyHeader(),
       )
       expect(response.status).toBe(200)
-      if (request.method === 'message/send') await response.text()
-      else await parseSseEvents(response)
+      if (request.method === 'message/send') {
+        const envelope = (await response.json()) as JSONRPCSuccessResponse<Task>
+        taskIds.push(envelope.result.id)
+      } else {
+        const events = await parseSseEvents(response)
+        const taskId = events[0]?.taskId
+        expect(taskId).toMatch(/^task_/)
+        taskIds.push(taskId as string)
+      }
     }
 
     expect(contexts).toHaveLength(requests.length)
     expect(authorizedThreads).toEqual(requests.map(({ contextId }) => contextId))
-    expect(calls).toEqual(requests.map(({ text, taskId }) => ({ message: text, sessionId: taskId })))
+    expect(calls).toEqual(requests.map(({ text }, index) => ({ message: text, sessionId: taskIds[index] })))
+    expect(taskIds).toHaveLength(requests.length)
+    expect(new Set(taskIds).size).toBe(requests.length)
     for (const [index, request] of requests.entries()) {
       expect(contexts[index]).toMatchObject({
         consumerId: 'consumer_sk_agent_test_key_1',
@@ -582,7 +592,7 @@ describe('A2A — authenticated sandbox context', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: textMessage('send', 'mismatch-task', 'a2a-context') },
+        params: { message: textMessage('send', undefined, 'a2a-context') },
       },
       { ...apiKeyHeader(), 'X-Tangle-Thread-Id': 'header-context' },
     )

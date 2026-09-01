@@ -15,6 +15,7 @@ import { verifyMpp } from '../src/verify'
 import type { AgentMeta, GatewayConfig, SandboxStreamEvent } from '../src/types'
 import { A2A_ERROR_CODES, type Task } from '../src/a2a/types'
 import type { MppConfig } from '../src/types'
+import { ServerAssignedTaskStore } from './server-assigned-task-store'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
@@ -91,7 +92,10 @@ function durableConfig(
 
 describe('PR #11 production regressions', () => {
   it('claims one terminal webhook when cancellation races fenced settlement on two workers', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'pr11-push-race',
+    )
     const pushStore = new InMemoryPushNotificationStore()
     const nonceStore = new MemoryNonceStore()
     const recoveryStore = new MemoryPaymentRecoveryStore()
@@ -168,7 +172,6 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'pr11-push-race',
             contextId: 'pr11-push-context',
             messageId: 'pr11-push-message',
             parts: [{ kind: 'text', text: 'run' }],
@@ -177,7 +180,8 @@ describe('PR #11 production regressions', () => {
       }),
     })
     await sandboxReady
-    await pushStore.set('pr11-push-race', { id: 'terminal', url: 'https://hook.example/terminal' })
+    const taskId = taskStore.serverAssignedId!
+    await pushStore.set(taskId, { id: 'terminal', url: 'https://hook.example/terminal' })
 
     const cancel = await canceler.request('/v1/agents/pr11', {
       method: 'POST',
@@ -200,7 +204,7 @@ describe('PR #11 production regressions', () => {
       .result?.status?.state).toBe('completed')
     expect(settlements).toBe(1)
     expect(deliveries).toBe(1)
-    expect(receivedTaskIds).toEqual(['pr11-push-race'])
+    expect(receivedTaskIds).toEqual([taskId])
     expect((await taskStore.get('pr11-push-race'))?.status.state).toBe('completed')
   })
 
@@ -325,7 +329,10 @@ describe('PR #11 production regressions', () => {
   })
 
   it('does not send an unsigned webhook if a production secret disappears at runtime', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'runtime-secret-task',
+    )
     const pushStore = new InMemoryPushNotificationStore()
     let sandboxStarted!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxStarted = resolve })
@@ -376,7 +383,6 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'runtime-secret-task',
             contextId: 'runtime-secret-context',
             messageId: 'runtime-secret-message',
             parts: [{ kind: 'text', text: 'run' }],
@@ -385,7 +391,7 @@ describe('PR #11 production regressions', () => {
       }),
     })
     await sandboxReady
-    await pushStore.set('runtime-secret-task', { id: 'cfg', url: 'https://hook.example/terminal' })
+    await pushStore.set(taskStore.serverAssignedId!, { id: 'cfg', url: 'https://hook.example/terminal' })
     config.a2a!.webhookSecret = undefined
     releaseSandbox()
 
@@ -477,7 +483,10 @@ describe('PR #11 production regressions', () => {
   })
 
   it('does not execute after a cancellation wins on another worker', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'pr11-cancel-race',
+    )
     let sandboxEntered!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxEntered = resolve })
     let releaseSandbox!: () => void
@@ -529,7 +538,6 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'pr11-cancel-race',
             contextId: 'pr11-context',
             messageId: 'pr11-message',
             parts: [{ kind: 'text', text: 'run' }],
@@ -565,7 +573,7 @@ describe('PR #11 production regressions', () => {
     let releaseFence!: () => void
     const fenceReleased = new Promise<void>((resolve) => { releaseFence = resolve })
     let blocked = false
-    const taskStore: TaskStore = {
+    const innerTaskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
@@ -582,6 +590,7 @@ describe('PR #11 production regressions', () => {
       compareAndSetExecution: (expected, next, requestId, now) =>
         innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
+    const taskStore = new ServerAssignedTaskStore(innerTaskStore, 'pr11-active-cancel-race')
     let providerStarted = false
     let releaseProvider!: () => void
     const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve })
@@ -628,7 +637,6 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'pr11-active-cancel-race',
             contextId: 'pr11-active-cancel-context',
             messageId: 'pr11-active-cancel-message',
             parts: [{ kind: 'text', text: 'run' }],
@@ -670,7 +678,7 @@ describe('PR #11 production regressions', () => {
     let releaseTransition!: () => void
     const transitionReleased = new Promise<void>((resolve) => { releaseTransition = resolve })
     let blocked = false
-    const taskStore: TaskStore = {
+    const innerTaskStore: TaskStore = {
       get: (id) => innerStore.get(id),
       put: (task) => innerStore.put(task),
       createIfAbsent: (task) => innerStore.createIfAbsent(task),
@@ -686,6 +694,7 @@ describe('PR #11 production regressions', () => {
       compareAndSetExecution: (expected, next, requestId, now) =>
         innerStore.compareAndSetExecution(expected, next, requestId, now),
     }
+    const taskStore = new ServerAssignedTaskStore(innerTaskStore, 'submission-lease-task')
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(durableConfig({
       a2a: { taskStore },
@@ -713,7 +722,6 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'submission-lease-task',
             contextId: 'submission-lease-context',
             messageId: 'submission-lease-message',
             parts: [{ kind: 'text', text: 'run' }],
@@ -797,7 +805,10 @@ describe('PR #11 production regressions', () => {
   })
 
   it('quotes retained A2A history before charging a continuation', async () => {
-    const taskStore = new InMemoryTaskStore()
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'pr11-continuation',
+    )
     let invocations = 0
     const longHistory = 'history '.repeat(500)
     const config: GatewayConfig = {
@@ -829,7 +840,7 @@ describe('PR #11 production regressions', () => {
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(config))
-    const send = (nonce: string, text: string) => app.request('/v1/agents/pr11', {
+    const send = (nonce: string, text: string, taskId?: string) => app.request('/v1/agents/pr11', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -843,7 +854,7 @@ describe('PR #11 production regressions', () => {
           message: {
             kind: 'message',
             role: 'user',
-            taskId: 'pr11-continuation',
+            ...(taskId ? { taskId } : {}),
             contextId: 'pr11-context',
             messageId: `message-${nonce}`,
             parts: [{ kind: 'text', text }],
@@ -855,7 +866,7 @@ describe('PR #11 production regressions', () => {
     const first = await send('9004', longHistory)
     expect((await first.json() as { result?: { status?: { state?: string } } }).result?.status?.state)
       .toBe('input-required')
-    const second = await send('9005', 'continue')
+    const second = await send('9005', 'continue', 'pr11-continuation')
 
     expect(second.status).toBe(200)
     expect((await second.json() as { result?: { status?: { state?: string } } }).result?.status?.state)

@@ -26,6 +26,7 @@ import type {
   SandboxBox,
   SandboxUsageReceipt,
 } from '../src/types'
+import { ServerAssignedTaskStore } from './server-assigned-task-store'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
@@ -1082,7 +1083,10 @@ describe('A2A recovery retention', () => {
   it('keeps an expired task until its no-receipt payment reconciles, then restores normal TTL', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-14T00:00:00.000Z'))
-    const taskStore = new InMemoryTaskStore(20)
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(20),
+      'task-503',
+    )
     const recoveryStore = new MemoryPaymentRecoveryStore()
     const settlements: PaymentSettlementInput[] = []
     const operations = new MemoryPaymentOperations({
@@ -1123,7 +1127,6 @@ describe('A2A recovery retention', () => {
             kind: 'message',
             role: 'user',
             messageId: 'message-503',
-            taskId: 'task-503',
             parts: [{ kind: 'text', text: 'run' }],
           },
         },

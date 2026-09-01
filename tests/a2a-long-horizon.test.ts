@@ -478,7 +478,7 @@ describe('A2A — push delivery on terminal state', () => {
       { chunks: ['part '], pause: { prompt: 'continue?' } },
     ])
     const { app, fetchMock, pushStore } = buildHarness({ sandbox })
-    // Register push for a task id we'll fabricate via an explicit message.taskId.
+    // Register push for an unrelated task to prove input-required is not terminal.
     const taskId = 'task_explicit_1'
     // First message must create the task; push registration requires task to exist.
     // So: create with a small no-pause sequence first, then run pause sequence
@@ -501,10 +501,9 @@ describe('A2A — push delivery on terminal state', () => {
   })
 
   it('webhook delivery: headers + body match the documented contract (unit-level)', async () => {
-    // The realistic flow: client pre-allocates taskId, registers push,
-    // THEN issues message/send (which uses that taskId). Push fires at
-    // terminal. We simulate this by registering on a separate task that we
-    // know about, then driving the same id through message/send.
+    // The realistic flow creates a task first, then registers push for its
+    // server-assigned taskId. We test delivery directly because this fixture
+    // does not need another gateway execution.
 
     // Concrete test: we cannot pre-register because set requires task to
     // exist. Instead, this test verifies the delivery mechanic by manually
@@ -710,7 +709,7 @@ describe('A2A — input-required + multi-turn via taskId', () => {
       apiKeyHeader(),
     )
     const body = (await followup.json()) as JSONRPCErrorResponse
-    expect(body.error.code).toBe(A2A_ERROR_CODES.INVALID_PARAMS)
+    expect(body.error.code).toBe(A2A_ERROR_CODES.UNSUPPORTED_OPERATION)
     expect(body.error.message).toContain('input-required')
   })
 })
