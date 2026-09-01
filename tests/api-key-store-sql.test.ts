@@ -35,7 +35,7 @@ async function createKey(
     rateLimit: 60,
     dailyLimit: 1_000,
     spendingLimitCents: 500,
-    expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+    expiresAt: new Date('2030-01-01T00:00:00.999Z'),
   })
 }
 
@@ -50,6 +50,7 @@ describe('SqlApiKeyStore', () => {
       expect(created.id).toMatch(/^[0-9a-f]{32}$/)
       expect(created.spentCents).toBe(0)
       expect(created.lastUsedAt).toBeNull()
+      expect(created.expiresAt?.toISOString()).toBe('2030-01-01T00:00:00.000Z')
 
       expect(await store.findByHash('hash-1')).toEqual(created)
       expect(await store.list('user-1')).toEqual([

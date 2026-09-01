@@ -8,7 +8,7 @@ interface ApiKeyRow {
   name: string
   key_hash: string
   key_prefix: string
-  scopes: string
+  scopes: string | null
   rate_limit: number
   daily_limit: number
   spending_limit_cents: number | null
@@ -48,7 +48,8 @@ export function sqlApiKeyStoreSchemaStatements(
   ]
 }
 
-function parseScopes(value: string): string[] {
+function parseScopes(value: string | null): string[] {
+  if (value === null) return ['chat']
   const parsed = JSON.parse(value) as unknown
   if (!Array.isArray(parsed) || !parsed.every((scope) => typeof scope === 'string')) {
     throw new TypeError('Stored API key scopes must be a string array')
@@ -143,6 +144,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
       id,
       userId,
       ...data,
+      expiresAt: data.expiresAt ? fromSqlTimestamp(toSqlTimestamp(data.expiresAt)) : null,
       spentCents: 0,
       lastUsedAt: null,
       createdAt: fromSqlTimestamp(createdAt)!,
