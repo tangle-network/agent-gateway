@@ -16,6 +16,7 @@ import {
   createAgentGateway,
   recoverPayments,
   SqlApiKeyStore,
+  SqlGatewayUsageStore,
   SqlPaymentRecoveryStore,
   verifyApiKeyFromStore,
 } from '@tangle-network/agent-gateway'
@@ -26,10 +27,12 @@ const paymentRecoveryStore = new SqlPaymentRecoveryStore(sqlAdapter)
 await paymentRecoveryStore.migrate()
 const apiKeyStore = new SqlApiKeyStore(sqlAdapter)
 await apiKeyStore.migrate()
+const usageStore = new SqlGatewayUsageStore(sqlAdapter)
+await usageStore.migrate()
 app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
-  recordUsage: recordUsageEvent,
+  recordUsage: usageStore.recordUsage,
   x402: {
     operatorAddress: '0x…',
     chainId: 3799,
@@ -47,6 +50,7 @@ app.route('/v1/agents', createAgentGateway({
 ```
 
 Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
+Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
 Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
 The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
 

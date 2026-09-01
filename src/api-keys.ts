@@ -81,7 +81,7 @@ export async function verifyApiKeyFromStore(
   authHeader: string,
   store: ApiKeyStore,
   prefix = 'ak_',
-): Promise<{ key: ApiKey; keyId: string; consumerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
+): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
   const bearerPrefix = `Bearer ${prefix}`
   if (!authHeader.startsWith(bearerPrefix)) return null
 
@@ -100,6 +100,7 @@ export async function verifyApiKeyFromStore(
     key,
     consumerId: `apikey:${key.id}`,
     keyId: key.id,
+    ownerId: key.userId,
     scopes: key.scopes,
     rateLimitPerMinute: key.rateLimit,
     dailyLimit: key.dailyLimit,

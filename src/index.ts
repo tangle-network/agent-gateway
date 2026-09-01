@@ -81,6 +81,11 @@ export {
   type SqlApiKeyStoreOptions,
 } from './api-key-store-sql'
 export {
+  SqlGatewayUsageStore,
+  sqlGatewayUsageStoreSchemaStatements,
+  type SqlGatewayUsageStoreOptions,
+} from './usage-store-sql'
+export {
   MemoryNonceStore,
   KvNonceStore,
   isAtomicNonceStore,

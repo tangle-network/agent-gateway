@@ -179,6 +179,8 @@ export interface PaymentResult {
 export interface ApiKeyInfo {
   keyId: string
   consumerId: string
+  /** Server-side owner identity for routing a private workspace request. */
+  ownerId?: string
   /** Scopes this key is authorized for (e.g. ["chat", "forms"]) */
   scopes?: string[]
   /** Per-key rate limit override (requests per minute). If set, overrides global rate limit. */

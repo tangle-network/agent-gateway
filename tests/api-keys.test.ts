@@ -203,6 +203,7 @@ describe('verifyApiKeyFromStore', () => {
     const result = await verifyApiKeyFromStore(`Bearer ${rawKey}`, store)
     expect(result).not.toBeNull()
     expect(result!.consumerId).toBe(`apikey:${result!.keyId}`)
+    expect(result!.ownerId).toBe('user_alice')
     expect(result!.scopes).toEqual(['chat'])
   })
 
