@@ -1,6 +1,8 @@
 import type { SandboxRunControlRef } from '../types'
 import type { Task } from './types'
 
+export type { SandboxRunControlRef } from '../types'
+
 interface ExecutionTaskStore {
   get(id: string): Promise<Task | undefined>
   compareAndSet?(expected: Task, next: Task): Promise<boolean>
@@ -115,18 +117,7 @@ export function hasMalformedTaskExecution(task: Task): boolean {
 /** Read the exact detached sandbox identity stored on a task. */
 export function readTaskExecutionReference(task: Task): SandboxRunControlRef | undefined {
   const inspection = inspectTaskExecution(task)
-  if (inspection.state !== 'valid') return undefined
-  const marker = inspection.marker
-  if (
-    !marker.runControlRef ||
-    typeof marker.runControlRef.environmentId !== 'string' ||
-    marker.runControlRef.environmentId.length === 0 ||
-    typeof marker.runControlRef.sessionId !== 'string' ||
-    marker.runControlRef.sessionId.length === 0 ||
-    typeof marker.runControlRef.executionId !== 'string' ||
-    marker.runControlRef.executionId.length === 0
-  ) return undefined
-  return marker.runControlRef
+  return inspection.state === 'valid' ? inspection.marker.runControlRef : undefined
 }
 
 /** Persist the sandbox admission before any response observation begins. */
@@ -166,10 +157,7 @@ export async function attachTaskExecutionReference(
         } satisfies TaskExecutionMarker,
       },
     }
-    if (
-      store.compareAndSetExecution &&
-      await store.compareAndSetExecution(current, next, requestId, now)
-    ) return next
+    if (store.compareAndSetExecution && await store.compareAndSetExecution(current, next, requestId, now)) return next
   }
   throw new Error(`A2A task '${task.id}' changed while sandbox execution was attached`)
 }
@@ -233,18 +221,16 @@ export function inspectTaskExecution(task: Task): TaskExecutionInspection {
     typeof marker.lease.expiresAt !== 'number' ||
     !Number.isFinite(marker.lease.expiresAt)
   ) return { state: 'malformed', reason: 'marker fields are invalid' }
-  if (
-    marker.runControlRef !== undefined &&
-    (
-      !marker.runControlRef ||
-      typeof marker.runControlRef !== 'object' ||
-      typeof marker.runControlRef.environmentId !== 'string' ||
-      marker.runControlRef.environmentId.length === 0 ||
-      typeof marker.runControlRef.sessionId !== 'string' ||
-      marker.runControlRef.sessionId.length === 0 ||
-      typeof marker.runControlRef.executionId !== 'string' ||
-      marker.runControlRef.executionId.length === 0
-    )
-  ) return { state: 'malformed', reason: 'detached execution reference is incomplete' }
+  if (marker.runControlRef !== undefined && !isRunControlRef(marker.runControlRef)) {
+    return { state: 'malformed', reason: 'detached execution reference is incomplete' }
+  }
   return { state: 'valid', marker: marker as TaskExecutionMarker }
+}
+
+function isRunControlRef(value: unknown): value is SandboxRunControlRef {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const ref = value as Partial<SandboxRunControlRef>
+  return [ref.environmentId, ref.sessionId, ref.executionId].every(
+    (part) => typeof part === 'string' && part.length > 0,
+  )
 }

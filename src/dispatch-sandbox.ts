@@ -9,14 +9,9 @@ import type {
   GatewayConfig,
   GatewaySandboxContext,
   SandboxExecutionBudget,
-  SandboxRunControlRef,
   SandboxStreamEvent,
   SandboxUsageReceipt,
 } from './types'
-import {
-  hasDetachedSandbox,
-  openDetachedSandboxStream,
-} from './a2a/detached-sandbox'
 
 /** Build the adapter context from the request's authenticated identity. */
 export function buildGatewaySandboxContext(
@@ -102,22 +97,10 @@ export async function* dispatchSandboxStreamRich(
   maxInputTokens?: number,
   onExecutionHeartbeat?: () => Promise<void>,
   sandboxContext?: GatewaySandboxContext,
-  options: {
-    detached?: boolean
-    turnId?: string
-    onExecutionAccepted?: (reference: SandboxRunControlRef) => Promise<void>
-  } = {},
 ): AsyncIterable<A2ADispatchEvent> {
   if (signal?.aborted) return
   const box = await config.getSandbox(agent, sandboxContext)
   if (signal?.aborted) return
-  const detached = options.detached === true
-  const detachedBox = hasDetachedSandbox(box) ? box : undefined
-  if (detached && !detachedBox && !config.x402.demoMode) {
-    throw new Error(
-      'A2A production execution requires sandbox dispatchPrompt and session controls',
-    )
-  }
   const outputLimit = maxOutputTokens ?? config.defaultOutputTokens ?? 1024
   if (!Number.isSafeInteger(outputLimit) || outputLimit <= 0) {
     throw new Error('max output tokens must be a positive safe integer')
@@ -162,26 +145,13 @@ export async function* dispatchSandboxStreamRich(
     // This durable handoff is after sandbox acquisition and immediately before
     // the adapter call that may start paid work.
     await onSandboxStart?.()
-    const promptStream = detached && detachedBox
-      ? await openDetachedSandboxStream(
-          detachedBox,
-          agent,
-          userMessage,
-          consumerId,
-          sessionId,
-          outputLimit,
-          executionBudget,
-          sandboxContext,
-          options,
-          executionController.signal,
-        )
-      : box.streamPrompt(userMessage, {
-          sessionId: sessionId ?? `consumer:${consumerId}`,
-          systemPrompt: agent.systemPrompt,
-          maxOutputTokens: outputLimit,
-          executionBudget,
-          signal: executionController.signal,
-        })
+    const promptStream = box.streamPrompt(userMessage, {
+      sessionId: sessionId ?? `consumer:${consumerId}`,
+      systemPrompt: agent.systemPrompt,
+      maxOutputTokens: outputLimit,
+      executionBudget,
+      signal: executionController.signal,
+    })
     iterator = promptStream[Symbol.asyncIterator]()
     const heartbeatMs = onExecutionHeartbeat
       ? Math.max(100, Math.min(
@@ -475,7 +445,7 @@ function completeUsage(
   return finalizeUsage(observed, budget)
 }
 
-function truncateUtf8(
+export function truncateUtf8(
   value: string,
   maxBytes: number,
   encoder: TextEncoder,

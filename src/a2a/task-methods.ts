@@ -18,13 +18,14 @@ import {
   type TaskStatusUpdateEvent,
   type StreamingEvent,
 } from './types'
-import type { SandboxRunControlRef, SandboxStreamEvent, SandboxPromptResult } from '../types'
+import type { SandboxPromptResult, SandboxRunControlRef, SandboxStreamEvent } from '../types'
 
 export interface TaskExecutionSource {
   reference: SandboxRunControlRef
   events: (opts?: { since?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
   result: () => Promise<SandboxPromptResult>
   interrupt: () => Promise<{ cancelled: boolean }>
+  translateText: (value: string) => string
 }
 
 export interface TaskMethodDependencies {
@@ -61,8 +62,10 @@ export async function handleTasksGet(
   }
   const accessError = await deps.authorizeTaskAccess(c, req, storedTask)
   if (accessError) return accessError
-  const task = await deps.recoverTask(storedTask, c.req.param('slug') ?? '')
-  return c.json(ok(req.id, task))
+  const slug = c.req.param('slug') ?? ''
+  const task = await deps.recoverTask(storedTask, slug)
+  const reconciled = await deps.reconcileTask(task, slug, true)
+  return c.json(ok(req.id, reconciled))
 }
 
 export async function handleTasksCancel(
@@ -80,7 +83,8 @@ export async function handleTasksCancel(
   }
   const accessError = await deps.authorizeTaskAccess(c, req, storedTask)
   if (accessError) return accessError
-  const task = await deps.recoverTask(storedTask, c.req.param('slug') ?? '')
+  const slug = c.req.param('slug') ?? ''
+  const task = await deps.recoverTask(storedTask, slug)
   if (isTerminal(task.status.state)) {
     return c.json(
       fail(
@@ -90,44 +94,32 @@ export async function handleTasksCancel(
       ),
     )
   }
-  let execution: TaskExecutionSource | undefined
-  try {
-    execution = await deps.getTaskExecution(task, c.req.param('slug') ?? '')
-  } catch (error) {
-    return c.json(fail(
-      req.id,
-      A2A_ERROR_CODES.INTERNAL_ERROR,
-      error instanceof Error ? error.message : String(error),
-    ))
-  }
-  if (
-    isTaskFinalizing(task) ||
-    deps.cancels.isFinalizing(task.id) ||
-    (hasActiveTaskExecution(task) && !deps.cancels.has(task.id) && !execution)
-  ) {
+  if (isTaskFinalizing(task) || deps.cancels.isFinalizing(task.id)) {
     return c.json(
-      fail(
-        req.id,
-        A2A_ERROR_CODES.TASK_NOT_CANCELABLE,
-        hasActiveTaskExecution(task)
-          ? `task '${task.id}' has an active execution fence`
-          : `task '${task.id}' is being finalized`,
-      ),
+      fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' is being finalized`),
     )
   }
+  if (hasActiveTaskExecution(task) && !deps.cancels.has(task.id)) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.TASK_NOT_CANCELABLE, `task '${task.id}' has an active execution fence`),
+    )
+  }
+  let execution: TaskExecutionSource | undefined
+  try {
+    execution = await deps.getTaskExecution(task, slug)
+  } catch (error) {
+    return executionError(c, req, error)
+  }
+  let candidate = task
   if (execution) {
     let interrupted: { cancelled: boolean }
     try {
       interrupted = await execution.interrupt()
     } catch (error) {
-      return c.json(fail(
-        req.id,
-        A2A_ERROR_CODES.INTERNAL_ERROR,
-        error instanceof Error ? error.message : String(error),
-      ))
+      return executionError(c, req, error)
     }
-    if (!interrupted.cancelled && !deps.cancels.has(task.id)) {
-      const reconciled = await deps.reconcileTask(task, c.req.param('slug') ?? '', true)
+    if (!interrupted.cancelled) {
+      const reconciled = await deps.reconcileTask(task, slug, true)
       if (isTerminal(reconciled.status.state) || reconciled.status.state === 'input-required') {
         return c.json(fail(
           req.id,
@@ -135,14 +127,9 @@ export async function handleTasksCancel(
           `task '${task.id}' is in state '${reconciled.status.state}'`,
         ))
       }
-      return c.json(fail(
-        req.id,
-        A2A_ERROR_CODES.INTERNAL_ERROR,
-        `task '${task.id}' execution was not canceled`,
-      ))
+      candidate = reconciled
     }
   }
-  let candidate = task
   for (let attempt = 0; attempt < 8; attempt += 1) {
     if (isTerminal(candidate.status.state)) {
       return c.json(
@@ -189,26 +176,16 @@ export async function handleTasksResubscribe(
   }
   const accessError = await deps.authorizeTaskAccess(c, req, storedTask)
   if (accessError) return accessError
-  const task = await deps.recoverTask(storedTask, c.req.param('slug') ?? '')
-  const event: TaskStatusUpdateEvent = {
-    kind: 'status-update',
-    taskId: task.id,
-    contextId: task.contextId,
-    status: task.status,
-    final: isTerminal(task.status.state) || task.status.state === 'input-required',
-  }
+  const slug = c.req.param('slug') ?? ''
+  const task = await deps.recoverTask(storedTask, slug)
   if (isTerminal(task.status.state) || task.status.state === 'input-required') {
     return statusEventStream(req, task)
   }
   let execution: TaskExecutionSource | undefined
   try {
-    execution = await deps.getTaskExecution(task, c.req.param('slug') ?? '')
+    execution = await deps.getTaskExecution(task, slug)
   } catch (error) {
-    return c.json(fail(
-      req.id,
-      A2A_ERROR_CODES.INTERNAL_ERROR,
-      error instanceof Error ? error.message : String(error),
-    ))
+    return executionError(c, req, error)
   }
   if (!execution) return statusEventStream(req, task)
   const observation = new AbortController()
@@ -227,8 +204,9 @@ export async function handleTasksResubscribe(
             observation.abort()
           }
         }
-        send(event)
+        send(taskStatusEvent(task))
         let latest = task
+        let observationError: unknown
         try {
           for await (const sandboxEvent of execution!.events({
             ...(params.lastEventId ? { since: params.lastEventId } : {}),
@@ -242,41 +220,27 @@ export async function handleTasksResubscribe(
                 artifact: {
                   artifactId: `${task.id}-artifact-0`,
                   name: 'response',
-                  parts: [{ kind: 'text', text: sandboxEvent.data.delta }],
+                  parts: [{ kind: 'text', text: execution!.translateText(sandboxEvent.data.delta) }],
                 },
                 append: true,
               })
             }
-            if (
-              sandboxEvent.type === 'input-required' ||
-              sandboxEvent.data?.inputRequired ||
-              sandboxEvent.type === 'done' ||
-              sandboxEvent.type === 'error' ||
-              sandboxEvent.type === 'session.run.failed'
-            ) {
-              latest = await deps.reconcileTask(
-                task,
-                c.req.param('slug') ?? '',
-                !deps.cancels.has(task.id),
-              )
-              if (!isTerminal(latest.status.state) && latest.status.state !== 'input-required') {
-                latest = await waitForTaskTerminal(deps.taskStore, latest)
-              }
-              break
-            }
           }
-          if (!observation.signal.aborted) {
-            latest = await deps.taskStore.get(task.id) ?? latest
+        } catch (error) {
+          observationError = error
+        }
+        if (!observation.signal.aborted) {
+          try {
+            latest = await deps.reconcileTask(task, slug, true)
             send({
               kind: 'status-update',
               taskId: task.id,
               contextId: task.contextId,
               status: latest.status,
               final: isTerminal(latest.status.state) || latest.status.state === 'input-required',
+              ...(observationError ? { metadata: { error: observationError instanceof Error ? observationError.message : String(observationError) } } : {}),
             })
-          }
-        } catch (error) {
-          if (!observation.signal.aborted) {
+          } catch (error) {
             send({
               kind: 'status-update',
               taskId: task.id,
@@ -286,10 +250,9 @@ export async function handleTasksResubscribe(
               metadata: { error: error instanceof Error ? error.message : String(error) },
             })
           }
-        } finally {
-          c.req.raw.signal.removeEventListener('abort', abortObservation)
-          try { ctrl.close() } catch { /* client disconnected */ }
         }
+        c.req.raw.signal.removeEventListener('abort', abortObservation)
+        try { ctrl.close() } catch { /* client disconnected */ }
       })()
     },
     cancel() {
@@ -305,27 +268,8 @@ export async function handleTasksResubscribe(
   })
 }
 
-async function waitForTaskTerminal(
-  taskStore: TaskStateStore,
-  task: Task,
-): Promise<Task> {
-  let latest = task
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (isTerminal(latest.status.state) || latest.status.state === 'input-required') return latest
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    latest = await taskStore.get(task.id) ?? latest
-  }
-  return latest
-}
-
 function statusEventStream(req: JSONRPCRequest, task: Task): Response {
-  const event: TaskStatusUpdateEvent = {
-    kind: 'status-update',
-    taskId: task.id,
-    contextId: task.contextId,
-    status: task.status,
-    final: isTerminal(task.status.state) || task.status.state === 'input-required',
-  }
+  const event = taskStatusEvent(task)
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(ctrl) {
@@ -340,4 +284,22 @@ function statusEventStream(req: JSONRPCRequest, task: Task): Response {
       'X-Task-Id': task.id,
     },
   })
+}
+
+function taskStatusEvent(task: Task): TaskStatusUpdateEvent {
+  return {
+    kind: 'status-update',
+    taskId: task.id,
+    contextId: task.contextId,
+    status: task.status,
+    final: isTerminal(task.status.state) || task.status.state === 'input-required',
+  }
+}
+
+function executionError(c: Context, req: JSONRPCRequest, error: unknown): Response {
+  return c.json(fail(
+    req.id,
+    A2A_ERROR_CODES.INTERNAL_ERROR,
+    error instanceof Error ? error.message : String(error),
+  ))
 }

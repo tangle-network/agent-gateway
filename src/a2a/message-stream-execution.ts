@@ -3,7 +3,6 @@ import {
   type AuthorizedRequest,
   beginPaymentExecution,
   buildGatewaySandboxContext,
-  dispatchSandboxStreamRich,
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
@@ -13,6 +12,10 @@ import {
   claimTaskExecution,
   renewTaskExecution,
 } from './execution-fence'
+import {
+  dispatchDetachedSandboxStreamRich,
+  taskExecutionTurnId,
+} from './detached-sandbox'
 import { fail, ok } from './jsonrpc'
 import {
   clearPaymentRecoveryMarker,
@@ -126,7 +129,7 @@ export async function executeMessageStream(
         try {
           send(workingStatus)
 
-          for await (const event of dispatchSandboxStreamRich(
+          for await (const event of dispatchDetachedSandboxStreamRich(
             authz.agent,
             authz.userMessage,
             authz.consumerId,
@@ -150,8 +153,7 @@ export async function executeMessageStream(
             },
             buildGatewaySandboxContext(authz),
             {
-              detached: true,
-              turnId: authz.requestId,
+              turnId: taskExecutionTurnId(task),
               onExecutionAccepted: async (reference) => {
                 workingTask = await attachTaskExecutionReference(
                   deps.taskStore,

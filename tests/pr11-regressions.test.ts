@@ -16,6 +16,7 @@ import type { AgentMeta, GatewayConfig, SandboxStreamEvent } from '../src/types'
 import { A2A_ERROR_CODES, type Task } from '../src/a2a/types'
 import type { MppConfig } from '../src/types'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
@@ -73,9 +74,9 @@ function sandbox(events: SandboxStreamEvent[] = [
 function durableConfig(
   overrides: Partial<GatewayConfig> = {},
 ): GatewayConfig {
+  const getSandbox = overrides.getSandbox ?? (async () => sandbox())
   return {
     resolveAgent: async () => agent,
-    getSandbox: async () => sandbox(),
     recordUsage: async () => undefined,
     x402: {
       operatorAddress,
@@ -87,6 +88,8 @@ function durableConfig(
     nonceStore: new MemoryNonceStore(),
     paymentRecovery: { store: new MemoryPaymentRecoveryStore() },
     ...overrides,
+    getSandbox: async (requestedAgent, context) =>
+      durableSandbox(await getSandbox(requestedAgent, context), 'pr11-sandbox'),
   }
 }
 
@@ -122,9 +125,16 @@ describe('PR #11 production regressions', () => {
       init?: RequestInit,
     ): Promise<Response> => webhook.fetch(new Request('https://receiver.local/terminal', init))
 
+    let sharedSandbox: SandboxBox | undefined
     const config = (sandbox: GatewayConfig['getSandbox']): GatewayConfig => ({
       resolveAgent: async () => agent,
-      getSandbox: sandbox,
+      getSandbox: async (requestedAgent, context) => {
+        sharedSandbox ??= durableSandbox(
+          await sandbox(requestedAgent, context),
+          'pr11-push-sandbox',
+        )
+        return sharedSandbox
+      },
       recordUsage: async () => undefined,
       x402: {
         operatorAddress,
@@ -522,12 +532,12 @@ describe('PR #11 production regressions', () => {
           sandboxEntered()
           await sandboxReleased
         }
-        return {
+        return durableSandbox({
           async *streamPrompt() {
             runs += 1
             yield { type: 'sandbox.usage', data: { usage: usage() } }
           },
-        }
+        }, `pr11-cancel-${worker}`)
       },
       recordUsage: async () => undefined,
       x402: {
@@ -619,7 +629,7 @@ describe('PR #11 production regressions', () => {
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
       resolveAgent: async () => agent,
-      getSandbox: async () => ({
+      getSandbox: async () => durableSandbox({
         async *streamPrompt() {
           if (worker === 'runner') {
             providerStarted = true
@@ -627,7 +637,7 @@ describe('PR #11 production regressions', () => {
           }
           yield { type: 'sandbox.usage', data: { usage: usage() } }
         },
-      }),
+      }, `pr11-active-${worker}`),
       recordUsage: async () => undefined,
       x402: {
         operatorAddress,
@@ -835,7 +845,7 @@ describe('PR #11 production regressions', () => {
     const longHistory = 'history '.repeat(500)
     const config: GatewayConfig = {
       resolveAgent: async () => agent,
-      getSandbox: async () => ({
+      getSandbox: async () => durableSandbox({
         async *streamPrompt() {
           invocations += 1
           if (invocations === 1) {
@@ -848,7 +858,7 @@ describe('PR #11 production regressions', () => {
           }
           yield { type: 'sandbox.usage', data: { usage: usage(200) } }
         },
-      }),
+      }, 'pr11-continuation-sandbox'),
       recordUsage: async () => undefined,
       x402: {
         operatorAddress,
@@ -1225,10 +1235,10 @@ describe('PR #11 production regressions', () => {
       const taskStore = new InMemoryTaskStore()
       app.route('/v1/agents', createAgentGateway({
         resolveAgent: async () => agent,
-        getSandbox: async () => sandbox([
+        getSandbox: async () => durableSandbox(sandbox([
           { type: 'input-required', data: { inputRequired: { prompt: 'Need one more detail' } } },
           { type: 'sandbox.usage', data: { usage: usage() } },
-        ]),
+        ]), 'stable-input-required-sandbox'),
         recordUsage: async () => undefined,
         x402: {
           operatorAddress,

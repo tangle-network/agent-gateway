@@ -220,37 +220,28 @@ export interface SandboxStreamEvent {
   }
 }
 
-/** Exact identity accepted by the sandbox runtime for one execution. */
-export interface SandboxRunControlRef {
-  environmentId: string
-  sessionId: string
-  executionId: string
-}
+export type SandboxRunControlRef = { environmentId: string; sessionId: string; executionId: string }
 
-/** Result returned by a detached sandbox admission call. */
-export interface SandboxDispatchResult {
+interface SandboxDispatchResult {
   sessionId: string
   executionId?: string
   runControlRef?: SandboxRunControlRef
+  dispatched?: boolean
 }
 
-/** Terminal result for one exact detached sandbox execution. */
 export interface SandboxPromptResult {
   success: boolean
   status: string
   executionId?: string
   response?: string
   error?: string
-  usage?: Partial<SandboxUsageReceipt>
+  question?: string
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  costUsd?: number
 }
 
-/** Durable session controls exposed by the current sandbox SDK. */
-export interface SandboxDurableSession {
-  events: (opts?: {
-    since?: string
-    executionId?: string
-    signal?: AbortSignal
-  }) => AsyncIterable<SandboxStreamEvent>
+interface SandboxDurableSession {
+  events: (opts?: { since?: string; executionId?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
   result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
   interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
 }

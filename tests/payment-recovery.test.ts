@@ -27,6 +27,7 @@ import type {
   SandboxUsageReceipt,
 } from '../src/types'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
@@ -1093,13 +1094,14 @@ describe('A2A recovery retention', () => {
       onSettle: async (_operation, input) => { settlements.push(input) },
       onReclaim: async () => undefined,
     })
+    const sandbox = durableSandbox({
+      async *streamPrompt() {
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'partial task' } }
+      },
+    })
     const config: GatewayConfig = {
       resolveAgent: async () => agent,
-      getSandbox: async () => ({
-        async *streamPrompt() {
-          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'partial task' } }
-        },
-      }),
+      getSandbox: async () => sandbox,
       recordUsage: async () => undefined,
       x402: {
         operatorAddress,

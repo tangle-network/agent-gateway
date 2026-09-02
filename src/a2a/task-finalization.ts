@@ -286,13 +286,14 @@ export async function recoverFinalizationIfNeeded(
   task: Task,
   deps: TaskFinalizationDependencies,
   requestedAgentSlug: string,
+  options: { force?: boolean } = {},
 ): Promise<Task> {
   if (!isTaskFinalizing(task)) return task
   const record = readFinalizationRecord(task)
   if (!record) {
     return expireFinalization(task, deps, null, new Error('A2A finalization record is missing'))
   }
-  if (record.lease.expiresAt > Date.now()) return task
+  if (!options.force && record.lease.expiresAt > Date.now()) return task
 
   const renewed: FinalizationRecord = {
     ...record,

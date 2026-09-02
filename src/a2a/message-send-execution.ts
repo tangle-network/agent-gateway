@@ -1,7 +1,6 @@
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
-  dispatchSandboxStreamRich,
   buildGatewaySandboxContext,
   beginPaymentExecution,
   markPaymentExecutionStarted,
@@ -12,6 +11,10 @@ import {
   claimTaskExecution,
   renewTaskExecution,
 } from './execution-fence'
+import {
+  dispatchDetachedSandboxStreamRich,
+  taskExecutionTurnId,
+} from './detached-sandbox'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
 import type { TaskStore } from './task-store'
 import { A2A_ERROR_CODES, type JSONRPCRequest, type Task } from './types'
@@ -81,7 +84,7 @@ export async function executeMessageSend(
   let inputRequiredSeen = false
   let finalizationLeaseId: string | undefined
   try {
-    for await (const event of dispatchSandboxStreamRich(
+    for await (const event of dispatchDetachedSandboxStreamRich(
       authz.agent,
       authz.userMessage,
       authz.consumerId,
@@ -105,8 +108,7 @@ export async function executeMessageSend(
       },
       buildGatewaySandboxContext(authz),
       {
-        detached: true,
-        turnId: authz.requestId,
+        turnId: taskExecutionTurnId(task),
         onExecutionAccepted: async (reference) => {
           workingTask = await attachTaskExecutionReference(
             deps.taskStore,

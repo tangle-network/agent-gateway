@@ -22,6 +22,7 @@ import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 import type {
   AgentMeta,
   ApiKeyInfo,
@@ -97,7 +98,7 @@ function buildHarness(
   const usage: GatewayUsageEvent[] = []
   const settlements: Array<{ method: string; cost: number }> = []
 
-  const gw = createAgentGateway({
+  const baseConfig: GatewayConfig = {
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async (evt) => {
@@ -125,6 +126,11 @@ function buildHarness(
     rateLimitStore: new MemoryRateLimitStore(),
     nonceStore: new MemoryNonceStore(),
     ...cfg,
+  }
+  const gw = createAgentGateway({
+    ...baseConfig,
+    getSandbox: async (requestedAgent, context) =>
+      durableSandbox(await baseConfig.getSandbox(requestedAgent, context)),
   })
 
   const app = new Hono()
