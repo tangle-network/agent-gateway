@@ -136,7 +136,7 @@ export async function resolveAuthorizedInputQuote(
   config: GatewayConfig,
   state: GatewayState,
   maxOutputTokens: number,
-  messages: readonly ChatMessage[],
+  messages: ChatMessage[],
   requestId: string,
   threadId: string | undefined,
   consumerId: string,
