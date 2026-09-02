@@ -253,7 +253,7 @@ export async function completeCanceledTask(
     }
 
     const canceled = withStatus(
-      clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+      clearTaskSubmission(clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask))),
       'canceled',
       undefined,
       responseText
@@ -269,8 +269,8 @@ export async function completeCanceledTask(
   await deps.releaseTaskPayment(authz, task, 'a2a task canceled', workObserved)
   const currentTask = await deps.taskStore.get(task.id)
   const canceledBase = currentTask?.status.state === 'canceled'
-    ? currentTask
-    : withStatus(currentTask ?? task, 'canceled')
+    ? clearTaskSubmission(currentTask)
+    : withStatus(clearTaskSubmission(currentTask ?? task), 'canceled')
   const canceled: Task = responseText
     ? {
         ...canceledBase,
@@ -404,7 +404,7 @@ export async function recoverFinalizationIfNeeded(
 }
 
 function finalizationResultTask(task: Task, record: FinalizationRecord): Task {
-  const cleanTask = clearPaymentRecoveryMarker(clearFinalizationMarker(task))
+  const cleanTask = clearTaskSubmission(clearPaymentRecoveryMarker(clearFinalizationMarker(task)))
   const finalState = record.finalState ?? (
     task.status.state === 'canceled'
       ? 'canceled'

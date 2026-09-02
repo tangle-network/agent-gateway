@@ -12,6 +12,12 @@ import type {
   SandboxExecutionBudget,
   SandboxUsageReceipt,
 } from './payment-types'
+import type {
+  DispatchedSession as SandboxSdkDispatchedSession,
+  PromptResult as SandboxSdkPromptResult,
+  SandboxInstance as SandboxSdkInstance,
+  SandboxSession as SandboxSdkSession,
+} from '@tangle-network/sandbox'
 
 export type {
   GatewayUsageEvent,
@@ -192,8 +198,10 @@ export interface ApiKeyInfo {
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
+  /** Stable sandbox event cursor used by detached resubscription. */
+  id?: string
   type?: string
-  data?: {
+  data?: Record<string, unknown> & {
     part?: { type?: string; text?: string }
     delta?: string
     finalText?: string
@@ -218,6 +226,24 @@ export interface SandboxStreamEvent {
   }
 }
 
+/** SDK dispatch options plus gateway-owned prompt and budget controls. */
+export type SandboxDispatchPromptOptions = NonNullable<
+  Parameters<SandboxSdkInstance['dispatchPrompt']>[1]
+> & {
+  systemPrompt?: string
+  maxOutputTokens?: number
+  executionBudget?: SandboxExecutionBudget
+}
+
+/** Durable SDK session operations required by detached A2A execution. */
+export type SandboxDurableSession = Pick<
+  SandboxSdkSession,
+  'events' | 'result' | 'interrupt'
+>
+
+export type SandboxDispatchResult = SandboxSdkDispatchedSession
+export type SandboxPromptResult = SandboxSdkPromptResult
+
 export interface SandboxBox {
   streamPrompt(
     message: string,
@@ -229,6 +255,13 @@ export interface SandboxBox {
       signal?: AbortSignal
     },
   ): AsyncIterable<SandboxStreamEvent>
+  /** Fire-and-detach a prompt whose execution survives observer disconnect. */
+  id?: SandboxSdkInstance['id']
+  dispatchPrompt?: (
+    message: Parameters<SandboxSdkInstance['dispatchPrompt']>[0],
+    opts?: SandboxDispatchPromptOptions,
+  ) => Promise<SandboxDispatchResult>
+  session?: (id: string) => SandboxDurableSession
 }
 
 /** Authenticated request identity supplied when the host resolves a sandbox. */

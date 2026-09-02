@@ -44,7 +44,11 @@
   "dependencies": {
     "hono": "^4.13.5"
   },
+  "peerDependencies": {
+    "@tangle-network/sandbox": ">=0.36.3 <0.37.0"
+  },
   "devDependencies": {
+    "@tangle-network/sandbox": "0.36.3",
     "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.11",
     "tsup": "^8.0.0",

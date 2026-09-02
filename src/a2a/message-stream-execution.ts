@@ -1,14 +1,19 @@
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
-  beginPaymentExecution,
   buildGatewaySandboxContext,
-  dispatchSandboxStreamRich,
+  beginPaymentExecution,
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
+import { dispatchDetachedSandboxStreamRich, taskExecutionTurnId } from './detached-sandbox'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
-import { claimTaskExecution, renewTaskExecution } from './execution-fence'
+import {
+  claimTaskExecution,
+  readDetachedExecutionIdentity,
+  renewTaskExecution,
+} from './execution-fence'
+import type { DetachedExecutionIdentity } from './detached-sandbox'
 import { fail, ok } from './jsonrpc'
 import {
   clearPaymentRecoveryMarker,
@@ -23,7 +28,7 @@ import {
   withFinalizationRecord,
 } from './task-finalization'
 import { clearTaskSubmission } from './task-submission-recovery'
-import { bindRequestAbort, type TaskCancellationRegistry } from './task-cancellation'
+import type { TaskCancellationRegistry } from './task-cancellation'
 import type { TaskLifecycle } from './task-lifecycle'
 import {
   agentMessage,
@@ -64,7 +69,6 @@ export async function executeMessageStream(
 ): Promise<Response> {
   const controller = deps.cancels.register(task.id)
   const lifecycle = deps.lifecycle
-  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const workingStatus: TaskStatusUpdateEvent = {
     kind: 'status-update',
     taskId: task.id,
@@ -73,7 +77,6 @@ export async function executeMessageStream(
     final: false,
   }
   if (isTerminal(task.status.state)) {
-    detachRequestAbort()
     deps.cancels.clear(task.id)
     return c.json(ok(req.id, task))
   }
@@ -81,7 +84,6 @@ export async function executeMessageStream(
     ? task
     : { ...task, status: workingStatus.status }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
-    detachRequestAbort()
     deps.cancels.clear(task.id)
     const current = await releaseTaskPayment(
       authz,
@@ -125,7 +127,7 @@ export async function executeMessageStream(
         try {
           send(workingStatus)
 
-          for await (const event of dispatchSandboxStreamRich(
+          for await (const event of dispatchDetachedSandboxStreamRich(
             authz.agent,
             authz.userMessage,
             authz.consumerId,
@@ -133,8 +135,14 @@ export async function executeMessageStream(
             controller.signal,
             task.id,
             authz.maxOutputTokens,
-            async () => {
-              workingTask = await claimTaskExecution(deps.taskStore, workingTask, authz.requestId)
+            async (identity?: DetachedExecutionIdentity) => {
+              workingTask = await claimTaskExecution(
+                deps.taskStore,
+                workingTask,
+                authz.requestId,
+                Date.now(),
+                identity,
+              )
               await beginPaymentExecution(authz, deps.config)
             },
             authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
@@ -148,6 +156,7 @@ export async function executeMessageStream(
               await renewPaymentExecution(authz, deps.config)
             },
             buildGatewaySandboxContext(authz),
+            { turnId: taskExecutionTurnId(task) },
           )) {
             if (event.kind === 'text') {
               responseText += event.delta
@@ -246,7 +255,9 @@ export async function executeMessageStream(
 
           if (inputRequiredSeen) {
             const paused = withStatus(
-              clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+              clearTaskSubmission(
+                clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+              ),
               'input-required',
               inputRequiredPrompt ? agentMessage(task, inputRequiredPrompt) : undefined,
               responseText
@@ -277,7 +288,9 @@ export async function executeMessageStream(
           }
 
           const completed = withStatus(
-            clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+            clearTaskSubmission(
+              clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+            ),
             'completed',
             undefined,
             [responseTextToArtifact(responseText, `${task.id}-artifact-0`)],
@@ -316,13 +329,43 @@ export async function executeMessageStream(
           })
           await lifecycle.finalization.deliverPush(completed)
         } catch (err) {
+          if (controller.signal.aborted) {
+            const canceled = await completeCanceledTask(
+              authz,
+              await deps.taskStore.get(task.id) ?? workingTask,
+              responseText,
+              usage,
+              workObserved,
+              lifecycle.finalization,
+            )
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: canceled.status,
+              final: true,
+            })
+            return
+          }
+          const currentBeforeFailure = await deps.taskStore.get(task.id) ?? workingTask
+          const detached = readDetachedExecutionIdentity(currentBeforeFailure) !== undefined
           const releasedTask = await releaseTaskPayment(
             authz,
-            task,
+            currentBeforeFailure,
             lifecycle.payment,
             err instanceof Error ? err.message : String(err),
-            workObserved || usage !== undefined,
+            detached && workObserved || usage !== undefined,
           )
+          if (detached && workObserved && !finalizationLeaseId) {
+            send({
+              kind: 'status-update',
+              taskId: task.id,
+              contextId: task.contextId,
+              status: releasedTask.status,
+              final: false,
+            })
+            return
+          }
           if (finalizationLeaseId) {
             const retained = await retainFinalizationForRecovery(
               deps.taskStore,
@@ -371,7 +414,6 @@ export async function executeMessageStream(
           }
         } finally {
           clearInterval(keepaliveTimer)
-          detachRequestAbort()
           deps.cancels.clear(task.id)
           try {
             if (ctrl.desiredSize !== null) ctrl.close()
@@ -382,7 +424,8 @@ export async function executeMessageStream(
       })()
     },
     cancel() {
-      controller.abort()
+      // The client owns this response, not the durable sandbox execution.
+      // `tasks/cancel` is the only operation allowed to abort the controller.
     },
   })
 

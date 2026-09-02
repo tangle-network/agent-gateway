@@ -1,4 +1,5 @@
 import type { Task } from './types'
+import type { DetachedExecutionIdentity } from './detached-sandbox'
 
 interface ExecutionTaskStore {
   get(id: string): Promise<Task | undefined>
@@ -21,6 +22,8 @@ export interface TaskExecutionMarker {
   version: typeof TASK_EXECUTION_VERSION
   requestId: string
   lease: { id: string; expiresAt: number }
+  /** Provider identity persisted before dispatch to close the admission gap. */
+  detached?: DetachedExecutionIdentity
 }
 
 export type TaskExecutionInspection =
@@ -41,6 +44,7 @@ export async function claimTaskExecution(
   task: Task,
   requestId: string,
   now = Date.now(),
+  detached?: DetachedExecutionIdentity,
 ): Promise<Task> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const current = await store.get(task.id)
@@ -53,10 +57,15 @@ export async function claimTaskExecution(
     }
     const existing = inspection.state === 'valid' ? inspection.marker : undefined
     if (existing && existing.lease.expiresAt > now) {
-      if (existing.requestId === requestId) return current
+      if (existing.requestId === requestId) {
+        if (detached && !sameDetachedIdentity(existing.detached, detached)) {
+          throw new Error(`A2A task '${task.id}' has a different detached execution identity`)
+        }
+        return current
+      }
       throw new Error(`A2A task '${task.id}' is already executing`)
     }
-    const next = withTaskExecution(current, requestId, now)
+    const next = withTaskExecution(current, requestId, now, detached)
     if (store.compareAndSet && await store.compareAndSet(current, next)) return next
   }
   throw new Error(`A2A task '${task.id}' changed too many times before sandbox execution`)
@@ -94,13 +103,13 @@ export async function renewTaskExecution(
 
 /** Remote cancellation is rejected while a live execution fence is held. */
 export function hasActiveTaskExecution(task: Task, now = Date.now()): boolean {
-  const marker = readTaskExecution(task)
+  const marker = readTaskExecutionMarker(task)
   return marker !== undefined && marker.lease.expiresAt > now
 }
 
 /** A working task with this marker has lost its execution owner. */
 export function hasExpiredTaskExecution(task: Task, now = Date.now()): boolean {
-  const marker = readTaskExecution(task)
+  const marker = readTaskExecutionMarker(task)
   return marker !== undefined && !hasActiveTaskExecution(task, now)
 }
 
@@ -122,7 +131,22 @@ export function clearTaskExecution(task: Task): Task {
       })()
 }
 
-function withTaskExecution(task: Task, requestId: string, now: number): Task {
+export function readTaskExecutionMarker(task: Task): TaskExecutionMarker | undefined {
+  const inspection = inspectTaskExecution(task)
+  return inspection.state === 'valid' ? inspection.marker : undefined
+}
+
+export function readDetachedExecutionIdentity(task: Task): DetachedExecutionIdentity | undefined {
+  return readTaskExecutionMarker(task)?.detached
+}
+
+function withTaskExecution(
+  task: Task,
+  requestId: string,
+  now: number,
+  detached?: DetachedExecutionIdentity,
+): Task {
+  const existing = readTaskExecutionMarker(task)
   return {
     ...task,
     metadata: {
@@ -131,14 +155,12 @@ function withTaskExecution(task: Task, requestId: string, now: number): Task {
         version: TASK_EXECUTION_VERSION,
         requestId,
         lease: { id: requestId, expiresAt: now + TASK_EXECUTION_LEASE_MS },
+        ...(detached || existing?.detached
+          ? { detached: detached ?? existing?.detached }
+          : {}),
       } satisfies TaskExecutionMarker,
     },
   }
-}
-
-function readTaskExecution(task: Task): TaskExecutionMarker | undefined {
-  const inspection = inspectTaskExecution(task)
-  return inspection.state === 'valid' ? inspection.marker : undefined
 }
 
 export function inspectTaskExecution(task: Task): TaskExecutionInspection {
@@ -158,5 +180,27 @@ export function inspectTaskExecution(task: Task): TaskExecutionInspection {
     typeof marker.lease.expiresAt !== 'number' ||
     !Number.isFinite(marker.lease.expiresAt)
   ) return { state: 'malformed', reason: 'marker fields are invalid' }
+  if (marker.detached !== undefined && !isDetachedIdentity(marker.detached)) {
+    return { state: 'malformed', reason: 'detached execution identity is invalid' }
+  }
   return { state: 'valid', marker: marker as TaskExecutionMarker }
+}
+
+function isDetachedIdentity(value: unknown): value is DetachedExecutionIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const identity = value as Partial<DetachedExecutionIdentity>
+  return typeof identity.environmentId === 'string' && identity.environmentId.length > 0 &&
+    typeof identity.sessionId === 'string' && identity.sessionId.length > 0 &&
+    typeof identity.executionId === 'string' && identity.executionId.length > 0 &&
+    typeof identity.turnId === 'string' && identity.turnId.length > 0
+}
+
+function sameDetachedIdentity(
+  left: DetachedExecutionIdentity | undefined,
+  right: DetachedExecutionIdentity,
+): boolean {
+  return left?.environmentId === right.environmentId &&
+    left.sessionId === right.sessionId &&
+    left.executionId === right.executionId &&
+    left.turnId === right.turnId
 }

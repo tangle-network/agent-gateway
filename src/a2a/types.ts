@@ -161,6 +161,8 @@ export interface MessageSendParams {
 
 export interface TaskIdParams {
   id: string
+  /** Replay events strictly after this sandbox event id. */
+  lastEventId?: string
   metadata?: Record<string, unknown>
 }
 

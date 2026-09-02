@@ -28,9 +28,14 @@ import {
   hasExpiredTaskExecution,
   hasMalformedTaskExecution,
   inspectTaskExecution,
+  readDetachedExecutionIdentity,
 } from './execution-fence'
 import { executeMessageSend } from './message-send-execution'
 import { executeMessageStream } from './message-stream-execution'
+import {
+  getTaskExecution,
+  reconcileDetachedTask,
+} from './task-execution-recovery'
 import { fail, ok, parseEnvelope } from './jsonrpc'
 import {
   type PushNotificationStore,
@@ -66,7 +71,6 @@ import {
 } from './task-submission-recovery'
 import { deliverTaskPush, type PushDeliveryDependencies } from './task-push-delivery'
 import {
-  bindRequestAbort,
   TaskCancellationRegistry,
 } from './task-cancellation'
 import {
@@ -122,12 +126,39 @@ function buildTaskMethodDependencies(
   const lifecycle = createTaskLifecycle(deps)
   return {
     taskStore: deps.taskStore,
-    payment: lifecycle.payment,
     cancels,
     authorizeTaskAccess: (c, req, task) => authorizeTaskAccess(c, req, task, deps),
-    recoverTask: (task, requestedAgentSlug) =>
-      recoverTaskIfNeeded(task, deps, requestedAgentSlug),
+    recoverTask: (task, requestedAgentSlug, options) =>
+      recoverTaskIfNeeded(
+        task,
+        deps,
+        requestedAgentSlug,
+        cancels.has(task.id),
+        options?.reconcileDetached ?? true,
+      ),
     deliverPush: (task) => maybeDeliverPush(task, deps),
+    getTaskExecution: (task, requestedAgentSlug) => getTaskExecution(
+      task,
+      requestedAgentSlug,
+      {
+        taskStore: deps.taskStore,
+        config: deps.config,
+        payment: lifecycle.payment,
+        finalization: lifecycle.finalization,
+        deliverPush: (recoveredTask) => maybeDeliverPush(recoveredTask, deps),
+      },
+    ),
+    reconcileTask: (task, requestedAgentSlug) => reconcileDetachedTask(
+      task,
+      requestedAgentSlug,
+      {
+        taskStore: deps.taskStore,
+        config: deps.config,
+        payment: lifecycle.payment,
+        finalization: lifecycle.finalization,
+        deliverPush: (recoveredTask) => maybeDeliverPush(recoveredTask, deps),
+      },
+    ),
   }
 }
 
@@ -231,12 +262,11 @@ async function handleMessageSend(
   deps: A2AHandlerDeps,
   cancels: TaskCancellationRegistry,
 ): Promise<Response> {
-  const guard = await guardMessageRequest(c, slug, req, deps)
+  const guard = await guardMessageRequest(c, slug, req, deps, cancels)
   if (guard instanceof Response) return guard
   const { authz, task } = guard
   setPaymentResponseHeaders(c, authz)
   const controller = cancels.register(task.id)
-  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const lifecycle = createTaskLifecycle(deps)
   try {
     return await executeMessageSend(
@@ -248,7 +278,6 @@ async function handleMessageSend(
       controller.signal,
     )
   } finally {
-    detachRequestAbort()
     cancels.clear(task.id)
   }
 }
@@ -262,7 +291,7 @@ async function handleMessageStream(
   deps: A2AHandlerDeps,
   cancels: TaskCancellationRegistry,
 ): Promise<Response> {
-  const guard = await guardMessageRequest(c, slug, req, deps)
+  const guard = await guardMessageRequest(c, slug, req, deps, cancels)
   if (guard instanceof Response) return guard
   const { authz, task } = guard
   setPaymentResponseHeaders(c, authz)
@@ -306,6 +335,7 @@ async function guardMessageRequest(
   slug: string,
   req: JSONRPCRequest,
   deps: A2AHandlerDeps,
+  cancels?: TaskCancellationRegistry,
 ): Promise<GuardSuccess | Response> {
   const params = req.params as MessageSendParams | undefined
   if (!params || !params.message) {
@@ -327,7 +357,12 @@ async function guardMessageRequest(
     }
     const accessError = await authorizeTaskAccess(c, req, storedForQuote, deps)
     if (accessError) return accessError
-    const quotedTask = await recoverTaskIfNeeded(storedForQuote, deps, slug)
+    const quotedTask = await recoverTaskIfNeeded(
+      storedForQuote,
+      deps,
+      slug,
+      cancels?.has(storedForQuote.id) ?? false,
+    )
     if (quotedTask.status.state === 'input-required') {
       billingMessages = [
         ...taskHistoryAsChatMessages(quotedTask),
@@ -374,7 +409,12 @@ async function guardMessageRequest(
     }
     const accessError = await authorizeTaskAccess(c, req, storedExisting, deps)
     if (accessError) return accessError
-    const existing = await recoverTaskIfNeeded(storedExisting, deps, slug)
+    const existing = await recoverTaskIfNeeded(
+      storedExisting,
+      deps,
+      slug,
+      cancels?.has(storedExisting.id) ?? false,
+    )
     if (existing.status.state !== 'input-required') {
       return c.json(
         fail(
@@ -659,6 +699,8 @@ async function recoverTaskIfNeeded(
   task: Task,
   deps: A2AHandlerDeps,
   requestedAgentSlug: string,
+  executionActive = false,
+  reconcileDetached = true,
 ): Promise<Task> {
   const lifecycle = createTaskLifecycle(deps)
   const paymentReleased = await recoverPaymentReleaseIfNeeded(task, lifecycle.payment)
@@ -667,11 +709,30 @@ async function recoverTaskIfNeeded(
     lifecycle.finalization,
     requestedAgentSlug,
   )
-  const paymentRecovered = await recoverPaymentMarkerIfNeeded(finalized, lifecycle.payment)
-  const submissionRecovered = await recoverSubmissionIfNeeded(paymentRecovered, {
-    taskStore: deps.taskStore,
-    deliverPush: lifecycle.finalization.deliverPush,
-  })
+  let reconciled = finalized
+  if (reconcileDetached && !executionActive && !isTaskFinalizing(finalized) && readDetachedExecutionIdentity(finalized)) {
+    try {
+      reconciled = await reconcileDetachedTask(finalized, requestedAgentSlug, {
+        taskStore: deps.taskStore,
+        config: deps.config,
+        payment: lifecycle.payment,
+        finalization: lifecycle.finalization,
+        deliverPush: (recoveredTask) => maybeDeliverPush(recoveredTask, deps),
+      })
+    } catch (error) {
+      console.error(
+        `[a2a] detached execution recovery deferred for ${finalized.id}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+  const paymentRecovered = readDetachedExecutionIdentity(reconciled) ? reconciled : await recoverPaymentMarkerIfNeeded(reconciled, lifecycle.payment)
+  const submissionRecovered = readDetachedExecutionIdentity(paymentRecovered)
+    ? paymentRecovered
+    : await recoverSubmissionIfNeeded(paymentRecovered, {
+        taskStore: deps.taskStore,
+        deliverPush: lifecycle.finalization.deliverPush,
+      })
   return recoverExpiredExecutionIfNeeded(submissionRecovered, deps)
 }
 
@@ -682,6 +743,9 @@ async function recoverExpiredExecutionIfNeeded(task: Task, deps: A2AHandlerDeps)
     (isTaskFinalizing(task) && !malformed) ||
     (!malformed && !hasExpiredTaskExecution(task))
   ) return task
+  // A durable detached execution can still be reconciled after its local
+  // lease expires. Keep it working until the exact SDK result is available.
+  if (!malformed && readDetachedExecutionIdentity(task)) return task
   const inspection = inspectTaskExecution(task)
   const failed: Task = {
     ...withStatus(task, 'failed'),

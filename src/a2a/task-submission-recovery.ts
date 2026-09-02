@@ -1,4 +1,5 @@
 import type { Task } from './types'
+import type { ApiKeyInfo, PaymentMethod, SandboxExecutionBudget } from '../types'
 import {
   compareAndSetTask,
   cryptoRandomId,
@@ -20,6 +21,11 @@ export interface TaskSubmissionIdentity {
   agent: TaskOriginAgent
   requestId: string
   consumerId: string
+  paymentMethod?: PaymentMethod
+  keyInfo?: ApiKeyInfo | null
+  threadId?: string
+  maxOutputTokens?: number
+  executionBudget?: SandboxExecutionBudget
 }
 
 interface TaskOriginBinding {
@@ -35,6 +41,11 @@ export interface TaskSubmissionRecord {
   agentSlug: string
   requestId: string
   consumerId: string
+  paymentMethod?: PaymentMethod
+  keyId?: string
+  threadId?: string
+  maxOutputTokens?: number
+  executionBudget?: SandboxExecutionBudget
 }
 
 export interface SubmissionRecoveryDependencies {
@@ -79,6 +90,11 @@ export function withTaskSubmission(
       agentSlug: identity.agent.slug,
       requestId: identity.requestId,
       consumerId: identity.consumerId,
+      ...(identity.keyInfo?.keyId ? { keyId: identity.keyInfo.keyId } : {}),
+      ...(identity.threadId ? { threadId: identity.threadId } : {}),
+      ...(identity.maxOutputTokens !== undefined ? { maxOutputTokens: identity.maxOutputTokens } : {}),
+      ...(identity.executionBudget ? { executionBudget: identity.executionBudget } : {}),
+      paymentMethod: identity.paymentMethod,
     } satisfies TaskSubmissionRecord,
   }
 }
@@ -116,11 +132,35 @@ export function readTaskSubmission(task: Task): TaskSubmissionRecord | undefined
     submission.agentSlug.length === 0 ||
     typeof submission.requestId !== 'string' ||
     submission.requestId.length === 0 ||
-    typeof submission.consumerId !== 'string'
+    typeof submission.consumerId !== 'string' ||
+    (submission.paymentMethod !== undefined && !isPaymentMethod(submission.paymentMethod)) ||
+    (submission.keyId !== undefined && (
+      typeof submission.keyId !== 'string' || submission.keyId.length === 0
+    )) ||
+    (submission.threadId !== undefined && (
+      typeof submission.threadId !== 'string' || submission.threadId.length === 0
+    )) ||
+    (submission.maxOutputTokens !== undefined && (
+      !Number.isSafeInteger(submission.maxOutputTokens) || submission.maxOutputTokens <= 0
+    )) ||
+    (submission.executionBudget !== undefined && !isExecutionBudget(submission.executionBudget))
   ) {
     return undefined
   }
   return submission as TaskSubmissionRecord
+}
+
+function isPaymentMethod(value: unknown): value is PaymentMethod {
+  return value === 'x402' || value === 'mpp' || value === 'apikey' || value === 'none'
+}
+
+function isExecutionBudget(value: unknown): value is SandboxExecutionBudget {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const budget = value as SandboxExecutionBudget
+  return [budget.maxInputTokens, budget.maxOutputTokens, budget.maxReasoningTokens,
+    budget.maxToolTokens, budget.maxToolCalls].every(
+      (item) => Number.isSafeInteger(item) && item >= 0,
+    ) && Number.isFinite(budget.maxProviderCostUsd) && budget.maxProviderCostUsd >= 0
 }
 
 export function clearTaskSubmission(task: Task): Task {

@@ -1,17 +1,22 @@
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
-  dispatchSandboxStreamRich,
   buildGatewaySandboxContext,
   beginPaymentExecution,
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
-import { claimTaskExecution, renewTaskExecution } from './execution-fence'
+import { dispatchDetachedSandboxStreamRich, taskExecutionTurnId } from './detached-sandbox'
+import {
+  claimTaskExecution,
+  readDetachedExecutionIdentity,
+  renewTaskExecution,
+} from './execution-fence'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
 import type { TaskStore } from './task-store'
 import { A2A_ERROR_CODES, type JSONRPCRequest, type Task } from './types'
 import { clearTaskSubmission } from './task-submission-recovery'
+import type { DetachedExecutionIdentity } from './detached-sandbox'
 import {
   buildFinalizationRecord,
   clearFinalizationMarker,
@@ -52,10 +57,9 @@ export async function executeMessageSend(
   signal: AbortSignal,
 ): Promise<Response> {
   if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
-  const taskWithoutSubmission = clearTaskSubmission(task)
   let workingTask: Task = task.status.state === 'working'
-    ? taskWithoutSubmission
-    : { ...taskWithoutSubmission, status: { state: 'working', timestamp: nowIso() } }
+    ? task
+    : { ...task, status: { state: 'working', timestamp: nowIso() } }
   if (
     JSON.stringify(task) !== JSON.stringify(workingTask) &&
     !await compareAndSetTask(deps.taskStore, task, workingTask)
@@ -78,7 +82,7 @@ export async function executeMessageSend(
   let inputRequiredSeen = false
   let finalizationLeaseId: string | undefined
   try {
-    for await (const event of dispatchSandboxStreamRich(
+    for await (const event of dispatchDetachedSandboxStreamRich(
       authz.agent,
       authz.userMessage,
       authz.consumerId,
@@ -86,8 +90,14 @@ export async function executeMessageSend(
       signal,
       task.id,
       authz.maxOutputTokens,
-      async () => {
-        workingTask = await claimTaskExecution(deps.taskStore, workingTask, authz.requestId)
+      async (identity?: DetachedExecutionIdentity) => {
+        workingTask = await claimTaskExecution(
+          deps.taskStore,
+          workingTask,
+          authz.requestId,
+          Date.now(),
+          identity,
+        )
         await beginPaymentExecution(authz, deps.config)
       },
       authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
@@ -101,6 +111,7 @@ export async function executeMessageSend(
         await renewPaymentExecution(authz, deps.config)
       },
       buildGatewaySandboxContext(authz),
+      { turnId: taskExecutionTurnId(task) },
     )) {
       if (event.kind === 'text') {
         responseText += event.delta
@@ -116,15 +127,27 @@ export async function executeMessageSend(
       }
     }
   } catch (err) {
+    if (signal.aborted) {
+      const canceled = await completeCanceledTask(
+        authz,
+        await deps.taskStore.get(task.id) ?? workingTask,
+        responseText,
+        usage,
+        workObserved,
+        deps.finalization,
+      )
+      return c.json(ok(req.id, canceled))
+    }
+    const detached = readDetachedExecutionIdentity(workingTask) !== undefined
     const releasedTask = await releaseTaskPayment(
       authz,
       workingTask,
       deps.payment,
       err instanceof Error ? err.message : String(err),
-      workObserved || usage !== undefined,
+      detached && workObserved || usage !== undefined,
     )
     const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
-    const failed = shouldPreserveTask(currentTask)
+    const failed = detached || shouldPreserveTask(currentTask)
       ? currentTask
       : withStatus(clearTaskSubmission(currentTask), 'failed')
     try {
@@ -187,7 +210,9 @@ export async function executeMessageSend(
       },
     })
     usageRecordedTask = await markUsageRecorded(deps.taskStore, usageRecordedTask)
-    const settledBase = clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask))
+    const settledBase = clearTaskSubmission(
+      clearPaymentRecoveryMarker(clearFinalizationMarker(usageRecordedTask)),
+    )
     const result = inputRequiredSeen
       ? withStatus(
           settledBase,
