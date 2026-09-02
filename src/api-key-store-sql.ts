@@ -26,14 +26,14 @@ export interface SqlApiKeyStoreOptions {
 
 export function sqlApiKeyStoreSchemaStatements(
   options: SqlApiKeyStoreOptions = {},
-): readonly [string, string] {
+): readonly [string, string, string] {
   const table = requireSqlIdentifier(options.table ?? 'agent_api_key')
   return [
     `CREATE TABLE IF NOT EXISTS ${table} (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
       name TEXT NOT NULL,
-      key_hash TEXT NOT NULL UNIQUE,
+      key_hash TEXT NOT NULL,
       key_prefix TEXT NOT NULL,
       scopes TEXT NOT NULL,
       rate_limit INTEGER NOT NULL,
@@ -45,6 +45,7 @@ export function sqlApiKeyStoreSchemaStatements(
       created_at INTEGER NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id, created_at)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_hash ON ${table} (key_hash)`,
   ]
 }
 

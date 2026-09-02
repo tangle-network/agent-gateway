@@ -46,6 +46,10 @@ describe('SqlApiKeyStore', () => {
       const store = await createStore(db)
       await store.migrate()
       const created = await createKey(store)
+      const indexes = db.prepare("PRAGMA index_list('agent_api_key')").all() as Array<{
+        name: string
+        unique: number
+      }>
 
       expect(created.id).toMatch(/^[0-9a-f]{32}$/)
       expect(created.spentCents).toBe(0)
@@ -63,6 +67,10 @@ describe('SqlApiKeyStore', () => {
       expect(await store.list('user-1')).not.toEqual([
         expect.objectContaining({ keyHash: expect.anything() }),
       ])
+      expect(indexes).toContainEqual(expect.objectContaining({
+        name: 'idx_agent_api_key_hash',
+        unique: 1,
+      }))
     } finally {
       db.close()
     }
