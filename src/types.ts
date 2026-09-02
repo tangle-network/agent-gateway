@@ -422,11 +422,12 @@ export interface GatewayConfig {
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel
+   * Set `a2a: false` to disable these routes and their setup checks.
    * Auth + rate-limit + injection-filter + authorization all share the
    * same pipeline as the OpenAI-compat path. Demo mode defaults to
    * `InMemoryTaskStore`; production must configure D1/postgres/DO storage.
   */
-  a2a?: {
+  a2a?: false | {
     /**
      * Authorize reads, cancellation, resubscription, and push configuration
      * for an existing task. Production control methods fail closed when this

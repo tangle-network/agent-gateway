@@ -148,6 +148,7 @@ An `agent-app` host can use this context to drive its normal persisted chat rout
 
 The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
 Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
+Set `a2a: false` when the application does not expose A2A routes.
 Custom production task stores must implement atomic `createIfAbsent`, `compareAndSet`, and `compareAndSetExecution` methods.
 `compareAndSetExecution` must reject a renewal when the stored owner lease has expired.
 Task stores must retain payment recovery metadata until reconciliation clears it.

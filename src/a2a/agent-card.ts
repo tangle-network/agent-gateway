@@ -22,6 +22,7 @@ export function buildAgentCard(
   config: GatewayConfig,
   agentUrl: string,
 ): AgentCard {
+  const a2aConfig = config.a2a === false ? undefined : config.a2a
   const schemes: string[] = []
   if (isX402AuthEnabled(config)) schemes.push('x402')
   if (isMppAuthEnabled(config)) schemes.push('mpp')
@@ -49,7 +50,7 @@ export function buildAgentCard(
     provider: { organization: 'Tangle', url: 'https://tangle.tools' },
     capabilities: {
       streaming: true,
-      pushNotifications: !!config.a2a?.pushStore,
+      pushNotifications: !!a2aConfig?.pushStore,
       stateTransitionHistory: false,
     },
     authentication: { schemes },
