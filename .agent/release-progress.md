@@ -5,26 +5,26 @@
 - Live URL: https://www.npmjs.com/package/@tangle-network/agent-gateway
 - Live service/process: npm package `@tangle-network/agent-gateway`
 - Artifact path: tag-triggered GitHub Actions publish workflow
-- Rollback artifact/path: retain v0.8.15; publish a follow-up patch if needed
+- Rollback artifact/path: retain v0.8.16; publish a follow-up patch if needed
 - Credential files: GitHub trusted publishing and npm provenance workflow
 
 ## Local State
-- Branch: chore/release-0.8.16-20260902
-- Commit: 408dac6 (merged background usage settlement)
+- Branch: chore/release-agent-gateway-0.8.17-20260902
+- Commit: 5e8f5e8 (merged OpenAI response contract fix)
 - Dirty files: clean at release start
 - Gates planned: version-only diff, full typecheck/test/build, PR review, npm version proof
 
 ## Remote State
 - Host/provider: GitHub Actions + npm trusted publishing
-- Current live artifact: @tangle-network/agent-gateway@0.8.15
-- Current service status: merged source is 408dac6; release workflow runs from an exact v0.8.16 tag
+- Current live artifact: @tangle-network/agent-gateway@0.8.16
+- Current service status: merged source is 5e8f5e8; release workflow runs from an exact v0.8.17 tag
 - Last smoke result: pending this release
 
 ## Decision
 - Build path: tag-triggered GitHub Actions publish
 - Reason: repository workflow owns verification, provenance, and npm publication
 - Expected duration: minutes after merge and tag push
-- Fallback/rollback: retain v0.8.15; diagnose and retry only after a failed v0.8.16 workflow
+- Fallback/rollback: retain v0.8.16; diagnose and retry only after a failed v0.8.17 workflow
 
 ## Timeline
 - 2026-09-01: confirmed release branch starts at origin/main 5095f58, version 0.8.13
@@ -40,3 +40,5 @@
 - 2026-09-02: npm registry returned version/latest 0.8.14 before the 0.8.15 release
 - 2026-09-02: PR #43 merged as 408dac6; canceled clients no longer prevent final usage settlement when the host opts in
 - 2026-09-02: local Node 22.13 and Node 24.13 test runs each passed 447/447 tests
+- 2026-09-02: PR #45 merged as 5e8f5e8; OpenAI non-stream responses, API-key URL configuration, and input-required visibility fixes landed
+- 2026-09-02: local Node 22.23.2 and Node 24.13.0 test runs each passed 453/453 tests; typecheck and build passed on both
