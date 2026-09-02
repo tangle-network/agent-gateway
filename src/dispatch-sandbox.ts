@@ -314,9 +314,9 @@ function mergeUsage(
   update: Partial<SandboxUsageReceipt>,
 ): Partial<SandboxUsageReceipt> {
   const merged = { ...current, ...update }
-  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd'] as const) {
+  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const) {
     const value = update[key]
-    if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new Error(`sandbox usage field ${key} is invalid`)
     }
     if (value !== undefined && current[key] !== undefined) {
@@ -324,6 +324,16 @@ function mergeUsage(
       // final event erase spend observed earlier in the same execution.
       merged[key] = Math.max(current[key]!, value)
     }
+  }
+  const providerCostUsd = update.providerCostUsd
+  if (providerCostUsd !== undefined && (!Number.isFinite(providerCostUsd) || providerCostUsd < 0)) {
+    throw new Error('sandbox usage field providerCostUsd is invalid')
+  }
+  if (providerCostUsd !== undefined && current.providerCostUsd !== undefined) {
+    merged.providerCostUsd = Math.max(current.providerCostUsd, providerCostUsd)
+  }
+  if (update.budgetEnforced !== undefined && typeof update.budgetEnforced !== 'boolean') {
+    throw new Error('sandbox usage budget flag is invalid')
   }
   if (current.budgetEnforced === false || update.budgetEnforced === false) {
     merged.budgetEnforced = false
@@ -412,6 +422,31 @@ function finalizeUsage(
   return usage
 }
 
+/** Complete a legacy receipt without claiming provider budget enforcement. */
+function completeLegacyUsage(
+  parts: Partial<SandboxUsageReceipt>,
+  userMessage: string,
+  outputText: string,
+  budget: SandboxExecutionBudget,
+): SandboxUsageReceipt {
+  const usage = {
+    inputTokens: parts.inputTokens ?? estimateTokens(userMessage),
+    outputTokens: parts.outputTokens ?? estimateTokens(outputText),
+    reasoningTokens: parts.reasoningTokens ?? 0,
+    toolTokens: parts.toolTokens ?? 0,
+    toolCallCount: parts.toolCallCount ?? 0,
+    providerCostUsd: parts.providerCostUsd ?? 0,
+    budgetEnforced: false,
+  }
+  if (!Number.isSafeInteger(
+    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens,
+  )) {
+    throw new Error('sandbox usage token total exceeds safe integer range')
+  }
+  enforceUsageBudget(usage, budget)
+  return usage
+}
+
 function completeUsage(
   parts: Partial<SandboxUsageReceipt>,
   reasoningTokens: number,
@@ -423,26 +458,23 @@ function completeUsage(
   requiresReceipt: boolean,
 ): SandboxUsageReceipt {
   const observed = withObservedUsage(parts, reasoningTokens, toolTokens, toolCallCount)
-  if (
-    !requiresReceipt &&
-    Object.keys(parts).length === 0 &&
-    reasoningTokens === 0 &&
-    toolTokens === 0 &&
-    toolCallCount === 0
-  ) {
-    // Preserve the pre-receipt SandboxBox contract for legacy API-key
-    // adapters. Durable payment operations must use provider-enforced usage.
-    return {
-      inputTokens: estimateTokens(userMessage),
-      outputTokens: estimateTokens(outputText),
-      reasoningTokens: 0,
-      toolTokens: 0,
-      toolCallCount: 0,
-      providerCostUsd: 0,
-      budgetEnforced: false,
-    }
+  if (requiresReceipt) return finalizeUsage(observed, budget)
+
+  // Legacy API-key calls may report only the fields their adapter knows. Keep
+  // those values, estimate only absent fields, and mark the receipt as not
+  // provider-enforced. Durable payment operations stay on finalizeUsage above.
+  const complete = [
+    'inputTokens',
+    'outputTokens',
+    'reasoningTokens',
+    'toolTokens',
+    'toolCallCount',
+    'providerCostUsd',
+  ] as const
+  if (complete.every((field) => observed[field] !== undefined) && observed.budgetEnforced === true) {
+    return finalizeUsage(observed, budget)
   }
-  return finalizeUsage(observed, budget)
+  return completeLegacyUsage(observed, userMessage, outputText, budget)
 }
 
 function truncateUtf8(

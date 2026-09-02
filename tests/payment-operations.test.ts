@@ -16,6 +16,7 @@ import type {
   GatewayConfig,
   SandboxBox,
   SandboxStreamEvent,
+  SandboxUsageReceipt,
 } from '../src/types'
 
 const agent: AgentMeta = {
@@ -432,6 +433,76 @@ describe('bounded request pricing and sandbox receipts', () => {
     expect(requiredX402Amount(0, 4, 2)).toBe(0n)
   })
 
+  it('preserves authoritative input, output, and provider cost for legacy calls', async () => {
+    await expect(collectUsage([partialUsageEvent()])).resolves.toEqual({
+      inputTokens: 40,
+      outputTokens: 20,
+      reasoningTokens: 0,
+      toolTokens: 0,
+      toolCallCount: 0,
+      providerCostUsd: 0.0123,
+      budgetEnforced: false,
+    })
+  })
+
+  it('adds observed reasoning and tool counts to a legacy partial receipt', async () => {
+    await expect(collectUsage([
+      { type: 'task.reasoning', data: { reasoning: { tokens: 5 } } },
+      { type: 'task.tool.updated', data: { tool: { inputTokens: 7, outputTokens: 8 } } },
+      partialUsageEvent(),
+    ])).resolves.toMatchObject({
+      inputTokens: 40,
+      outputTokens: 20,
+      reasoningTokens: 5,
+      toolTokens: 15,
+      toolCallCount: 1,
+      providerCostUsd: 0.0123,
+      budgetEnforced: false,
+    })
+  })
+
+  it('does not let a lower legacy receipt erase earlier provider cost', async () => {
+    await expect(collectUsage([
+      partialUsageEvent({ providerCostUsd: 0.9 }),
+      partialUsageEvent({ providerCostUsd: 0.1 }),
+    ])).resolves.toMatchObject({ providerCostUsd: 0.9, budgetEnforced: false })
+  })
+
+  it('checks estimated legacy fields against the execution budget', async () => {
+    await expect(collectUsage([], {
+      userMessage: 'x'.repeat(80),
+      maxInputTokens: 1,
+    })).rejects.toThrow('sandbox exceeded max input tokens')
+  })
+
+  it.each([
+    ['fractional input tokens', { inputTokens: 40.5 }, 'sandbox usage field inputTokens is invalid'],
+    ['negative provider cost', { providerCostUsd: -1 }, 'sandbox usage field providerCostUsd is invalid'],
+    ['invalid budget flag', { budgetEnforced: 'yes' }, 'sandbox usage budget flag is invalid'],
+  ])('rejects %s in a partial receipt', async (_name, override, message) => {
+    const event = partialUsageEvent(override as Record<string, unknown>)
+    await expect(collectUsage([event])).rejects.toThrow(message)
+  })
+
+  it('preserves a complete provider-enforced receipt on the legacy path', async () => {
+    await expect(collectUsage([completeUsageEvent()])).resolves.toEqual({
+      inputTokens: 40,
+      outputTokens: 20,
+      reasoningTokens: 5,
+      toolTokens: 13,
+      toolCallCount: 2,
+      providerCostUsd: 0.0123,
+      budgetEnforced: true,
+    })
+  })
+
+  it('keeps durable calls strict for incomplete and unenforced receipts', async () => {
+    await expect(collectUsage([partialUsageEvent()], { requiresReceipt: true }))
+      .rejects.toThrow('sandbox did not provide a complete usage receipt')
+    await expect(collectUsage([completeUsageEvent({ budgetEnforced: false })], { requiresReceipt: true }))
+      .rejects.toThrow('sandbox did not enforce the execution budget')
+  })
+
   it.each([
     ['honors max output', false],
     ['ignores max output', true],
@@ -618,7 +689,7 @@ describe('bounded request pricing and sandbox receipts', () => {
     })
   })
 
-  it('does not let a lower final receipt erase earlier hidden spend or a failed budget flag', async () => {
+  it('does not let a lower durable receipt erase earlier hidden spend or a failed budget flag', async () => {
     const box: SandboxBox = {
       async *streamPrompt() {
         yield {
@@ -665,7 +736,17 @@ describe('bounded request pricing and sandbox receipts', () => {
     }
     const run = async () => {
       const events = []
-      for await (const event of dispatchSandboxStreamRich(agent, 'hi', 'consumer', config, undefined, undefined, 4)) {
+      for await (const event of dispatchSandboxStreamRich(
+        agent,
+        'hi',
+        'consumer',
+        config,
+        undefined,
+        undefined,
+        4,
+        undefined,
+        true,
+      )) {
         events.push(event)
       }
       return events.find((event) => event.kind === 'usage')
@@ -825,6 +906,82 @@ describe('bounded request pricing and sandbox receipts', () => {
     }
   })
 })
+
+function partialUsageEvent(overrides: Record<string, unknown> = {}): SandboxStreamEvent {
+  return {
+    type: 'sandbox.usage',
+    data: {
+      usage: {
+        inputTokens: 40,
+        outputTokens: 20,
+        providerCostUsd: 0.0123,
+        ...overrides,
+      },
+    },
+  } as SandboxStreamEvent
+}
+
+function completeUsageEvent(overrides: Partial<SandboxUsageReceipt> = {}): SandboxStreamEvent {
+  return {
+    type: 'sandbox.usage',
+    data: {
+      usage: {
+        inputTokens: 40,
+        outputTokens: 20,
+        reasoningTokens: 5,
+        toolTokens: 13,
+        toolCallCount: 2,
+        providerCostUsd: 0.0123,
+        budgetEnforced: true,
+        ...overrides,
+      },
+    },
+  }
+}
+
+async function collectUsage(
+  events: readonly SandboxStreamEvent[],
+  options: {
+    requiresReceipt?: boolean
+    userMessage?: string
+    maxInputTokens?: number
+  } = {},
+): Promise<SandboxUsageReceipt> {
+  const config: GatewayConfig = {
+    resolveAgent: async () => agent,
+    getSandbox: async () => ({
+      async *streamPrompt() {
+        yield* events
+      },
+    }),
+    recordUsage: async () => undefined,
+    x402: { operatorAddress: '0x1', chainId: 1, demoMode: true },
+    executionBudget: {
+      maxReasoningTokens: 64,
+      maxToolTokens: 64,
+      maxToolCalls: 64,
+      maxProviderCostUsd: 100,
+    },
+  }
+  let usage: SandboxUsageReceipt | undefined
+  for await (const event of dispatchSandboxStreamRich(
+    agent,
+    options.userMessage ?? 'hello',
+    'consumer',
+    config,
+    undefined,
+    undefined,
+    64,
+    undefined,
+    options.requiresReceipt ?? false,
+    undefined,
+    options.maxInputTokens ?? 100,
+  )) {
+    if (event.kind === 'usage') usage = event.usage
+  }
+  if (!usage) throw new Error('test stream did not return a usage receipt')
+  return usage
+}
 
 function settledUsage() {
   return {
