@@ -92,6 +92,8 @@ Keep version 1 explicitly configured while old and new gateways coexist; shared 
 Before it calls the verifier, the gateway requires the signed amount to cover the complete filtered conversation plus the requested output limit.
 The default bound includes system text, message roles, and JSON framing.
 Set `inputTokenBound` when the provider adds harness, tool, workspace, or other hidden context.
+The callback can read retained history asynchronously through its `threadId`.
+It runs before payment verification and receives no consumer identity.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
