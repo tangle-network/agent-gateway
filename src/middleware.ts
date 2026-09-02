@@ -78,6 +78,21 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     )
   }
   if (
+    config.unauthenticatedInputTokenBound !== undefined &&
+    (!Number.isSafeInteger(config.unauthenticatedInputTokenBound) ||
+      config.unauthenticatedInputTokenBound < 0)
+  ) {
+    throw new Error(
+      'createAgentGateway: unauthenticatedInputTokenBound must be a non-negative safe integer',
+    )
+  }
+  if (config.inputTokenBound && isX402AuthEnabled(config) &&
+      config.unauthenticatedInputTokenBound === undefined) {
+    throw new Error(
+      'createAgentGateway: inputTokenBound requires unauthenticatedInputTokenBound for x402 authentication',
+    )
+  }
+  if (
     config.x402.currencyDecimals !== undefined &&
     (!Number.isInteger(config.x402.currencyDecimals) ||
       config.x402.currencyDecimals < 0 ||
