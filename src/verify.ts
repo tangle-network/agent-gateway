@@ -32,13 +32,28 @@ interface DecodedMppCredential {
   payload: Record<string, unknown>
 }
 
+function decodeBase64Url(value: string): string {
+  const normalized = value.replaceAll('-', '+').replaceAll('_', '/')
+  const padding = '='.repeat((4 - normalized.length % 4) % 4)
+  const binary = atob(normalized + padding)
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+function encodeBase64Url(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+}
+
 function decodeMppCredential(authHeader: string): DecodedMppCredential | undefined {
   const match = authHeader.match(/^Payment\s+(\S+)\s+(\S+)$/i)
   if (!match) return undefined
   const [, rawMethod, credentialB64] = match
   if (!/^[A-Za-z0-9_-]+$/.test(credentialB64)) return undefined
   try {
-    const decoded = Buffer.from(credentialB64, 'base64url').toString('utf-8')
+    const decoded = decodeBase64Url(credentialB64)
     let payload: Record<string, unknown> = {}
     try {
       const credential = JSON.parse(decoded) as unknown
@@ -64,7 +79,7 @@ function canonicalMppNonceKey(
   credential: string,
 ): string {
   if (payload.nonce === undefined) {
-    return `mpp:${method.toLowerCase()}:receipt:${Buffer.from(credential).toString('base64url')}`
+    return `mpp:${method.toLowerCase()}:receipt:${encodeBase64Url(credential)}`
   }
   const nonce = BigInt(String(payload.nonce)).toString()
   const commitment = payload.commitment
@@ -98,7 +113,7 @@ function legacyMppPaymentIdentity(
 ): string {
   const canonicalPayload = stableJson(payload)
   if (canonicalPayload !== '{}') return `legacy:${method}:${canonicalPayload}`
-  return `legacy:${method}:credential:${Buffer.from(credential).toString('base64url')}`
+  return `legacy:${method}:credential:${encodeBase64Url(credential)}`
 }
 
 /** Pure capability checks shared by discovery and every request protocol. */

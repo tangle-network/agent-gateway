@@ -6,10 +6,11 @@
  * - A Hono router for CRUD (createApiKeyRoutes)
  * - A verifyApiKey function that checks against the store
  *
- * Each agent implements ApiKeyStore against their own DB.
+ * Apps can use SqlApiKeyStore or provide a store for another database.
  */
 
 import { Hono } from 'hono'
+import type { PaymentResult } from './types'
 
 // --- Types ---
 
@@ -38,7 +39,7 @@ export interface ApiKeyCreateRequest {
   expiresAt?: string
 }
 
-/** Each agent implements this against their DB */
+/** Persistent storage contract for API keys. */
 export interface ApiKeyStore {
   create(userId: string, data: {
     name: string
@@ -57,7 +58,48 @@ export interface ApiKeyStore {
 
   delete(userId: string, keyId: string): Promise<boolean>
 
-  recordUsage(keyId: string, costCents: number): Promise<void>
+  recordUsage(keyId: string, costCents: number, requestId?: string): Promise<void>
+}
+
+const API_KEY_CONSUMER_PREFIX = 'apikey:'
+
+/** Convert a gateway USD settlement to the store's conservative whole cents. */
+export function apiKeySettlementCostCents(costUsd: number): number {
+  if (!Number.isFinite(costUsd) || costUsd < 0) {
+    throw new TypeError('API key settlement cost must be a non-negative USD amount')
+  }
+  const rawCents = costUsd * 100
+  const nearestCent = Math.round(rawCents)
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(rawCents)) * 4
+  const normalizedCents = Math.abs(rawCents - nearestCent) <= tolerance
+    ? nearestCent
+    : rawCents
+  const costCents = Math.ceil(normalizedCents)
+  if (!Number.isSafeInteger(costCents)) {
+    throw new TypeError('API key settlement cost exceeds the cents range')
+  }
+  return costCents
+}
+
+/** Build the gateway settlement callback for an API-key store. */
+export function createApiKeyUsageSettlement(
+  store: Pick<ApiKeyStore, 'recordUsage'>,
+): (payment: PaymentResult, costUsd: number) => Promise<void> {
+  return async (payment, costUsd) => {
+    if (
+      payment.method !== 'apikey'
+      || !payment.consumerId.startsWith(API_KEY_CONSUMER_PREFIX)
+    ) {
+      throw new TypeError('Unsupported API key settlement identity')
+    }
+    const keyId = payment.consumerId.slice(API_KEY_CONSUMER_PREFIX.length)
+    if (!keyId) throw new TypeError('API key settlement key id is missing')
+    await store.recordUsage(
+      keyId,
+      apiKeySettlementCostCents(costUsd),
+      payment.requestId,
+    )
+  }
 }
 
 // --- Key generation ---
@@ -81,7 +123,7 @@ export async function verifyApiKeyFromStore(
   authHeader: string,
   store: ApiKeyStore,
   prefix = 'ak_',
-): Promise<{ key: ApiKey; keyId: string; consumerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
+): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
   const bearerPrefix = `Bearer ${prefix}`
   if (!authHeader.startsWith(bearerPrefix)) return null
 
@@ -100,6 +142,7 @@ export async function verifyApiKeyFromStore(
     key,
     consumerId: `apikey:${key.id}`,
     keyId: key.id,
+    ownerId: key.userId,
     scopes: key.scopes,
     rateLimitPerMinute: key.rateLimit,
     dailyLimit: key.dailyLimit,
@@ -118,10 +161,19 @@ export interface ApiKeyRoutesConfig {
   validScopes?: string[]
 }
 
+function positiveInteger(value: unknown, fallback: number): number | null {
+  if (value === undefined) return fallback
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null
+}
+
 export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
   const router = new Hono()
   const prefix = config.prefix ?? 'ak_'
   const validScopes = config.validScopes ?? ['chat']
+  if (validScopes.length === 0) throw new TypeError('At least one API key scope is required')
+  const defaultScope = validScopes.includes('chat') ? 'chat' : validScopes[0]
 
   // List keys
   router.get('/', async (c) => {
@@ -137,25 +189,69 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
     const userId = await config.getAuthUserId(c.req.raw)
     if (!userId) return c.json({ error: 'Unauthorized' }, 401)
 
-    const body = await c.req.json<ApiKeyCreateRequest>()
-    if (!body.name?.trim()) return c.json({ error: 'name is required' }, 400)
+    let input: unknown
+    try {
+      input = await c.req.json()
+    } catch {
+      return c.json({ error: 'body must be valid JSON' }, 400)
+    }
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return c.json({ error: 'body must be a JSON object' }, 400)
+    }
+    const body = input as Record<string, unknown>
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    if (!name) return c.json({ error: 'name is required' }, 400)
 
-    const scopes = (body.scopes ?? ['chat']).filter(s => validScopes.includes(s))
-    if (scopes.length === 0) scopes.push('chat')
+    if (body.scopes !== undefined && !Array.isArray(body.scopes)) {
+      return c.json({ error: 'scopes must be an array' }, 400)
+    }
+    const requestedScopes = Array.isArray(body.scopes) ? body.scopes : [defaultScope]
+    const scopes = [...new Set(requestedScopes.filter(
+      (scope): scope is string => typeof scope === 'string' && validScopes.includes(scope),
+    ))]
+    if (scopes.length === 0) scopes.push(defaultScope)
+
+    const rateLimit = positiveInteger(body.rateLimit, 60)
+    if (rateLimit === null) return c.json({ error: 'rateLimit must be a positive integer' }, 400)
+    const dailyLimit = positiveInteger(body.dailyLimit, 1_000)
+    if (dailyLimit === null) return c.json({ error: 'dailyLimit must be a positive integer' }, 400)
+
+    let spendingLimitCents: number | null = null
+    if (body.spendingLimitCents !== undefined) {
+      if (
+        typeof body.spendingLimitCents !== 'number'
+        || !Number.isSafeInteger(body.spendingLimitCents)
+        || body.spendingLimitCents < 0
+      ) {
+        return c.json({ error: 'spendingLimitCents must be a non-negative integer' }, 400)
+      }
+      spendingLimitCents = body.spendingLimitCents
+    }
+
+    let expiresAt: Date | null = null
+    if (body.expiresAt !== undefined) {
+      if (typeof body.expiresAt !== 'string') {
+        return c.json({ error: 'expiresAt must be a valid date string' }, 400)
+      }
+      expiresAt = new Date(body.expiresAt)
+      if (Number.isNaN(expiresAt.getTime())) {
+        return c.json({ error: 'expiresAt must be a valid date string' }, 400)
+      }
+    }
 
     const rawKey = generateRawKey(prefix)
     const keyHash = await hashKey(rawKey)
     const keyPrefix = rawKey.slice(0, prefix.length + 8)
 
     const created = await config.store.create(userId, {
-      name: body.name.trim(),
+      name,
       keyHash,
       keyPrefix,
       scopes,
-      rateLimit: body.rateLimit ?? 60,
-      dailyLimit: body.dailyLimit ?? 1000,
-      spendingLimitCents: body.spendingLimitCents ?? null,
-      expiresAt: body.expiresAt ? new Date(body.expiresAt) : null,
+      rateLimit,
+      dailyLimit,
+      spendingLimitCents,
+      expiresAt,
     })
 
     return c.json({
