@@ -68,6 +68,8 @@ export {
   type RateLimitStore,
 } from './rate-limit'
 export {
+  apiKeySettlementCostCents,
+  createApiKeyUsageSettlement,
   createApiKeyRoutes,
   verifyApiKeyFromStore,
   type ApiKey,
@@ -75,6 +77,18 @@ export {
   type ApiKeyStore,
   type ApiKeyRoutesConfig,
 } from './api-keys'
+export {
+  ApiKeySpendingLimitExceededError,
+  SqlApiKeyStore,
+  sqlApiKeyStoreSchemaStatements,
+  type SqlApiKeyStoreOptions,
+} from './api-key-store-sql'
+export {
+  SqlGatewayUsageStore,
+  sqlGatewayUsageStoreSchemaStatements,
+  usdToNanodollars,
+  type SqlGatewayUsageStoreOptions,
+} from './usage-store-sql'
 export {
   MemoryNonceStore,
   KvNonceStore,
@@ -130,7 +144,9 @@ export {
   type D1DatabaseLike,
   type D1StmtLike,
   d1ToSqlAdapter,
+  sqlTaskStoreSchemaStatements,
   type SqlAdapter,
+  type SqlTaskStoreOptions,
   SqlTaskStore,
 } from './a2a/task-store-sql'
 export {

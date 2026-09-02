@@ -1,5 +1,6 @@
 import type { Context } from 'hono'
 
+import { isChatMessageArray } from './chat-input'
 import { filterConsumerMessagesStrict } from './filter'
 import { type RequestContext, generateRequestId } from './observer'
 import { type GatewayState, type AuthorizedRequest } from './dispatch-types'
@@ -82,9 +83,14 @@ export async function authenticateAndGuard(
   if (!agent || !agent.enabled) {
     return c.json({ error: { message: 'Agent not found', type: 'not_found' } }, 404)
   }
-  if (!messages?.length) {
+  if (!isChatMessageArray(messages)) {
     return c.json(
-      { error: { message: 'messages array required', type: 'invalid_request' } },
+      {
+        error: {
+          message: 'messages must be a non-empty array of role/content objects',
+          type: 'invalid_request',
+        },
+      },
       400,
     )
   }
@@ -443,6 +449,7 @@ export async function authenticateAndGuard(
       method: paymentMethod,
       consumerId: consumerId,
       keyId: keyInfo?.keyId,
+      ownerId: keyInfo?.ownerId,
       requestId,
       ...(threadId ? { threadId } : {}),
     })

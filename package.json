@@ -2,6 +2,9 @@
   "name": "@tangle-network/agent-gateway",
   "version": "0.8.11",
   "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tangle-network/agent-gateway.git"
@@ -39,14 +42,14 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "hono": "^4.6.0"
+    "hono": "^4.13.5"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0",
-    "@vitest/coverage-v8": "^4.1.4",
+    "@types/node": "^24.13.3",
+    "@vitest/coverage-v8": "^4.1.11",
     "tsup": "^8.0.0",
-    "typescript": "^5.7.0",
-    "viem": "^2.48.1",
-    "vitest": "^4.1.4"
+    "typescript": "^5.9.3",
+    "viem": "^2.56.2",
+    "vitest": "^4.1.11"
   }
 }

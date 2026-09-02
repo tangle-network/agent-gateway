@@ -153,7 +153,8 @@ const pg: SqlAdapter = {
   },
 }
 
-const taskStore = new SqlTaskStore(pg)
+// The dialect option also upgrades timestamp columns created by versions before 0.8.12.
+const taskStore = new SqlTaskStore(pg, { dialect: 'postgres' })
 await taskStore.migrate()
 ```
 

@@ -14,7 +14,10 @@ npm install @tangle-network/agent-gateway
 ```ts
 import {
   createAgentGateway,
+  createApiKeyUsageSettlement,
   recoverPayments,
+  SqlApiKeyStore,
+  SqlGatewayUsageStore,
   SqlPaymentRecoveryStore,
   verifyApiKeyFromStore,
 } from '@tangle-network/agent-gateway'
@@ -23,10 +26,15 @@ import { Hono } from 'hono'
 const app = new Hono()
 const paymentRecoveryStore = new SqlPaymentRecoveryStore(sqlAdapter)
 await paymentRecoveryStore.migrate()
+const apiKeyStore = new SqlApiKeyStore(sqlAdapter)
+await apiKeyStore.migrate()
+const usageStore = new SqlGatewayUsageStore(sqlAdapter)
+await usageStore.migrate()
 app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
-  recordUsage: recordUsageEvent,
+  recordUsage: usageStore.recordUsage,
+  settlePayment: createApiKeyUsageSettlement(apiKeyStore),
   x402: {
     operatorAddress: '0x…',
     chainId: 3799,
@@ -42,6 +50,15 @@ app.route('/v1/agents', createAgentGateway({
   verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
+
+Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
+Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
+Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
+The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
+The API-key store records each request once and refuses a settlement that would exceed the key limit.
+This check runs after work completes, so it does not reserve funds before an in-flight request.
+Use a payment authorization flow when the product requires a strict pre-run budget.
+The usage store writes USD values as integer nanodollars instead of SQL floating-point values.
 
 Production requires either `x402.verifySigner` or `verifyApiKey`.
 API-key-only apps can omit `x402` entirely.
