@@ -1,5 +1,5 @@
 export { createAgentGateway } from './middleware'
-export { reclaimPayment, SandboxStreamError } from './dispatch'
+export { maximumBillableInputTokens, reclaimPayment, SandboxStreamError } from './dispatch'
 export {
   recoverPayment,
   recoverPayments,

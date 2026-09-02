@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { maximumBillableInputTokens as rootMaximumBillableInputTokens } from '../src'
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
 import { InMemoryPushNotificationStore } from '../src/a2a/push-notifications'
@@ -91,6 +92,10 @@ function durableConfig(
 }
 
 describe('PR #11 production regressions', () => {
+  it('exports the conservative input bound from the package root', () => {
+    expect(rootMaximumBillableInputTokens({ ...agent, systemPrompt: '' }, '😀')).toBe(4)
+  })
+
   it('claims one terminal webhook when cancellation races fenced settlement on two workers', async () => {
     const taskStore = new ServerAssignedTaskStore(
       new InMemoryTaskStore(),
@@ -875,12 +880,26 @@ describe('PR #11 production regressions', () => {
 
   it('uses the configured complete provider input bound before quoting', async () => {
     let quotedMessages: Array<{ role: string; content: string }> | undefined
-    const inputTokenBound = ({ messages }: { messages: Array<{ role: string; content: string }> }) => {
+    let quotedThreadId: string | undefined
+    let quotedRequestId: string | undefined
+    const inputTokenBound = async ({
+      messages,
+      threadId,
+      requestId,
+    }: {
+      messages: Array<{ role: string; content: string }>
+      threadId?: string
+      requestId: string
+    }) => {
+      await Promise.resolve()
       quotedMessages = messages
+      quotedThreadId = threadId
+      quotedRequestId = requestId
       return 4_096
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(durableConfig({
+      conversationMode: 'thread',
       maxOutputTokens: 1_024,
       defaultOutputTokens: 1_024,
       inputTokenBound,
@@ -888,7 +907,10 @@ describe('PR #11 production regressions', () => {
 
     const response = await app.request('/v1/agents/pr11/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tangle-Thread-Id': 'thread-existing-1',
+      },
       body: JSON.stringify({
         messages: [
           { role: 'user', content: 'first turn' },
@@ -907,6 +929,8 @@ describe('PR #11 production regressions', () => {
       { role: 'assistant', content: 'prior answer' },
       { role: 'user', content: 'current turn' },
     ])
+    expect(quotedThreadId).toBe('thread-existing-1')
+    expect(quotedRequestId).toMatch(/^req_[0-9a-f]{32}$/)
     expect(body.error?.x402?.required_amount).toBe(
       requiredX402Amount(agent.pricePerTokenUsd, 4_096, 1_024, 6, 1_024, 1_024)
         .toString(),

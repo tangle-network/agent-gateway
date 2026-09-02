@@ -140,7 +140,12 @@ export async function authenticateAndGuard(
   if (config.inputTokenBound) {
     let configuredBound: number
     try {
-      configuredBound = config.inputTokenBound({ agent, messages: filtered })
+      configuredBound = await config.inputTokenBound({
+        agent,
+        messages: filtered,
+        requestId,
+        ...(threadId ? { threadId } : {}),
+      })
     } catch {
       return c.json(
         {

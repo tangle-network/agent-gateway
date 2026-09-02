@@ -360,11 +360,16 @@ export interface GatewayConfig {
   /**
    * Return a safe upper bound for the complete provider input.
    * Include system, chat framing, retained history, tools, harness, and workspace context.
+   * The callback runs before payment verification, so it receives no consumer
+   * identity. `threadId` is sufficient for a host to read its retained history.
    */
   inputTokenBound?: (input: {
     agent: AgentMeta
     messages: ChatMessage[]
-  }) => number
+    requestId: string
+    /** Stable UI conversation id when `conversationMode` is `thread`. */
+    threadId?: string
+  }) => number | Promise<number>
 
   /** Hidden provider spend limits included in the pre-execution payment quote. */
   executionBudget?: {
