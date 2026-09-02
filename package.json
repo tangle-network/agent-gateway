@@ -1,6 +1,6 @@
 {
   "name": "@tangle-network/agent-gateway",
-  "version": "0.8.12",
+  "version": "0.8.13",
   "packageManager": "pnpm@10.28.0",
   "engines": {
     "node": ">=22.13.0"
