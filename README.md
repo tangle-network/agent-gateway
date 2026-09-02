@@ -53,6 +53,18 @@ app.route('/v1/agents', createAgentGateway({
 }))
 ```
 
+Configure `continueOnDisconnect` when the host keeps agent turns alive after a caller closes the API stream.
+The gateway then consumes the final usage receipt and settles payment in background time.
+When omitted, a disconnect aborts sandbox work.
+Create the gateway inside the Worker request when you need its execution context:
+
+```ts
+const gateway = createAgentGateway({
+  ...gatewayConfig,
+  continueOnDisconnect: (task) => ctx.waitUntil(task),
+})
+```
+
 Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
 Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
 Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
