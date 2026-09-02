@@ -103,12 +103,19 @@ export function sqlTaskStoreSchemaStatements(tableName = 'a2a_tasks'): readonly 
       context_id TEXT NOT NULL,
       state TEXT NOT NULL,
       payload TEXT NOT NULL,
-      updated_at INTEGER NOT NULL,
+      updated_at BIGINT NOT NULL,
       execution_request_id TEXT,
-      execution_lease_expires_at REAL
+      execution_lease_expires_at BIGINT
     )`,
     `CREATE INDEX IF NOT EXISTS idx_${table}_context ON ${table} (context_id, updated_at)`,
   ]
+}
+
+export interface SqlTaskStoreOptions {
+  ttlMs?: number
+  table?: string
+  /** Required only to upgrade a table created by a pre-0.8.12 PostgreSQL store. */
+  dialect?: 'sqlite' | 'postgres'
 }
 
 /**
@@ -122,7 +129,7 @@ export class SqlTaskStore implements TaskStore {
 
   constructor(
     private readonly db: SqlAdapter,
-    private readonly opts: { ttlMs?: number; table?: string } = {},
+    private readonly opts: SqlTaskStoreOptions = {},
   ) {
     this.table = requireSqlIdentifier(opts.table ?? 'a2a_tasks')
   }
@@ -138,9 +145,9 @@ export class SqlTaskStore implements TaskStore {
   } | undefined> {
     const rows = await this.db.query<{
       payload: string
-      updated_at: number
+      updated_at: number | string | bigint
       execution_request_id?: string | null
-      execution_lease_expires_at?: number | null
+      execution_lease_expires_at?: number | string | bigint | null
     }>(
       `SELECT payload, updated_at, execution_request_id, execution_lease_expires_at FROM ${this.table} WHERE id = ?`,
       [id],
@@ -149,9 +156,12 @@ export class SqlTaskStore implements TaskStore {
     return row
       ? {
           payload: row.payload,
-          updatedAt: row.updated_at,
+          updatedAt: sqlSafeInteger(row.updated_at, 'updated_at'),
           executionRequestId: row.execution_request_id ?? null,
-          executionLeaseExpiresAt: row.execution_lease_expires_at ?? null,
+          executionLeaseExpiresAt: row.execution_lease_expires_at === null ||
+            row.execution_lease_expires_at === undefined
+            ? null
+            : sqlSafeInteger(row.execution_lease_expires_at, 'execution_lease_expires_at'),
         }
       : undefined
   }
@@ -178,7 +188,7 @@ export class SqlTaskStore implements TaskStore {
     await this.db.exec(createTable)
     for (const column of [
       'execution_request_id TEXT',
-      'execution_lease_expires_at REAL',
+      'execution_lease_expires_at BIGINT',
     ]) {
       try {
         await this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN ${column}`)
@@ -186,6 +196,15 @@ export class SqlTaskStore implements TaskStore {
         const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
         if (!message.includes('duplicate column') && !message.includes('already exists')) throw error
       }
+    }
+    if (this.opts.dialect === 'postgres') {
+      await this.db.exec(
+        `ALTER TABLE ${this.table} ALTER COLUMN updated_at TYPE BIGINT USING updated_at::bigint`,
+      )
+      await this.db.exec(
+        `ALTER TABLE ${this.table} ALTER COLUMN execution_lease_expires_at TYPE BIGINT ` +
+          `USING execution_lease_expires_at::bigint`,
+      )
     }
     await this.db.exec(createContextIndex)
   }
@@ -370,18 +389,32 @@ export class SqlTaskStore implements TaskStore {
    * specifically wire SqlTaskStore can use it for richer queries.
    */
   async listByContext(contextId: string): Promise<Task[]> {
-    const rows = await this.db.query<{ payload: string; updated_at: number }>(
+    const rows = await this.db.query<{
+      payload: string
+      updated_at: number | string | bigint
+    }>(
       `SELECT payload, updated_at FROM ${this.table} WHERE context_id = ? ORDER BY updated_at DESC`,
       [contextId],
     )
     const now = Date.now()
     return rows
-      .map((r) => ({ task: JSON.parse(r.payload) as Task, updatedAt: r.updated_at }))
+      .map((r) => ({
+        task: JSON.parse(r.payload) as Task,
+        updatedAt: sqlSafeInteger(r.updated_at, 'updated_at'),
+      }))
       .filter(({ task, updatedAt }) =>
         now - updatedAt <= this.ttlMs || hasPendingPaymentRecovery(task),
       )
       .map(({ task }) => task)
   }
+}
+
+function sqlSafeInteger(value: number | string | bigint, column: string): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(parsed)) {
+    throw new TypeError(`${column} must be a safe integer`)
+  }
+  return parsed
 }
 
 function executionColumns(task: Task): [string | null, number | null] {

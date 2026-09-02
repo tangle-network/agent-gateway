@@ -188,10 +188,36 @@ describe('SqlTaskStore', () => {
     const statements = sqlTaskStoreSchemaStatements()
     expect(statements).toHaveLength(2)
     expect(statements[0]).toContain('CREATE TABLE IF NOT EXISTS a2a_tasks')
+    expect(statements[0]).toContain('updated_at BIGINT NOT NULL')
+    expect(statements[0]).toContain('execution_lease_expires_at BIGINT')
     expect(statements[1]).toContain('idx_a2a_tasks_context')
     expect(() => sqlTaskStoreSchemaStatements('tasks; DROP TABLE tasks')).toThrow(/table name/)
     expect(() => new SqlTaskStore({} as SqlAdapter, { table: 'tasks; DROP TABLE tasks' }))
       .toThrow(/table name/)
+  })
+
+  it('upgrades pre-0.8.12 PostgreSQL timestamp columns to millisecond-safe BIGINT', async () => {
+    const statements: string[] = []
+    const adapter: SqlAdapter = {
+      async exec(sql) {
+        statements.push(sql)
+        return { rowsAffected: 0 }
+      },
+      async query<TRow>() {
+        return [] as TRow[]
+      },
+    }
+    const store = new SqlTaskStore(adapter, { dialect: 'postgres' })
+
+    await store.migrate()
+
+    expect(statements).toContain(
+      'ALTER TABLE a2a_tasks ALTER COLUMN updated_at TYPE BIGINT USING updated_at::bigint',
+    )
+    expect(statements).toContain(
+      'ALTER TABLE a2a_tasks ALTER COLUMN execution_lease_expires_at TYPE BIGINT ' +
+        'USING execution_lease_expires_at::bigint',
+    )
   })
 
   it('uses D1 changes instead of indexed billing rows for affected writes', async () => {

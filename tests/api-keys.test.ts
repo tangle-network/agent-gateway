@@ -257,7 +257,7 @@ describe('API key usage settlement', () => {
     const settle = createApiKeyUsageSettlement({ recordUsage })
 
     await settle({ method: 'apikey', consumerId: 'apikey:key-1', requestId: 'request-1' }, 0.07)
-    expect(recordUsage).toHaveBeenCalledWith('key-1', 7)
+    expect(recordUsage).toHaveBeenCalledWith('key-1', 7, 'request-1')
 
     await expect(settle(
       { method: 'x402', consumerId: 'apikey:key-1', requestId: 'request-2' },

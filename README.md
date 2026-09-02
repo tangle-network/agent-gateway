@@ -55,6 +55,10 @@ Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
 Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
 Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
 The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
+The API-key store records each request once and refuses a settlement that would exceed the key limit.
+This check runs after work completes, so it does not reserve funds before an in-flight request.
+Use a payment authorization flow when the product requires a strict pre-run budget.
+The usage store writes USD values as integer nanodollars instead of SQL floating-point values.
 
 Production requires either `x402.verifySigner` or `verifyApiKey`.
 API-key-only apps can omit `x402` entirely.

@@ -1231,6 +1231,37 @@ describe('POST /:slug/chat/completions — injection blocking', () => {
 })
 
 describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
+  it('passes the verified API-key owner to private-workspace authorization', async () => {
+    let ownerId: string | undefined
+    const { app } = buildHarness({
+      verifyApiKey: async (): Promise<ApiKeyInfo> => ({
+        keyId: 'key-user-a',
+        consumerId: 'apikey:key-user-a',
+        ownerId: 'user-a',
+        scopes: ['chat'],
+      }),
+      authorizeConsumer: async (_agent, consumer) => {
+        ownerId = consumer.ownerId
+        return ownerId === 'user-a'
+          ? { allow: true }
+          : { allow: false, reason: 'wrong owner', code: 'wrong_owner' }
+      },
+    })
+
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer user-a-key',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'private work' }] }),
+    })
+
+    expect(response.status).toBe(200)
+    await readSse(response)
+    expect(ownerId).toBe('user-a')
+  })
+
   it('passes the validated thread id to host authorization before sandbox lookup', async () => {
     let authorizedThread: string | undefined
     const { app } = buildHarness({
@@ -1363,6 +1394,31 @@ describe('POST /:slug/chat/completions — authorizeConsumer hook', () => {
     expect(res.status).toBe(200)
     await readSse(res)
     expect(paymentAuthorizations).toBe(1)
+  })
+})
+
+describe('POST /:slug/chat/completions — malformed input', () => {
+  it.each([
+    null,
+    [],
+    { messages: 'not-an-array' },
+    { messages: [{}] },
+    { messages: [{ role: 'user', content: 42 }] },
+    { messages: [{ role: 'unknown', content: 'hello' }] },
+  ])('returns 400 instead of throwing for %j', async (body) => {
+    const { app } = buildHarness()
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_input',
+      },
+      body: JSON.stringify(body),
+    })
+
+    expect(response.status).toBe(400)
+    expect((await response.json() as { error: { type: string } }).error.type)
+      .toBe('invalid_request')
   })
 })
 

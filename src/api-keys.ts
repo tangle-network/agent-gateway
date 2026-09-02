@@ -58,7 +58,7 @@ export interface ApiKeyStore {
 
   delete(userId: string, keyId: string): Promise<boolean>
 
-  recordUsage(keyId: string, costCents: number): Promise<void>
+  recordUsage(keyId: string, costCents: number, requestId?: string): Promise<void>
 }
 
 const API_KEY_CONSUMER_PREFIX = 'apikey:'
@@ -94,7 +94,11 @@ export function createApiKeyUsageSettlement(
     }
     const keyId = payment.consumerId.slice(API_KEY_CONSUMER_PREFIX.length)
     if (!keyId) throw new TypeError('API key settlement key id is missing')
-    await store.recordUsage(keyId, apiKeySettlementCostCents(costUsd))
+    await store.recordUsage(
+      keyId,
+      apiKeySettlementCostCents(costUsd),
+      payment.requestId,
+    )
   }
 }
 

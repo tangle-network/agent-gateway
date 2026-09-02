@@ -265,6 +265,8 @@ export interface GatewayConfig {
       method: PaymentMethod
       consumerId: string
       keyId?: string
+      /** Verified server-side API-key owner. Never accept this from the request body. */
+      ownerId?: string
       requestId: string
       /** Requested stable conversation id, after syntax validation. */
       threadId?: string

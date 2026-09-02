@@ -78,6 +78,7 @@ export {
   type ApiKeyRoutesConfig,
 } from './api-keys'
 export {
+  ApiKeySpendingLimitExceededError,
   SqlApiKeyStore,
   sqlApiKeyStoreSchemaStatements,
   type SqlApiKeyStoreOptions,
@@ -85,6 +86,7 @@ export {
 export {
   SqlGatewayUsageStore,
   sqlGatewayUsageStoreSchemaStatements,
+  usdToNanodollars,
   type SqlGatewayUsageStoreOptions,
 } from './usage-store-sql'
 export {
@@ -144,6 +146,7 @@ export {
   d1ToSqlAdapter,
   sqlTaskStoreSchemaStatements,
   type SqlAdapter,
+  type SqlTaskStoreOptions,
   SqlTaskStore,
 } from './a2a/task-store-sql'
 export {

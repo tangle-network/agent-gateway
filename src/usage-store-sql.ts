@@ -22,16 +22,27 @@ export function sqlGatewayUsageStoreSchemaStatements(
       reasoning_tokens INTEGER,
       tool_tokens INTEGER,
       tool_call_count INTEGER,
-      provider_cost_usd REAL,
-      total_cost_usd REAL NOT NULL,
-      owner_earned_usd REAL NOT NULL,
-      platform_fee_usd REAL NOT NULL,
-      duration_ms INTEGER NOT NULL,
+      provider_cost_nanodollars BIGINT,
+      total_cost_nanodollars BIGINT NOT NULL,
+      owner_earned_nanodollars BIGINT NOT NULL,
+      platform_fee_nanodollars BIGINT NOT NULL,
+      duration_ms BIGINT NOT NULL,
       settlement_basis TEXT,
-      created_at INTEGER NOT NULL
+      created_at BIGINT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_${table}_agent ON ${table} (agent_id, created_at)`,
   ]
+}
+
+export function usdToNanodollars(value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new TypeError('USD amount must be finite and non-negative')
+  }
+  const nanodollars = Math.round(value * 1_000_000_000)
+  if (!Number.isSafeInteger(nanodollars)) {
+    throw new TypeError('USD amount exceeds the nanodollar range')
+  }
+  return nanodollars
 }
 
 /** Durable, retry-safe storage for gateway usage attribution. */
@@ -58,7 +69,8 @@ export class SqlGatewayUsageStore {
       `INSERT INTO ${this.table} (
         request_id, agent_id, agent_slug, consumer_id, payment_method,
         input_tokens, output_tokens, reasoning_tokens, tool_tokens, tool_call_count,
-        provider_cost_usd, total_cost_usd, owner_earned_usd, platform_fee_usd,
+        provider_cost_nanodollars, total_cost_nanodollars,
+        owner_earned_nanodollars, platform_fee_nanodollars,
         duration_ms, settlement_basis, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(request_id) DO UPDATE SET
@@ -71,10 +83,10 @@ export class SqlGatewayUsageStore {
         reasoning_tokens = excluded.reasoning_tokens,
         tool_tokens = excluded.tool_tokens,
         tool_call_count = excluded.tool_call_count,
-        provider_cost_usd = excluded.provider_cost_usd,
-        total_cost_usd = excluded.total_cost_usd,
-        owner_earned_usd = excluded.owner_earned_usd,
-        platform_fee_usd = excluded.platform_fee_usd,
+        provider_cost_nanodollars = excluded.provider_cost_nanodollars,
+        total_cost_nanodollars = excluded.total_cost_nanodollars,
+        owner_earned_nanodollars = excluded.owner_earned_nanodollars,
+        platform_fee_nanodollars = excluded.platform_fee_nanodollars,
         duration_ms = excluded.duration_ms,
         settlement_basis = excluded.settlement_basis`,
       [
@@ -88,10 +100,10 @@ export class SqlGatewayUsageStore {
         event.reasoningTokens ?? null,
         event.toolTokens ?? null,
         event.toolCallCount ?? null,
-        event.providerCostUsd ?? null,
-        event.totalCostUsd,
-        event.ownerEarnedUsd,
-        event.platformFeeUsd,
+        event.providerCostUsd === undefined ? null : usdToNanodollars(event.providerCostUsd),
+        usdToNanodollars(event.totalCostUsd),
+        usdToNanodollars(event.ownerEarnedUsd),
+        usdToNanodollars(event.platformFeeUsd),
         event.durationMs,
         event.settlementBasis ?? null,
         Math.floor(Date.now() / 1_000),

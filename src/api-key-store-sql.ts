@@ -18,16 +18,24 @@ interface ApiKeyRow {
   created_at: number
 }
 
+interface ApiKeyUsageRow {
+  request_id: string
+  key_id: string
+  cost_cents: number | string | bigint
+}
+
 type PublicApiKeyRow = Omit<ApiKeyRow, 'key_hash'>
 
 export interface SqlApiKeyStoreOptions {
   table?: string
+  usageTable?: string
 }
 
 export function sqlApiKeyStoreSchemaStatements(
   options: SqlApiKeyStoreOptions = {},
-): readonly [string, string, string] {
+): readonly string[] {
   const table = requireSqlIdentifier(options.table ?? 'agent_api_key')
+  const usageTable = requireSqlIdentifier(options.usageTable ?? `${table}_usage`)
   return [
     `CREATE TABLE IF NOT EXISTS ${table} (
       id TEXT PRIMARY KEY,
@@ -38,14 +46,22 @@ export function sqlApiKeyStoreSchemaStatements(
       scopes TEXT NOT NULL,
       rate_limit INTEGER NOT NULL,
       daily_limit INTEGER NOT NULL,
-      spending_limit_cents INTEGER,
-      spent_cents INTEGER NOT NULL DEFAULT 0,
-      last_used_at INTEGER,
-      expires_at INTEGER,
-      created_at INTEGER NOT NULL
+      spending_limit_cents BIGINT,
+      spent_cents BIGINT NOT NULL DEFAULT 0,
+      last_used_at BIGINT,
+      expires_at BIGINT,
+      created_at BIGINT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table} (user_id, created_at)`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_hash ON ${table} (key_hash)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_hash_unique ON ${table} (key_hash)`,
+    `CREATE TABLE IF NOT EXISTS ${usageTable} (
+      request_id TEXT PRIMARY KEY,
+      key_id TEXT NOT NULL,
+      cost_cents BIGINT NOT NULL,
+      created_at BIGINT NOT NULL,
+      FOREIGN KEY (key_id) REFERENCES ${table}(id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_${usageTable}_key ON ${usageTable} (key_id, created_at)`,
   ]
 }
 
@@ -92,17 +108,25 @@ function publicRowToApiKey(row: PublicApiKeyRow): Omit<ApiKey, 'keyHash'> {
 /** Durable API-key storage for D1, SQLite, libSQL, and compatible SQL drivers. */
 export class SqlApiKeyStore implements ApiKeyStore {
   private readonly table: string
+  private readonly usageTable: string
 
   constructor(
     private readonly db: SqlAdapter,
     options: SqlApiKeyStoreOptions = {},
   ) {
     this.table = requireSqlIdentifier(options.table ?? 'agent_api_key')
+    this.usageTable = requireSqlIdentifier(options.usageTable ?? `${this.table}_usage`)
+    if (this.table === this.usageTable) {
+      throw new TypeError('API key and usage table names must differ')
+    }
   }
 
   /** Idempotent. Call once during deployment. */
   async migrate(): Promise<void> {
-    for (const statement of sqlApiKeyStoreSchemaStatements({ table: this.table })) {
+    for (const statement of sqlApiKeyStoreSchemaStatements({
+      table: this.table,
+      usageTable: this.usageTable,
+    })) {
       await this.db.exec(statement)
     }
   }
@@ -154,11 +178,18 @@ export class SqlApiKeyStore implements ApiKeyStore {
 
   async list(userId: string): Promise<Omit<ApiKey, 'keyHash'>[]> {
     const rows = await this.db.query<PublicApiKeyRow>(
-      `SELECT id, user_id, name, key_prefix, scopes, rate_limit, daily_limit,
-        spending_limit_cents, spent_cents, last_used_at, expires_at, created_at
-       FROM ${this.table}
-       WHERE user_id = ?
-       ORDER BY created_at DESC`,
+      `SELECT k.id, k.user_id, k.name, k.key_prefix, k.scopes, k.rate_limit, k.daily_limit,
+        k.spending_limit_cents,
+        k.spent_cents + COALESCE((
+          SELECT SUM(u.cost_cents) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+        ), 0) AS spent_cents,
+        COALESCE((
+          SELECT MAX(u.created_at) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+        ), k.last_used_at) AS last_used_at,
+        k.expires_at, k.created_at
+       FROM ${this.table} AS k
+       WHERE k.user_id = ?
+       ORDER BY k.created_at DESC`,
       [userId],
     )
     return rows.map(publicRowToApiKey)
@@ -166,10 +197,17 @@ export class SqlApiKeyStore implements ApiKeyStore {
 
   async findByHash(keyHash: string): Promise<ApiKey | null> {
     const rows = await this.db.query<ApiKeyRow>(
-      `SELECT id, user_id, name, key_hash, key_prefix, scopes, rate_limit, daily_limit,
-        spending_limit_cents, spent_cents, last_used_at, expires_at, created_at
-       FROM ${this.table}
-       WHERE key_hash = ?
+      `SELECT k.id, k.user_id, k.name, k.key_hash, k.key_prefix, k.scopes,
+        k.rate_limit, k.daily_limit, k.spending_limit_cents,
+        k.spent_cents + COALESCE((
+          SELECT SUM(u.cost_cents) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+        ), 0) AS spent_cents,
+        COALESCE((
+          SELECT MAX(u.created_at) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+        ), k.last_used_at) AS last_used_at,
+        k.expires_at, k.created_at
+       FROM ${this.table} AS k
+       WHERE k.key_hash = ?
        LIMIT 1`,
       [keyHash],
     )
@@ -184,18 +222,85 @@ export class SqlApiKeyStore implements ApiKeyStore {
     return result.rowsAffected > 0
   }
 
-  async recordUsage(keyId: string, costCents: number): Promise<void> {
+  async recordUsage(keyId: string, costCents: number, requestId?: string): Promise<void> {
     if (!Number.isSafeInteger(costCents) || costCents < 0) {
       throw new TypeError('API key usage cost must be a non-negative integer number of cents')
     }
-    const result = await this.db.exec(
-      `UPDATE ${this.table}
-       SET spent_cents = spent_cents + ?, last_used_at = ?
-       WHERE id = ?`,
-      [costCents, Math.floor(Date.now() / 1_000), keyId],
-    )
-    if (result.rowsAffected !== 1) {
-      throw new Error('API key no longer exists')
+    const usageRequestId = requestId ?? crypto.randomUUID()
+    if (!usageRequestId || usageRequestId.length > 128) {
+      throw new TypeError('API key usage request id must contain 1 to 128 characters')
     }
+    const createdAt = Math.floor(Date.now() / 1_000)
+    const result = await this.db.exec(
+      `INSERT INTO ${this.usageTable} (request_id, key_id, cost_cents, created_at)
+       SELECT ?, k.id, ?, ?
+       FROM ${this.table} AS k
+       WHERE k.id = ?
+         AND (
+           k.spending_limit_cents IS NULL OR
+           k.spent_cents + COALESCE((
+             SELECT SUM(u.cost_cents) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+           ), 0) + ? <= k.spending_limit_cents
+         )
+       ON CONFLICT(request_id) DO NOTHING`,
+      [usageRequestId, costCents, createdAt, keyId, costCents],
+    )
+    if (result.rowsAffected === 1) return
+
+    const existing = (await this.db.query<ApiKeyUsageRow>(
+      `SELECT request_id, key_id, cost_cents FROM ${this.usageTable} WHERE request_id = ?`,
+      [usageRequestId],
+    ))[0]
+    if (existing) {
+      if (
+        existing.key_id === keyId
+        && sqlSafeInteger(existing.cost_cents, 'cost_cents') === costCents
+      ) return
+      throw new Error('API key usage request id was reused with different usage')
+    }
+
+    const key = (await this.db.query<{
+      spending_limit_cents: number | null
+      spent_cents: number
+    }>(
+      `SELECT k.spending_limit_cents,
+        k.spent_cents + COALESCE((
+          SELECT SUM(u.cost_cents) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
+        ), 0) AS spent_cents
+       FROM ${this.table} AS k WHERE k.id = ?`,
+      [keyId],
+    ))[0]
+    if (!key) throw new Error('API key no longer exists')
+    if (key.spending_limit_cents === null) {
+      throw new Error('API key usage could not be recorded')
+    }
+    throw new ApiKeySpendingLimitExceededError(
+      keyId,
+      key.spending_limit_cents,
+      key.spent_cents,
+      costCents,
+    )
+  }
+}
+
+function sqlSafeInteger(value: number | string | bigint, column: string): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(parsed)) {
+    throw new TypeError(`${column} must be a safe integer`)
+  }
+  return parsed
+}
+
+export class ApiKeySpendingLimitExceededError extends Error {
+  readonly code = 'api_key.spending_limit_exceeded'
+
+  constructor(
+    readonly keyId: string,
+    readonly spendingLimitCents: number | null,
+    readonly spentCents: number,
+    readonly requestedCents: number,
+  ) {
+    super(`API key spending limit would be exceeded for key ${keyId}`)
+    this.name = 'ApiKeySpendingLimitExceededError'
   }
 }

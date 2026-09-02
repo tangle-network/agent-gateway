@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 
+import { isChatMessageArray } from './chat-input'
 import { createA2AHandlers } from './a2a/handler'
 import { InMemoryTaskStore } from './a2a/task-store'
 import {
@@ -258,17 +259,29 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
       )
     }
 
-    let body: ChatCompletionRequest
+    let input: unknown
     try {
-      body = await c.req.json()
+      input = await c.req.json()
     } catch {
       return c.json({ error: { message: 'Invalid JSON', type: 'invalid_request' } }, 400)
     }
-    if (!body.messages?.length) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return c.json({ error: { message: 'JSON object required', type: 'invalid_request' } }, 400)
+    }
+    const body = input as Partial<ChatCompletionRequest>
+    if (!isChatMessageArray(body.messages)) {
       return c.json(
-        { error: { message: 'messages array required', type: 'invalid_request' } },
+        {
+          error: {
+            message: 'messages must be a non-empty array of role/content objects',
+            type: 'invalid_request',
+          },
+        },
         400,
       )
+    }
+    if (body.stream !== undefined && typeof body.stream !== 'boolean') {
+      return c.json({ error: { message: 'stream must be a boolean', type: 'invalid_request' } }, 400)
     }
 
     const guard = await authenticateAndGuard(

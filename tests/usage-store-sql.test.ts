@@ -77,6 +77,35 @@ describe('SqlGatewayUsageStore', () => {
     }
   })
 
+  it('stores money as exact integer nanodollars instead of lossy SQL REAL values', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = new SqlGatewayUsageStore(sqliteAdapter(db))
+      await store.migrate()
+      await store.recordUsage(usage({
+        providerCostUsd: 123_456.789_123,
+        totalCostUsd: 123_456.789_123,
+        ownerEarnedUsd: 123_456.789_123,
+        platformFeeUsd: 0,
+      }))
+
+      const row = db.prepare(`SELECT
+        provider_cost_nanodollars,
+        total_cost_nanodollars,
+        owner_earned_nanodollars,
+        platform_fee_nanodollars
+        FROM agent_gateway_usage WHERE request_id = ?`).get('request-1') as Record<string, number>
+      expect(row).toEqual({
+        provider_cost_nanodollars: 123_456_789_123_000,
+        total_cost_nanodollars: 123_456_789_123_000,
+        owner_earned_nanodollars: 123_456_789_123_000,
+        platform_fee_nanodollars: 0,
+      })
+    } finally {
+      db.close()
+    }
+  })
+
   it('isolates custom tables and rejects unsafe identifiers', async () => {
     const db = new DatabaseSync(':memory:')
     try {
