@@ -54,6 +54,7 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
         ...inputConfig,
         x402: { operatorAddress: '', chainId: 0 },
       }
+  const a2aConfig = config.a2a === false ? undefined : config.a2a
   // Production gateways must verify x402 signatures. Tests and local
   // dev can opt into the explicit demo path.
   if (!isX402AuthEnabled(config) && !config.verifyApiKey) {
@@ -75,6 +76,21 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   ) {
     throw new Error(
       'createAgentGateway: defaultOutputTokens must be a positive integer no greater than maxOutputTokens',
+    )
+  }
+  if (
+    config.unauthenticatedInputTokenBound !== undefined &&
+    (!Number.isSafeInteger(config.unauthenticatedInputTokenBound) ||
+      config.unauthenticatedInputTokenBound < 0)
+  ) {
+    throw new Error(
+      'createAgentGateway: unauthenticatedInputTokenBound must be a non-negative safe integer',
+    )
+  }
+  if (config.inputTokenBound && isX402AuthEnabled(config) &&
+      config.unauthenticatedInputTokenBound === undefined) {
+    throw new Error(
+      'createAgentGateway: inputTokenBound requires unauthenticatedInputTokenBound for x402 authentication',
     )
   }
   if (
@@ -122,9 +138,9 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
   }
   if (
-    config.a2a?.pushStore &&
+    a2aConfig?.pushStore &&
     !config.x402.demoMode &&
-    (!config.a2a.webhookSecret || config.a2a.webhookSecret.trim().length === 0)
+    (!a2aConfig.webhookSecret || a2aConfig.webhookSecret.trim().length === 0)
   ) {
     throw new Error('createAgentGateway: production A2A push requires a webhookSecret')
   }
@@ -398,29 +414,31 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   // Both surfaces share authenticateAndGuard + dispatchSandboxStream +
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
-  const pushStore = config.a2a?.pushStore
-  try {
-    // Do not create process-local state for production A2A.
-    if (!config.x402.demoMode && !config.a2a?.taskStore) {
-      throw new Error('A2A production requires an explicitly configured atomic task store')
+  if (config.a2a !== false) {
+    const pushStore = a2aConfig?.pushStore
+    try {
+      // Do not create process-local state for production A2A.
+      if (!config.x402.demoMode && !a2aConfig?.taskStore) {
+        throw new Error('A2A production requires an explicitly configured atomic task store')
+      }
+      const taskStore = a2aConfig?.taskStore ?? new InMemoryTaskStore()
+      const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
+      gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
+      gw.post('/:slug', a2a.handleJsonRpc)
+    } catch (error) {
+      // A missing or older custom store must not take down the OpenAI surface.
+      // Keep A2A unavailable until its owner supplies atomic methods.
+      console.error(
+        '[agent-gateway] A2A is unavailable until its task store is configured with atomic methods:',
+        error instanceof Error ? error.message : String(error),
+      )
+      const unavailable = (c: import('hono').Context) => c.json(
+        { error: 'A2A task persistence is not configured for concurrent workers' },
+        503,
+      )
+      gw.get('/:slug/.well-known/agent.json', unavailable)
+      gw.post('/:slug', unavailable)
     }
-    const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
-    const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
-    gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
-    gw.post('/:slug', a2a.handleJsonRpc)
-  } catch (error) {
-    // A missing or older custom store must not take down the OpenAI surface.
-    // Keep A2A unavailable until its owner supplies atomic methods.
-    console.error(
-      '[agent-gateway] A2A is unavailable until its task store is configured with atomic methods:',
-      error instanceof Error ? error.message : String(error),
-    )
-    const unavailable = (c: import('hono').Context) => c.json(
-      { error: 'A2A task persistence is not configured for concurrent workers' },
-      503,
-    )
-    gw.get('/:slug/.well-known/agent.json', unavailable)
-    gw.post('/:slug', unavailable)
   }
 
   return gw

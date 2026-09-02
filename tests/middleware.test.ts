@@ -1531,6 +1531,34 @@ describe('createAgentGateway — production-config guard', () => {
     })).not.toThrow()
   })
 
+  it('does not mount or warn about A2A when explicitly disabled', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      const gateway = createAgentGateway({
+        resolveAgent: async () => null,
+        getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
+        recordUsage: async () => { /* unused */ },
+        x402: { operatorAddress, chainId: 3799, demoMode: true },
+        a2a: false,
+      })
+      const app = new Hono()
+      app.route('/v1/agents', gateway)
+
+      const card = await app.request('/v1/agents/test-agent/.well-known/agent.json')
+      const rpc = await app.request('/v1/agents/test-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+
+      expect(card.status).toBe(404)
+      expect(rpc.status).toBe(404)
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
   it('boots when verifySigner is supplied (production path)', () => {
     expect(() => createAgentGateway({
       resolveAgent: async () => null,
