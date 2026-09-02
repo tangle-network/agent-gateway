@@ -9,25 +9,26 @@
 - Credential files: GitHub trusted publishing and npm provenance workflow
 
 ## Local State
-- Branch: origin/main (tag source)
-- Commit: 2896b2e (merged 0.8.10 release)
-- Dirty files: clean at release tag
-- Gates planned: focused failure tests, full typecheck/test/build, PR review, npm version proof
+- Branch: chore/release-agent-gateway-0.8.14-20260902
+- Commit: 5095f58 (merged partial provider receipt preservation)
+- Dirty files: clean at release start
+- Gates planned: version-only diff, full typecheck/test/build, PR review, npm version proof
 
 ## Remote State
 - Host/provider: GitHub Actions + npm trusted publishing
-- Current live artifact: @tangle-network/agent-gateway@0.8.10
-- Current service status: tag workflow 33542264053 completed successfully; verify and publish-npm passed
-- Last smoke result: `npm view @tangle-network/agent-gateway version dist-tags --json` returned version/latest `0.8.10`
+- Current live artifact: @tangle-network/agent-gateway@0.8.13
+- Current service status: merged source is 5095f58; release workflow runs from an exact v0.8.14 tag
+- Last smoke result: pending this release
 
 ## Decision
 - Build path: tag-triggered GitHub Actions publish
 - Reason: repository workflow owns verification, provenance, and npm publication
-- Expected duration: minutes after merge and tag push; completed in under two minutes
-- Fallback/rollback: retain v0.8.8; diagnose and retry only after a failed v0.8.10 workflow
+- Expected duration: minutes after merge and tag push
+- Fallback/rollback: retain v0.8.13; diagnose and retry only after a failed v0.8.14 workflow
 
 ## Timeline
-- 2026-09-01: confirmed branch starts at origin/main v0.8.8; implementation and release verification in progress
+- 2026-09-01: confirmed release branch starts at origin/main 5095f58, version 0.8.13
+- 2026-09-01: local typecheck, 26 test files / 439 tests, and build passed on Node 24.13.0
 - 2026-09-01: PR #24 merged as b39a117 after verify passed; release target is 0.8.9
 - 2026-09-01: v0.8.9 tag run 33541628022 failed because PR #25 server-owned IDs invalidated the new preallocated-id test; npm publication was skipped
 - 2026-09-01: PR #27 merged as c008808; corrected test passes 389/389 and release target is 0.8.10
