@@ -86,7 +86,11 @@ function mount(config: GatewayConfig): Hono {
 }
 
 function requestBody(message = 'run') {
-  return JSON.stringify({ max_tokens: 4, messages: [{ role: 'user', content: message }] })
+  return JSON.stringify({
+    max_tokens: 4,
+    messages: [{ role: 'user', content: message }],
+    stream: true,
+  })
 }
 
 function pendingMppRecovery(

@@ -189,6 +189,11 @@ export interface ApiKeyInfo {
   dailyLimit?: number
 }
 
+/** Resolve the URL where a caller can obtain an API key for one agent. */
+export type ApiKeyPurchaseUrl =
+  | string
+  | ((slug: string) => string | undefined)
+
 /** Durable result for one accepted API-key request. */
 export interface ApiKeyRequestClaimResult {
   allowed: boolean
@@ -223,9 +228,8 @@ export interface SandboxStreamEvent {
      * Optional sandbox-side signal that the agent has paused and is waiting
      * for additional input from the caller. The A2A gateway translates this
      * into an `input-required` task status; the caller can then submit a
-     * follow-up `message/send` with the same `taskId` to continue. Ignored
-     * by the OpenAI-compat path. Carry an optional `prompt` to surface to
-     * the caller (rendered as the input-required message body).
+     * follow-up `message/send` with the same `taskId` to continue. The
+     * OpenAI-compat path renders an optional `prompt` in the assistant body.
      */
     inputRequired?: { prompt?: string }
     /** Provider receipt fields. Version 2 operations require every field. */
@@ -344,6 +348,13 @@ export interface GatewayConfig {
 
   /** Base URL for API key purchase links (e.g. "https://film.tangle.tools") */
   baseUrl?: string
+
+  /**
+   * Override the API-key purchase URL shown in payment errors.
+   * A string is used as-is; a function receives the agent slug.
+   * Without this override, `baseUrl` keeps its historical `/agents/{slug}/api-keys` path.
+   */
+  apiKeyPurchaseUrl?: ApiKeyPurchaseUrl
 
   /** Public API key prefix shown by discovery. Defaults to `sk_agent_`. */
   apiKeyPrefix?: string
@@ -520,4 +531,23 @@ export interface ChatCompletionChunk {
     delta: { content?: string; role?: string }
     finish_reason: string | null
   }>
+}
+
+export interface ChatCompletionUsage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+}
+
+export interface ChatCompletion {
+  id: string
+  object: 'chat.completion'
+  created: number
+  model: string
+  choices: Array<{
+    index: number
+    message: { role: 'assistant'; content: string }
+    finish_reason: string | null
+  }>
+  usage: ChatCompletionUsage
 }

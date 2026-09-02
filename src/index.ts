@@ -135,8 +135,11 @@ export type {
   CreateAgentGatewayConfig,
   GatewayConfig,
   ChatMessage,
+  ChatCompletion,
+  ChatCompletionUsage,
   ChatCompletionRequest,
   ChatCompletionChunk,
+  ApiKeyPurchaseUrl,
 } from './types'
 
 // --- A2A protocol surface (Google Agent-to-Agent) ---

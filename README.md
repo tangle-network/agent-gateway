@@ -109,6 +109,8 @@ The asynchronous callback runs after payment authentication and `authorizeConsum
 It receives the verified consumer, API-key owner, and `threadId` when one exists.
 The gateway recomputes the execution budget and rejects an underfunded payment before claiming it.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
+OpenAI chat requests return a JSON `chat.completion` by default; set `stream: true` for SSE chunks.
+Set `apiKeyPurchaseUrl` to override the API-key purchase link in payment errors; without it, `baseUrl` keeps the `/agents/{slug}/api-keys` default.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
 Requests with a version 2 operation or generic MPP charge reject missing receipts.
