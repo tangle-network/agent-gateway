@@ -10,7 +10,11 @@
  */
 
 import { Hono } from 'hono'
-import type { PaymentResult } from './types'
+import type {
+  ApiKeyRequestClaimInput,
+  ApiKeyRequestClaimResult,
+  PaymentResult,
+} from './types'
 
 // --- Types ---
 
@@ -21,8 +25,8 @@ export interface ApiKey {
   keyHash: string
   keyPrefix: string
   scopes: string[]
-  rateLimit: number      // requests per minute
-  dailyLimit: number     // requests per day
+  rateLimit: number      // requests per rolling minute
+  dailyLimit: number     // requests per UTC day
   spendingLimitCents: number | null  // max spend in cents (null = unlimited)
   spentCents: number     // running total spent
   lastUsedAt: Date | null
@@ -59,6 +63,13 @@ export interface ApiKeyStore {
   delete(userId: string, keyId: string): Promise<boolean>
 
   recordUsage(keyId: string, costCents: number, requestId?: string): Promise<void>
+
+  /** Atomically count one request against the key's minute and daily limits. */
+  claimRequest?(
+    keyId: string,
+    requestId: string,
+    requestedAt?: Date,
+  ): Promise<ApiKeyRequestClaimResult>
 }
 
 const API_KEY_CONSUMER_PREFIX = 'apikey:'
@@ -99,6 +110,35 @@ export function createApiKeyUsageSettlement(
       apiKeySettlementCostCents(costUsd),
       payment.requestId,
     )
+  }
+}
+
+/** Connect a durable API-key store to the gateway request-claim callback. */
+export function createApiKeyRequestClaim(
+  store: { claimRequest: NonNullable<ApiKeyStore['claimRequest']> },
+): (input: ApiKeyRequestClaimInput) => Promise<ApiKeyRequestClaimResult> {
+  return (input) => store.claimRequest(
+    input.keyInfo.keyId,
+    input.requestId,
+    input.requestedAt,
+  )
+}
+
+export class ApiKeyRequestLimitExceededError extends Error {
+  readonly code = 'api_key.request_limit_exceeded'
+
+  constructor(readonly claim: ApiKeyRequestClaimResult) {
+    super(`API key ${claim.reason ?? 'request'} limit exceeded`)
+    this.name = 'ApiKeyRequestLimitExceededError'
+  }
+}
+
+export class ApiKeyRequestClaimUnavailableError extends Error {
+  readonly code = 'api_key.request_claim_unavailable'
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ApiKeyRequestClaimUnavailableError'
   }
 }
 

@@ -218,6 +218,39 @@ describe('A2A — AgentCard discovery', () => {
     expect(card.authentication.schemes).toEqual(expect.arrayContaining(['x402', 'mpp', 'Bearer']))
   })
 
+  it('advertises only Bearer when payment transports are disabled', async () => {
+    const agent = makeAgent()
+    const gateway = createAgentGateway({
+      resolveAgent: async () => agent,
+      getSandbox: async () => new StubSandbox(['ok']),
+      recordUsage: async () => undefined,
+      verifyApiKey: async () => ({
+        keyId: 'key-1',
+        consumerId: 'apikey:key-1',
+        scopes: ['chat'],
+      }),
+      claimApiKeyRequest: async () => ({
+        allowed: true,
+        minuteRemaining: 1,
+        dailyRemaining: 1,
+        minuteResetAt: Date.now() + 60_000,
+        dailyResetAt: Date.now() + 86_400_000,
+      }),
+      a2a: {
+        taskStore: new InMemoryTaskStore(),
+        authorizeTaskAccess: async () => true,
+      },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', gateway)
+
+    const response = await app.request('/v1/agents/test-agent/.well-known/agent.json')
+    const card = await response.json() as AgentCard
+
+    expect(response.status).toBe(200)
+    expect(card.authentication.schemes).toEqual(['Bearer'])
+  })
+
   it('uses AgentMeta.skills + description when provided; synthesizes defaults otherwise', async () => {
     const richAgent = makeAgent({
       description: 'A red-team adversary that audits other agents',
@@ -581,6 +614,41 @@ describe('A2A — message/stream', () => {
 })
 
 describe('A2A — authenticated sandbox context', () => {
+  it('enforces the same durable API-key request claim as OpenAI chat', async () => {
+    const harness = buildHarness({
+      verifyApiKey: async () => ({
+        keyId: 'limited-key',
+        consumerId: 'apikey:limited-key',
+        scopes: ['chat'],
+        dailyLimit: 1,
+      }),
+      claimApiKeyRequest: async () => ({
+        allowed: false,
+        reason: 'daily',
+        minuteRemaining: 10,
+        dailyRemaining: 0,
+        minuteResetAt: Date.now() + 60_000,
+        dailyResetAt: Date.now() + 86_400_000,
+      }),
+    })
+
+    const response = await postJsonRpc(
+      harness.app,
+      'test-agent',
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: { message: textMessage('do not run') },
+      },
+      apiKeyHeader(),
+    )
+
+    expect(response.status).toBe(429)
+    expect(response.headers.get('X-RateLimit-Daily-Remaining')).toBe('0')
+    expect(harness.usage).toHaveLength(0)
+  })
+
   it('passes task identity and authenticated context to send and stream adapters', async () => {
     const contexts: Array<GatewaySandboxContext | undefined> = []
     const authorizedThreads: Array<string | undefined> = []

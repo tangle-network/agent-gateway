@@ -11,6 +11,10 @@
  */
 
 import type { Context } from 'hono'
+import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from '../api-keys'
 
 import {
   type AuthorizedRequest,
@@ -454,7 +458,7 @@ async function claimTaskPayment(
         )
       },
     })
-  } catch {
+  } catch (claimError) {
     let recoveryTask = paymentTask
     try {
       recoveryTask = await retainPaymentRecoveryMarker(
@@ -494,6 +498,34 @@ async function claimTaskPayment(
       console.error(
         `[a2a] failed to persist payment-failed task ${task.id}:`,
         taskError instanceof Error ? taskError.message : String(taskError),
+      )
+    }
+    if (claimError instanceof ApiKeyRequestLimitExceededError) {
+      const resetAt = claimError.claim.reason === 'daily'
+        ? claimError.claim.dailyResetAt
+        : claimError.claim.minuteResetAt
+      const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
+      return c.json(
+        fail(
+          req.id,
+          A2A_ERROR_CODES.INTERNAL_ERROR,
+          `API key ${claimError.claim.reason} request limit exceeded`,
+        ),
+        {
+          status: 429,
+          headers: {
+            'Retry-After': String(retryAfterSeconds),
+            'X-Request-Id': authz.requestId,
+            'X-RateLimit-Remaining': String(claimError.claim.minuteRemaining),
+            'X-RateLimit-Daily-Remaining': String(claimError.claim.dailyRemaining),
+          },
+        },
+      )
+    }
+    if (claimError instanceof ApiKeyRequestClaimUnavailableError) {
+      return c.json(
+        fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'API key request limits are unavailable'),
+        { status: 503, headers: { 'X-Request-Id': authz.requestId } },
       )
     }
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))

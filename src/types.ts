@@ -189,6 +189,24 @@ export interface ApiKeyInfo {
   dailyLimit?: number
 }
 
+/** Durable result for one accepted API-key request. */
+export interface ApiKeyRequestClaimResult {
+  allowed: boolean
+  /** The exhausted policy when `allowed` is false. */
+  reason?: 'minute' | 'daily'
+  minuteRemaining: number
+  dailyRemaining: number
+  minuteResetAt: number
+  dailyResetAt: number
+}
+
+/** Identity supplied to the durable API-key request counter. */
+export interface ApiKeyRequestClaimInput {
+  keyInfo: ApiKeyInfo
+  requestId: string
+  requestedAt: Date
+}
+
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
@@ -299,6 +317,14 @@ export interface GatewayConfig {
    * Production gateways must provide this callback.
    */
   verifyApiKey?: (authHeader: string) => Promise<ApiKeyInfo | null>
+
+  /**
+   * Atomically count an accepted API-key request before compute starts.
+   * Required when `verifyApiKey` returns a `dailyLimit`.
+   */
+  claimApiKeyRequest?: (
+    input: ApiKeyRequestClaimInput,
+  ) => Promise<ApiKeyRequestClaimResult>
 
   /**
    * Settle a legacy payment after usage attribution is recorded.
