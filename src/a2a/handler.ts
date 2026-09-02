@@ -459,6 +459,13 @@ async function claimTaskPayment(
       },
     })
   } catch (claimError) {
+    const apiKeyFailure = apiKeyClaimFailureResponse(c, req, authz, claimError)
+    if (apiKeyFailure && !paymentFailureTask) {
+      // This task id has not left the request yet, and API-key admission owns
+      // no payment recovery state. Do not retain one task per rejected call.
+      await deps.taskStore.delete(task.id)
+      return apiKeyFailure
+    }
     let recoveryTask = paymentTask
     try {
       recoveryTask = await retainPaymentRecoveryMarker(
@@ -500,34 +507,7 @@ async function claimTaskPayment(
         taskError instanceof Error ? taskError.message : String(taskError),
       )
     }
-    if (claimError instanceof ApiKeyRequestLimitExceededError) {
-      const resetAt = claimError.claim.reason === 'daily'
-        ? claimError.claim.dailyResetAt
-        : claimError.claim.minuteResetAt
-      const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
-      return c.json(
-        fail(
-          req.id,
-          A2A_ERROR_CODES.INTERNAL_ERROR,
-          `API key ${claimError.claim.reason} request limit exceeded`,
-        ),
-        {
-          status: 429,
-          headers: {
-            'Retry-After': String(retryAfterSeconds),
-            'X-Request-Id': authz.requestId,
-            'X-RateLimit-Remaining': String(claimError.claim.minuteRemaining),
-            'X-RateLimit-Daily-Remaining': String(claimError.claim.dailyRemaining),
-          },
-        },
-      )
-    }
-    if (claimError instanceof ApiKeyRequestClaimUnavailableError) {
-      return c.json(
-        fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'API key request limits are unavailable'),
-        { status: 503, headers: { 'X-Request-Id': authz.requestId } },
-      )
-    }
+    if (apiKeyFailure) return apiKeyFailure
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))
   }
 
@@ -562,6 +542,43 @@ async function claimTaskPayment(
       fail(req.id, A2A_ERROR_CODES.INVALID_PARAMS, `task '${task.id}' changed during payment confirmation`),
     )
   }
+}
+
+function apiKeyClaimFailureResponse(
+  c: Context,
+  req: JSONRPCRequest,
+  authz: AuthorizedRequest,
+  error: unknown,
+): Response | undefined {
+  if (error instanceof ApiKeyRequestLimitExceededError) {
+    const resetAt = error.claim.reason === 'daily'
+      ? error.claim.dailyResetAt
+      : error.claim.minuteResetAt
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
+    return c.json(
+      fail(
+        req.id,
+        A2A_ERROR_CODES.INTERNAL_ERROR,
+        `API key ${error.claim.reason} request limit exceeded`,
+      ),
+      {
+        status: 429,
+        headers: {
+          'Retry-After': String(retryAfterSeconds),
+          'X-Request-Id': authz.requestId,
+          'X-RateLimit-Remaining': String(error.claim.minuteRemaining),
+          'X-RateLimit-Daily-Remaining': String(error.claim.dailyRemaining),
+        },
+      },
+    )
+  }
+  if (error instanceof ApiKeyRequestClaimUnavailableError) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'API key request limits are unavailable'),
+      { status: 503, headers: { 'X-Request-Id': authz.requestId } },
+    )
+  }
+  return undefined
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

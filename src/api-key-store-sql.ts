@@ -27,6 +27,7 @@ interface ApiKeyUsageRow {
 
 interface ApiKeyRequestStateRow {
   key_id: string
+  claim_sequence: number | string | bigint
   reference_at: number | string | bigint
   day_bucket: number | string | bigint
   rate_limit: number | string | bigint
@@ -43,6 +44,8 @@ export interface SqlApiKeyStoreOptions {
   usageTable?: string
   requestTable?: string
 }
+
+const REQUEST_CLAIM_PRUNE_INTERVAL = 256
 
 export function sqlApiKeyStoreSchemaStatements(
   options: SqlApiKeyStoreOptions = {},
@@ -313,6 +316,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
       if (inserted.rowsAffected === 1) {
         const claim = await this.readRequestClaim(requestId)
         if (!claim) throw new Error('API key request claim was not readable after insert')
+        await this.maybePruneRequestClaims(claim)
         return requestClaimResult(claim, true)
       }
 
@@ -392,7 +396,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
 
   private async readRequestClaim(requestId: string): Promise<ApiKeyRequestStateRow | undefined> {
     return (await this.db.query<ApiKeyRequestStateRow>(
-      `SELECT r.key_id, r.created_at AS reference_at, r.day_bucket,
+      `SELECT r.key_id, r.claim_sequence, r.created_at AS reference_at, r.day_bucket,
         k.rate_limit, k.daily_limit,
         COALESCE((
           SELECT COUNT(*) FROM ${this.requestTable} AS recent
@@ -423,7 +427,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
     dayBucket: number,
   ): Promise<ApiKeyRequestStateRow | undefined> {
     return (await this.db.query<ApiKeyRequestStateRow>(
-      `SELECT k.id AS key_id, ? AS reference_at, ? AS day_bucket,
+      `SELECT k.id AS key_id, 0 AS claim_sequence, ? AS reference_at, ? AS day_bucket,
         k.rate_limit, k.daily_limit,
         COALESCE((
           SELECT COUNT(*) FROM ${this.requestTable} AS recent
@@ -448,6 +452,25 @@ export class SqlApiKeyStore implements ApiKeyStore {
         keyId,
       ],
     ))[0]
+  }
+
+  private async maybePruneRequestClaims(claim: ApiKeyRequestStateRow): Promise<void> {
+    const sequence = sqlSafeInteger(claim.claim_sequence, 'claim_sequence')
+    if (sequence % REQUEST_CLAIM_PRUNE_INTERVAL !== 0) return
+    const dayBucket = sqlSafeInteger(claim.day_bucket, 'day_bucket')
+    try {
+      await this.db.exec(
+        `DELETE FROM ${this.requestTable}
+         WHERE key_id = ? AND day_bucket < ?`,
+        [claim.key_id, dayBucket - 1],
+      )
+    } catch (error) {
+      // Cleanup never changes admission correctness. A later interval retries.
+      console.error(
+        `[agent-gateway] API key request cleanup failed for ${claim.key_id}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
   }
 }
 

@@ -615,6 +615,10 @@ describe('A2A — message/stream', () => {
 
 describe('A2A — authenticated sandbox context', () => {
   it('enforces the same durable API-key request claim as OpenAI chat', async () => {
+    const taskStore = new ServerAssignedTaskStore(
+      new InMemoryTaskStore(),
+      'rate-limited-task',
+    )
     const harness = buildHarness({
       verifyApiKey: async () => ({
         keyId: 'limited-key',
@@ -630,6 +634,7 @@ describe('A2A — authenticated sandbox context', () => {
         minuteResetAt: Date.now() + 60_000,
         dailyResetAt: Date.now() + 86_400_000,
       }),
+      a2a: { taskStore },
     })
 
     const response = await postJsonRpc(
@@ -647,6 +652,8 @@ describe('A2A — authenticated sandbox context', () => {
     expect(response.status).toBe(429)
     expect(response.headers.get('X-RateLimit-Daily-Remaining')).toBe('0')
     expect(harness.usage).toHaveLength(0)
+    expect(taskStore.serverAssignedId).toBeTruthy()
+    await expect(taskStore.get('rate-limited-task')).resolves.toBeUndefined()
   })
 
   it('passes task identity and authenticated context to send and stream adapters', async () => {

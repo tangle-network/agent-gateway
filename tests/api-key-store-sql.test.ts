@@ -176,6 +176,41 @@ describe('SqlApiKeyStore', () => {
     }
   })
 
+  it('bounds stored request claims while retaining the current and prior UTC day', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = await createStore(db)
+      const key = await createKey(
+        store,
+        'user-1',
+        'retention-hash',
+        500,
+        { rateLimit: 300, dailyLimit: 300 },
+      )
+      await store.claimRequest(key.id, 'old-request', new Date('2026-09-01T12:00:00.000Z'))
+      await Promise.all(Array.from(
+        { length: 255 },
+        (_, index) => store.claimRequest(
+          key.id,
+          `current-request-${index}`,
+          new Date('2026-09-03T12:00:00.000Z'),
+        ),
+      ))
+
+      const old = db.prepare(
+        'SELECT request_id FROM agent_api_key_request WHERE request_id = ?',
+      ).all('old-request')
+      const current = db.prepare(
+        'SELECT COUNT(*) AS count FROM agent_api_key_request WHERE key_id = ?',
+      ).get(key.id) as { count: number }
+
+      expect(old).toEqual([])
+      expect(current.count).toBe(255)
+    } finally {
+      db.close()
+    }
+  })
+
   it('deduplicates retries by request id and rejects changed retry data', async () => {
     const db = new DatabaseSync(':memory:')
     try {

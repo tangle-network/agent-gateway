@@ -45,7 +45,10 @@ export async function claimPayment(
     }
     const claimRequest = config.claimApiKeyRequest
     if (!claimRequest) {
-      if (authz.keyInfo?.dailyLimit !== undefined) {
+      if (
+        authz.keyInfo.rateLimitPerMinute !== undefined ||
+        authz.keyInfo.dailyLimit !== undefined
+      ) {
         throw new ApiKeyRequestClaimUnavailableError(
           'API key request limits are not configured',
         )

@@ -1078,6 +1078,13 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     }
     const { app } = buildHarness({
       verifyApiKey: async (auth) => (auth === 'Bearer ak_goodkey' ? customKey : null),
+      claimApiKeyRequest: async () => ({
+        allowed: true,
+        minuteRemaining: 29,
+        dailyRemaining: 999,
+        minuteResetAt: Date.now() + 60_000,
+        dailyResetAt: Date.now() + 86_400_000,
+      }),
     })
     const ok = await app.request('/v1/agents/test-agent/chat/completions', {
       method: 'POST',
@@ -1143,6 +1150,27 @@ describe('POST /:slug/chat/completions — auth paths', () => {
         consumerId: 'apikey:k-unconfigured',
         scopes: ['chat'],
         dailyLimit: 10,
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ak_unconfigured' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'do not run' }] }),
+    })
+
+    expect(response.status).toBe(503)
+    expect((await response.json() as { error: { code: string } }).error.code)
+      .toBe('api_key.request_claim_unavailable')
+    expect(sandbox.receivedPrompt).toBeNull()
+  })
+
+  it('fails closed when a verified minute limit has no durable request counter', async () => {
+    const { app, sandbox } = buildHarness({
+      verifyApiKey: async () => ({
+        keyId: 'k-unconfigured-minute',
+        consumerId: 'apikey:k-unconfigured-minute',
+        scopes: ['chat'],
+        rateLimitPerMinute: 10,
       }),
     })
     const response = await app.request('/v1/agents/test-agent/chat/completions', {

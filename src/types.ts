@@ -320,7 +320,7 @@ export interface GatewayConfig {
 
   /**
    * Atomically count an accepted API-key request before compute starts.
-   * Required when `verifyApiKey` returns a `dailyLimit`.
+   * Required when `verifyApiKey` returns a minute or daily request limit.
    */
   claimApiKeyRequest?: (
     input: ApiKeyRequestClaimInput,
