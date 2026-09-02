@@ -299,6 +299,13 @@ export interface GatewayConfig {
    */
   recordUsage: (event: GatewayUsageEvent) => Promise<void>
 
+  /**
+   * Keep the gateway task alive after the HTTP client disconnects.
+   * Pass a Worker execution context's `waitUntil` method here.
+   * When omitted, disconnecting aborts sandbox work.
+   */
+  continueOnDisconnect?: (task: Promise<void>) => void
+
   /** x402 payment configuration */
   x402: X402Config
 

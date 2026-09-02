@@ -87,6 +87,12 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
       'createAgentGateway: unauthenticatedInputTokenBound must be a non-negative safe integer',
     )
   }
+  if (
+    config.continueOnDisconnect !== undefined &&
+    typeof config.continueOnDisconnect !== 'function'
+  ) {
+    throw new Error('createAgentGateway: continueOnDisconnect must be a function')
+  }
   if (config.inputTokenBound && isX402AuthEnabled(config) &&
       config.unauthenticatedInputTokenBound === undefined) {
     throw new Error(
@@ -474,14 +480,21 @@ function streamChatCompletions(
     rateLimitRemaining,
     maxOutputTokens,
   } = authz
-  let outputText = ''
   let usage: import('./types').SandboxUsageReceipt | undefined
   let workObserved = false
+  let clientDisconnected = false
   const requestSignal = c.req.raw.signal
   const abortController = new AbortController()
   const abortFromRequest = () => abortController.abort()
-  if (requestSignal.aborted) abortFromRequest()
-  else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  const continueOnDisconnect = config.continueOnDisconnect
+  if (!continueOnDisconnect) {
+    if (requestSignal.aborted) abortFromRequest()
+    else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  }
+  let finishBackgroundTask!: () => void
+  const backgroundTask = new Promise<void>((resolve) => {
+    finishBackgroundTask = resolve
+  })
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -492,8 +505,7 @@ function streamChatCompletions(
     async start(controller) {
       const encoder = new TextEncoder()
       const sendChunk = (delta: string, role?: string) => {
-        if (controller.desiredSize === null) return
-        outputText += delta
+        if (clientDisconnected || controller.desiredSize === null) return
         const chunk: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -504,7 +516,7 @@ function streamChatCompletions(
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
       }
       const sendKeepalive = () => {
-        if (controller.desiredSize === null) return
+        if (clientDisconnected || controller.desiredSize === null) return
         controller.enqueue(encoder.encode(': keep-alive\n\n'))
       }
       const keepaliveTimer = setInterval(sendKeepalive, 15_000)
@@ -554,7 +566,7 @@ function streamChatCompletions(
           model: agent.slug,
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         }
-        if (controller.desiredSize !== null) {
+        if (!clientDisconnected && controller.desiredSize !== null) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         }
@@ -581,7 +593,11 @@ function streamChatCompletions(
             releaseError instanceof Error ? releaseError.message : String(releaseError),
           )
         }
-        if (!abortController.signal.aborted && controller.desiredSize !== null) {
+        if (
+          !clientDisconnected &&
+          !abortController.signal.aborted &&
+          controller.desiredSize !== null
+        ) {
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
@@ -590,14 +606,28 @@ function streamChatCompletions(
         }
       } finally {
         clearInterval(keepaliveTimer)
-        requestSignal.removeEventListener('abort', abortFromRequest)
-        if (controller.desiredSize !== null) controller.close()
+        if (!continueOnDisconnect) {
+          requestSignal.removeEventListener('abort', abortFromRequest)
+        }
+        finishBackgroundTask()
+        if (!clientDisconnected && controller.desiredSize !== null) controller.close()
       }
     },
     cancel() {
-      abortController.abort()
+      clientDisconnected = true
+      if (!continueOnDisconnect) abortController.abort()
     },
   })
+
+  if (continueOnDisconnect) {
+    try {
+      continueOnDisconnect(backgroundTask)
+    } catch (error) {
+      abortController.abort()
+      void stream.cancel()
+      throw error
+    }
+  }
 
   return new Response(stream, {
     headers: {

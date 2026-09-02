@@ -724,6 +724,72 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     expect(sandboxSignal?.aborted).toBe(true)
   })
 
+  it('records final usage after reader cancellation when background continuation is configured', async () => {
+    let sandboxSignal: AbortSignal | undefined
+    let releaseSandbox!: () => void
+    const mayFinish = new Promise<void>((resolve) => { releaseSandbox = resolve })
+    const backgroundTasks: Promise<void>[] = []
+    let sandboxFinished = false
+    const { app, usage } = buildHarness({
+      continueOnDisconnect: (task) => { backgroundTasks.push(task) },
+      getSandbox: async () => ({
+        async *streamPrompt(_message: string, opts?: { signal?: AbortSignal }) {
+          sandboxSignal = opts?.signal
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'partial' } }
+          await mayFinish
+          yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: ' complete' } }
+          yield {
+            type: 'sandbox.usage',
+            data: {
+              usage: {
+                inputTokens: 3,
+                outputTokens: 2,
+                reasoningTokens: 1,
+                toolTokens: 0,
+                toolCallCount: 0,
+                providerCostUsd: 0.00012,
+                budgetEnforced: true,
+              },
+            },
+          }
+          sandboxFinished = true
+        },
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer sk_agent_background',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const reader = response.body!.getReader()
+    const decoder = new TextDecoder()
+    let received = ''
+    while (!received.includes('partial')) {
+      const { value, done } = await reader.read()
+      if (done) break
+      received += decoder.decode(value)
+    }
+
+    expect(received).toContain('partial')
+    await reader.cancel()
+    releaseSandbox()
+    expect(backgroundTasks).toHaveLength(1)
+    await Promise.all(backgroundTasks)
+
+    expect(sandboxSignal?.aborted).toBe(false)
+    expect(sandboxFinished).toBe(true)
+    expect(usage).toHaveLength(1)
+    expect(usage[0]).toMatchObject({
+      inputTokens: 3,
+      outputTokens: 2,
+      reasoningTokens: 1,
+      providerCostUsd: 0.00012,
+    })
+  })
+
   it('releases a durable payment when cancellation wins after authorization but before sandbox start', async () => {
     const controller = new AbortController()
     const operations = new MemoryPaymentOperations()
