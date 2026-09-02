@@ -68,6 +68,8 @@ export {
   type RateLimitStore,
 } from './rate-limit'
 export {
+  apiKeySettlementCostCents,
+  createApiKeyUsageSettlement,
   createApiKeyRoutes,
   verifyApiKeyFromStore,
   type ApiKey,

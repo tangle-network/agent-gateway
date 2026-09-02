@@ -1,6 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Hono } from 'hono'
 import {
+  apiKeySettlementCostCents,
+  createApiKeyUsageSettlement,
   createApiKeyRoutes,
   verifyApiKeyFromStore,
   type ApiKey,
@@ -239,6 +241,34 @@ describe('createApiKeyRoutes — CRUD', () => {
     // Alice's key is still there
     const list = await (await app.request('/keys', { headers: { 'X-User': 'user_alice' } })).json() as { keys: unknown[] }
     expect(list.keys).toHaveLength(1)
+  })
+})
+
+describe('API key usage settlement', () => {
+  it('normalizes floating-point cents without undercounting real fractions', () => {
+    expect(apiKeySettlementCostCents(0)).toBe(0)
+    expect(apiKeySettlementCostCents(0.000_001)).toBe(1)
+    expect(apiKeySettlementCostCents(0.07)).toBe(7)
+    expect(apiKeySettlementCostCents(0.070_001)).toBe(8)
+  })
+
+  it('records the verified API key identity and rejects other payment identities', async () => {
+    const recordUsage = vi.fn(async () => undefined)
+    const settle = createApiKeyUsageSettlement({ recordUsage })
+
+    await settle({ method: 'apikey', consumerId: 'apikey:key-1', requestId: 'request-1' }, 0.07)
+    expect(recordUsage).toHaveBeenCalledWith('key-1', 7)
+
+    await expect(settle(
+      { method: 'x402', consumerId: 'apikey:key-1', requestId: 'request-2' },
+      0.01,
+    )).rejects.toThrow(/identity/)
+    await expect(settle(
+      { method: 'apikey', consumerId: 'apikey:', requestId: 'request-3' },
+      0.01,
+    )).rejects.toThrow(/key id/)
+    expect(() => apiKeySettlementCostCents(-1)).toThrow(/non-negative/)
+    expect(() => apiKeySettlementCostCents(Number.MAX_VALUE)).toThrow(/cents range/)
   })
 })
 

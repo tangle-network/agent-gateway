@@ -10,6 +10,7 @@
  */
 
 import { Hono } from 'hono'
+import type { PaymentResult } from './types'
 
 // --- Types ---
 
@@ -58,6 +59,43 @@ export interface ApiKeyStore {
   delete(userId: string, keyId: string): Promise<boolean>
 
   recordUsage(keyId: string, costCents: number): Promise<void>
+}
+
+const API_KEY_CONSUMER_PREFIX = 'apikey:'
+
+/** Convert a gateway USD settlement to the store's conservative whole cents. */
+export function apiKeySettlementCostCents(costUsd: number): number {
+  if (!Number.isFinite(costUsd) || costUsd < 0) {
+    throw new TypeError('API key settlement cost must be a non-negative USD amount')
+  }
+  const rawCents = costUsd * 100
+  const nearestCent = Math.round(rawCents)
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(rawCents)) * 4
+  const normalizedCents = Math.abs(rawCents - nearestCent) <= tolerance
+    ? nearestCent
+    : rawCents
+  const costCents = Math.ceil(normalizedCents)
+  if (!Number.isSafeInteger(costCents)) {
+    throw new TypeError('API key settlement cost exceeds the cents range')
+  }
+  return costCents
+}
+
+/** Build the gateway settlement callback for an API-key store. */
+export function createApiKeyUsageSettlement(
+  store: Pick<ApiKeyStore, 'recordUsage'>,
+): (payment: PaymentResult, costUsd: number) => Promise<void> {
+  return async (payment, costUsd) => {
+    if (
+      payment.method !== 'apikey'
+      || !payment.consumerId.startsWith(API_KEY_CONSUMER_PREFIX)
+    ) {
+      throw new TypeError('Unsupported API key settlement identity')
+    }
+    const keyId = payment.consumerId.slice(API_KEY_CONSUMER_PREFIX.length)
+    if (!keyId) throw new TypeError('API key settlement key id is missing')
+    await store.recordUsage(keyId, apiKeySettlementCostCents(costUsd))
+  }
 }
 
 // --- Key generation ---

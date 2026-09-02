@@ -14,6 +14,7 @@ npm install @tangle-network/agent-gateway
 ```ts
 import {
   createAgentGateway,
+  createApiKeyUsageSettlement,
   recoverPayments,
   SqlApiKeyStore,
   SqlGatewayUsageStore,
@@ -33,6 +34,7 @@ app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
   recordUsage: usageStore.recordUsage,
+  settlePayment: createApiKeyUsageSettlement(apiKeyStore),
   x402: {
     operatorAddress: '0x…',
     chainId: 3799,
