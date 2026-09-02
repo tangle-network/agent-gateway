@@ -97,13 +97,25 @@ describe('SqlApiKeyStore', () => {
       const store = await createStore(db)
       await createKey(store)
 
-      await Promise.all(Array.from({ length: 20 }, () => store.recordUsage('missing', 1)))
       const key = await store.findByHash('hash-1')
       await Promise.all(Array.from({ length: 20 }, () => store.recordUsage(key!.id, 3)))
 
       const updated = await store.findByHash('hash-1')
       expect(updated?.spentCents).toBe(60)
       expect(updated?.lastUsedAt).toBeInstanceOf(Date)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('rejects usage for a key deleted while its request was running', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = await createStore(db)
+      const key = await createKey(store)
+      await store.delete('user-1', key.id)
+
+      await expect(store.recordUsage(key.id, 1)).rejects.toThrow(/no longer exists/)
     } finally {
       db.close()
     }

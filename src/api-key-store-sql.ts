@@ -188,11 +188,14 @@ export class SqlApiKeyStore implements ApiKeyStore {
     if (!Number.isSafeInteger(costCents) || costCents < 0) {
       throw new TypeError('API key usage cost must be a non-negative integer number of cents')
     }
-    await this.db.exec(
+    const result = await this.db.exec(
       `UPDATE ${this.table}
        SET spent_cents = spent_cents + ?, last_used_at = ?
        WHERE id = ?`,
       [costCents, Math.floor(Date.now() / 1_000), keyId],
     )
+    if (result.rowsAffected !== 1) {
+      throw new Error('API key no longer exists')
+    }
   }
 }
