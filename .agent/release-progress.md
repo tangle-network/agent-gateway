@@ -5,26 +5,26 @@
 - Live URL: https://www.npmjs.com/package/@tangle-network/agent-gateway
 - Live service/process: npm package `@tangle-network/agent-gateway`
 - Artifact path: tag-triggered GitHub Actions publish workflow
-- Rollback artifact/path: retain v0.8.8; publish a follow-up patch if needed
+- Rollback artifact/path: retain v0.8.14; publish a follow-up patch if needed
 - Credential files: GitHub trusted publishing and npm provenance workflow
 
 ## Local State
-- Branch: chore/release-agent-gateway-0.8.14-20260902
-- Commit: 5095f58 (merged partial provider receipt preservation)
+- Branch: chore/release-agent-gateway-0.8.15-20260902
+- Commit: 90ed0fd (merged authorization fence and A2A opt-out)
 - Dirty files: clean at release start
 - Gates planned: version-only diff, full typecheck/test/build, PR review, npm version proof
 
 ## Remote State
 - Host/provider: GitHub Actions + npm trusted publishing
-- Current live artifact: @tangle-network/agent-gateway@0.8.13
-- Current service status: merged source is 5095f58; release workflow runs from an exact v0.8.14 tag
+- Current live artifact: @tangle-network/agent-gateway@0.8.14
+- Current service status: merged source is 90ed0fd; release workflow runs from an exact v0.8.15 tag
 - Last smoke result: pending this release
 
 ## Decision
 - Build path: tag-triggered GitHub Actions publish
 - Reason: repository workflow owns verification, provenance, and npm publication
 - Expected duration: minutes after merge and tag push
-- Fallback/rollback: retain v0.8.13; diagnose and retry only after a failed v0.8.14 workflow
+- Fallback/rollback: retain v0.8.14; diagnose and retry only after a failed v0.8.15 workflow
 
 ## Timeline
 - 2026-09-01: confirmed release branch starts at origin/main 5095f58, version 0.8.13
@@ -35,3 +35,6 @@
 - 2026-09-01: PR #28 merged as 2896b2e; tag v0.8.10 points to that SHA
 - 2026-09-01: workflow 33542264053 passed verification and trusted npm publication
 - 2026-09-01: npm registry returned version/latest 0.8.10 and tarball `https://registry.npmjs.org/@tangle-network/agent-gateway/-/agent-gateway-0.8.10.tgz`
+- 2026-09-02: PR #39 merged as 23d9f8a; async input bounds and the root pricing export landed
+- 2026-09-02: PR #40 merged as 90ed0fd; dynamic bounds now run after payment and consumer authorization, and `a2a: false` disables A2A routes
+- 2026-09-02: npm registry returned version/latest 0.8.14 before the 0.8.15 release
