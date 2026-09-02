@@ -363,7 +363,7 @@ describe('final payment boundary protocol guards', () => {
     const request = (app: Hono) => app.request('/v1/agents/guards/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('5') },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'mixed deploy' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'mixed deploy' }], stream: true }),
     })
     const legacyResponsePromise = request(legacy)
     await legacyEntered
@@ -430,7 +430,7 @@ describe('final payment boundary protocol guards', () => {
     const responses = await Promise.all(apps.map((app) => app.request('/v1/agents/guards/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('32') },
-      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }] }),
+      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }], stream: true }),
     })))
     await Promise.all(responses.map((response) => response.text()))
 
@@ -481,7 +481,7 @@ describe('final payment boundary protocol guards', () => {
     const request = () => app.request('/v1/agents/guards/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': paymentHeader('33') },
-      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }] }),
+      body: JSON.stringify({ max_tokens: 1, messages: [{ role: 'user', content: 'run once' }], stream: true }),
     })
     const requests = [request(), request()]
     await sandboxStarted

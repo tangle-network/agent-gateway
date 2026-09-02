@@ -31,6 +31,7 @@ import {
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import type {
   ChatCompletionChunk,
+  ChatCompletion,
   ChatCompletionRequest,
   CreateAgentGatewayConfig,
   GatewayConfig,
@@ -412,7 +413,9 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
       )
     }
 
-    return streamChatCompletions(c, authz, config, obs)
+    return body.stream === true
+      ? streamChatCompletions(c, authz, config, obs)
+      : completeChatCompletion(c, authz, config, obs)
   })
 
   // --- A2A protocol surface (Google Agent-to-Agent, JSON-RPC 2.0 + AgentCard) ---
@@ -459,6 +462,227 @@ export namespace createAgentGateway {
   export const paymentProtocolVersion = 2 as const
 }
 
+interface ChatCompletionRun {
+  text: string
+  usage: import('./types').SandboxUsageReceipt
+}
+
+interface ChatCompletionCallbacks {
+  onText?: (delta: string) => void
+  onActivity?: () => void
+  onUsage?: (usage: import('./types').SandboxUsageReceipt) => void
+}
+
+const DEFAULT_INPUT_REQUIRED_MESSAGE = 'Additional input is required.'
+
+function inputRequiredMessage(prompt?: string): string {
+  const trimmed = prompt?.trim()
+  return trimmed || DEFAULT_INPUT_REQUIRED_MESSAGE
+}
+
+/** Consume one sandbox run and normalize its output for both OpenAI modes. */
+async function runChatCompletion(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  signal: AbortSignal,
+  callbacks: ChatCompletionCallbacks = {},
+): Promise<ChatCompletionRun> {
+  let text = ''
+  let usage: import('./types').SandboxUsageReceipt | undefined
+
+  for await (const event of dispatchSandboxStreamRich(
+    authz.agent,
+    authz.userMessage,
+    authz.consumerId,
+    config,
+    signal,
+    authz.threadId,
+    authz.maxOutputTokens,
+    () => beginPaymentExecution(authz, config),
+    authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
+    async () => {
+      if (authz.paymentRecoveryId) callbacks.onActivity?.()
+      await markPaymentExecutionStarted(authz, config)
+    },
+    authz.executionBudget.maxInputTokens,
+    () => renewPaymentExecution(authz, config),
+    buildGatewaySandboxContext(authz),
+  )) {
+    if (event.kind === 'text') {
+      text += event.delta
+      callbacks.onActivity?.()
+      callbacks.onText?.(event.delta)
+    } else if (event.kind === 'input-required') {
+      const prompt = inputRequiredMessage(event.prompt)
+      const delta = text.length > 0 ? `\n\n${prompt}` : prompt
+      text += delta
+      callbacks.onActivity?.()
+      callbacks.onText?.(delta)
+    } else if (event.kind === 'activity') {
+      callbacks.onActivity?.()
+    } else {
+      usage = event.usage
+      callbacks.onUsage?.(usage)
+    }
+  }
+
+  if (!usage) throw new Error('sandbox did not provide a usage receipt')
+  return { text, usage }
+}
+
+function safeCompletionErrorMessage(error: unknown): string {
+  const rawMessage = error instanceof Error ? error.message : String(error)
+  // Never expose stack traces or absolute paths from sandbox internals.
+  return rawMessage.includes('/') || rawMessage.includes('\\')
+    ? 'Internal agent error'
+    : rawMessage
+}
+
+function completionHeaders(
+  authz: AuthorizedRequest,
+  paymentSettled: boolean,
+): Record<string, string> {
+  const {
+    agent,
+    paymentMethod,
+    requestId,
+    rateLimitRemaining,
+  } = authz
+  return {
+    'X-Request-Id': requestId,
+    'X-Agent-Slug': agent.slug,
+    'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
+    ...(authz.threadId ? { 'X-Tangle-Thread-Id': authz.threadId } : {}),
+    'X-Payment-Method': paymentMethod,
+    'X-Payment-Settled': paymentSettled
+      ? 'true'
+      : paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
+    ...(authz.mppChargeOperation
+      ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
+      : {}),
+    ...(authz.paymentRecoveryId
+      ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
+      : {}),
+    ...(rateLimitRemaining !== undefined
+      ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
+      : {}),
+  }
+}
+
+async function reportCompletionError(
+  obs: GatewayObserver | undefined,
+  ctx: RequestContext,
+  consumerId: string,
+  error: unknown,
+): Promise<void> {
+  try {
+    await obs?.onStreamError?.(ctx, {
+      consumerId,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    })
+  } catch (observerError) {
+    console.error(
+      `[agent-gateway] stream observer failed for ${ctx.requestId}:`,
+      observerError instanceof Error ? observerError.message : String(observerError),
+    )
+  }
+}
+
+async function releaseCompletionAfterFailure(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  error: unknown,
+  workObserved: boolean,
+  usage: import('./types').SandboxUsageReceipt | undefined,
+): Promise<void> {
+  try {
+    await releasePaymentAfterFailure(
+      authz,
+      config,
+      error instanceof Error ? error.message : String(error),
+      workObserved || usage !== undefined,
+    )
+  } catch (releaseError) {
+    console.error(
+      `[agent-gateway] payment release failed for ${authz.requestId}:`,
+      releaseError instanceof Error ? releaseError.message : String(releaseError),
+    )
+  }
+}
+
+async function completeChatCompletion(
+  c: import('hono').Context,
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  obs: GatewayObserver | undefined,
+): Promise<Response> {
+  let usage: import('./types').SandboxUsageReceipt | undefined
+  let workObserved = false
+  const requestSignal = c.req.raw.signal
+  const abortController = new AbortController()
+  const abortFromRequest = () => abortController.abort()
+  const continueOnDisconnect = config.continueOnDisconnect
+  if (!continueOnDisconnect) {
+    if (requestSignal.aborted) abortFromRequest()
+    else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  }
+  const ctx: RequestContext = {
+    requestId: authz.requestId,
+    agentSlug: authz.agent.slug,
+    startMs: authz.startMs,
+  }
+
+  try {
+    const completion = await runChatCompletion(authz, config, abortController.signal, {
+      onText: () => { workObserved = true },
+      onActivity: () => { workObserved = true },
+      onUsage: (nextUsage) => { usage = nextUsage },
+    })
+    usage = completion.usage
+    await settleAndRecord(
+      authz.agent,
+      authz,
+      completion.usage,
+      config,
+      obs,
+    )
+
+    const response: ChatCompletion = {
+      id: `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: authz.agent.slug,
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: completion.text },
+        finish_reason: 'stop',
+      }],
+      usage: {
+        prompt_tokens: completion.usage.inputTokens,
+        completion_tokens: completion.usage.outputTokens,
+        total_tokens: completion.usage.inputTokens + completion.usage.outputTokens,
+      },
+    }
+    return c.json(response, {
+      headers: completionHeaders(authz, true),
+    })
+  } catch (error) {
+    await reportCompletionError(obs, ctx, authz.consumerId, error)
+    await releaseCompletionAfterFailure(authz, config, error, workObserved, usage)
+    return c.json(
+      { error: { message: safeCompletionErrorMessage(error), type: 'server_error' } },
+      {
+        status: 500,
+        headers: completionHeaders(authz, false),
+      },
+    )
+  } finally {
+    if (!continueOnDisconnect) {
+      requestSignal.removeEventListener('abort', abortFromRequest)
+    }
+  }
+}
+
 /**
  * Drain the sandbox stream into an OpenAI-shaped SSE response, settle the
  * payment, fire observer hooks. Identical pre-refactor behavior, just lifted
@@ -474,11 +698,7 @@ function streamChatCompletions(
   const {
     agent,
     consumerId,
-    paymentMethod,
     requestId,
-    userMessage,
-    rateLimitRemaining,
-    maxOutputTokens,
   } = authz
   let usage: import('./types').SandboxUsageReceipt | undefined
   let workObserved = false
@@ -523,33 +743,12 @@ function streamChatCompletions(
 
       try {
         sendChunk('', 'assistant')
-        for await (const event of dispatchSandboxStreamRich(
-          agent,
-          userMessage,
-          consumerId,
-          config,
-          abortController.signal,
-          authz.threadId,
-          maxOutputTokens,
-          () => beginPaymentExecution(authz, config),
-          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-          async () => {
-            if (authz.paymentRecoveryId) workObserved = true
-            await markPaymentExecutionStarted(authz, config)
-          },
-          authz.executionBudget.maxInputTokens,
-          () => renewPaymentExecution(authz, config),
-          buildGatewaySandboxContext(authz),
-        )) {
-          if (event.kind === 'text') {
-            sendChunk(event.delta)
-            workObserved = true
-          }
-          if (event.kind === 'activity') workObserved = true
-          if (event.kind === 'usage') usage = event.usage
-        }
-
-        if (!usage) throw new Error('sandbox did not provide a usage receipt')
+        const completion = await runChatCompletion(authz, config, abortController.signal, {
+          onText: sendChunk,
+          onActivity: () => { workObserved = true },
+          onUsage: (nextUsage) => { usage = nextUsage },
+        })
+        usage = completion.usage
 
         await settleAndRecord(
           agent,
@@ -571,28 +770,9 @@ function streamChatCompletions(
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         }
       } catch (err) {
-        const rawMessage = err instanceof Error ? err.message : String(err)
-        // Never expose stack traces / absolute paths from sandbox internals.
-        const safeMessage =
-          rawMessage.includes('/') || rawMessage.includes('\\')
-            ? 'Internal agent error'
-            : rawMessage
-        try {
-          await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
-        } catch (observerError) {
-          console.error(
-            `[agent-gateway] stream observer failed for ${requestId}:`,
-            observerError instanceof Error ? observerError.message : String(observerError),
-          )
-        }
-        try {
-          await releasePaymentAfterFailure(authz, config, rawMessage, workObserved || usage !== undefined)
-        } catch (releaseError) {
-          console.error(
-            `[agent-gateway] payment release failed for ${authz.requestId}:`,
-            releaseError instanceof Error ? releaseError.message : String(releaseError),
-          )
-        }
+        const safeMessage = safeCompletionErrorMessage(err)
+        await reportCompletionError(obs, ctx, consumerId, err)
+        await releaseCompletionAfterFailure(authz, config, err, workObserved, usage)
         if (
           !clientDisconnected &&
           !abortController.signal.aborted &&
@@ -633,21 +813,7 @@ function streamChatCompletions(
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'X-Request-Id': requestId,
-      'X-Agent-Slug': agent.slug,
-      'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
-      ...(authz.threadId ? { 'X-Tangle-Thread-Id': authz.threadId } : {}),
-      'X-Payment-Method': paymentMethod,
-      'X-Payment-Settled': paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
-      ...(authz.mppChargeOperation
-        ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
-        : {}),
-      ...(authz.paymentRecoveryId
-        ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
-        : {}),
-      ...(rateLimitRemaining !== undefined
-        ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
-        : {}),
+      ...completionHeaders(authz, false),
     },
   })
 }

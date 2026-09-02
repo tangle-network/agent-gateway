@@ -26,6 +26,15 @@ import {
   verifyX402,
 } from './verify'
 
+function apiKeyPurchaseUrl(config: GatewayConfig, slug: string): string | undefined {
+  const configured = config.apiKeyPurchaseUrl
+  if (typeof configured === 'function') return configured(slug)
+  if (configured !== undefined) return configured
+  return config.baseUrl
+    ? `${config.baseUrl}/agents/${slug}/api-keys`
+    : undefined
+}
+
 /**
  * Resolve the agent, then run the full pre-dispatch pipeline: payment +
  * rate-limit + injection filter + user-message extraction + optional
@@ -318,9 +327,7 @@ export async function authenticateAndGuard(
           ...(isApiKeyAuthEnabled(config)
             ? {
                 api_key: {
-                  purchase_url: config.baseUrl
-                    ? `${config.baseUrl}/agents/${slug}/api-keys`
-                    : undefined,
+                  purchase_url: apiKeyPurchaseUrl(config, slug),
                 },
               }
             : {}),
