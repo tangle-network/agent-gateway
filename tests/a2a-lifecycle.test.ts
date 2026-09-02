@@ -378,38 +378,143 @@ describe('A2A lifecycle recovery and ownership', () => {
 })
 
 describe('A2A client disconnect cancellation', () => {
+  const delayedUsage = {
+    inputTokens: 1,
+    outputTokens: 1,
+    reasoningTokens: 0,
+    toolTokens: 0,
+    toolCallCount: 0,
+    providerCostUsd: 0.000002,
+    budgetEnforced: true,
+  }
+
+  class DetachedSandbox implements SandboxBox {
+    readonly id = 'sandbox-disconnect'
+    dispatchCount = 0
+    interruptCount = 0
+    readonly eventReads: Array<{ executionId?: string; since?: string }> = []
+    private readonly startedPromise: Promise<void>
+    private resolveStarted!: () => void
+    private resolveRelease!: () => void
+    private readonly releasePromise: Promise<void>
+    private events: SandboxStreamEvent[] = []
+    private executionId = ''
+    private interrupted = false
+    private done!: Promise<void>
+    private resolveDone!: () => void
+
+    constructor() {
+      this.startedPromise = new Promise((resolve) => { this.resolveStarted = resolve })
+      this.releasePromise = new Promise((resolve) => { this.resolveRelease = resolve })
+    }
+
+    async waitForStarted(): Promise<void> {
+      return this.startedPromise
+    }
+
+    release(): void {
+      this.resolveRelease()
+    }
+
+    async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
+      throw new Error('the test requires detached dispatch')
+    }
+
+    async dispatchPrompt(_message: string, opts?: { sessionId?: string; turnId?: string }) {
+      this.dispatchCount += 1
+      const sessionId = opts?.sessionId ?? 'session-disconnect'
+      this.executionId = `execution-${this.dispatchCount}`
+      this.events = []
+      this.interrupted = false
+      this.done = new Promise((resolve) => { this.resolveDone = resolve })
+      setTimeout(() => {
+        void (async () => {
+          this.events.push({
+            type: 'message.part.updated',
+            data: { part: { type: 'text' }, delta: 'started' },
+          })
+          this.resolveStarted()
+          await this.releasePromise
+          if (this.interrupted) {
+            this.events.push({ type: 'error', data: { message: 'canceled' } })
+          } else {
+            this.events.push({ type: 'sandbox.usage', data: { usage: delayedUsage } })
+          }
+          this.events.push({ type: 'done', data: { usage: delayedUsage } })
+          this.resolveDone()
+        })()
+      }, 0)
+      return {
+        sessionId,
+        executionId: this.executionId,
+        runControlRef: { environmentId: this.id, sessionId, executionId: this.executionId },
+      }
+    }
+
+    session(sessionId: string) {
+      return {
+        events: (opts?: { executionId?: string; since?: string; signal?: AbortSignal }) => {
+          this.eventReads.push({ executionId: opts?.executionId, since: opts?.since })
+          return this.readEvents(opts)
+        },
+        result: async ({ executionId } = {}) => {
+          if (executionId !== undefined && executionId !== this.executionId) {
+            return { success: false, status: 'failed', executionId, error: 'wrong execution' }
+          }
+          await this.done
+          return {
+            success: !this.interrupted,
+            status: this.interrupted ? 'canceled' : 'success',
+            executionId: this.executionId,
+            response: 'started',
+            usage: delayedUsage,
+          }
+        },
+        interrupt: async ({ executionId } = {}) => {
+          const cancelled = executionId === undefined || executionId === this.executionId
+          if (cancelled) {
+            this.interruptCount += 1
+            this.interrupted = true
+            this.resolveRelease()
+          }
+          return { cancelled }
+        },
+      }
+    }
+
+    private async *readEvents(opts?: { executionId?: string; since?: string; signal?: AbortSignal }) {
+      if (opts?.executionId !== undefined && opts.executionId !== this.executionId) return
+      let index = 0
+      while (true) {
+        if (opts?.signal?.aborted) return
+        if (index < this.events.length) yield this.events[index++]!
+        else if (this.events.at(-1)?.type === 'done' || this.events.at(-1)?.type === 'error') return
+        else await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+    }
+  }
+
   async function makeDisconnectHarness() {
     const taskStore = new InMemoryTaskStore()
-    let started!: () => void
-    let aborted!: () => void
-    const sandboxStarted = new Promise<void>((resolve) => { started = resolve })
-    const sandboxAborted = new Promise<void>((resolve) => { aborted = resolve })
-    const sandbox: SandboxBox = {
-      async *streamPrompt(_message, opts) {
-        const signal = opts?.signal
-        if (signal?.aborted) {
-          aborted()
-          return
-        }
-        signal?.addEventListener('abort', () => {
-          aborted()
-        }, { once: true })
-        started()
-        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'started' } }
-        await new Promise<void>((resolve) => {
-          signal?.addEventListener('abort', resolve, { once: true })
-        })
-      },
-    }
+    const sandbox = new DetachedSandbox()
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
       getSandbox: async () => sandbox,
     })))
-    return { app, sandboxStarted, sandboxAborted }
+    return { app, sandbox, taskStore }
   }
 
-  it('aborts sandbox work when the response reader disconnects', async () => {
-    const { app, sandboxStarted, sandboxAborted } = await makeDisconnectHarness()
+  async function waitForTaskState(taskStore: InMemoryTaskStore, id: string, state: Task['status']['state']) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const task = await taskStore.get(id)
+      if (task?.status.state === state) return task
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error(`task '${id}' did not reach '${state}'`)
+  }
+
+  it('keeps the detached run alive after the response reader disconnects', async () => {
+    const { app, sandbox, taskStore } = await makeDisconnectHarness()
     const response = await post(
       app,
       agentA.slug,
@@ -418,14 +523,62 @@ describe('A2A client disconnect cancellation', () => {
     )
     const reader = response.body!.getReader()
     const firstRead = reader.read()
-    await sandboxStarted
+    await sandbox.waitForStarted()
+    const taskId = response.headers.get('X-Task-Id')!
+    const executionMarker = (await taskStore.get(taskId))?.metadata?.gatewayExecution as Record<string, unknown>
+    expect(executionMarker).toMatchObject({
+      runControlRef: {
+        environmentId: sandbox.id,
+        sessionId: taskId,
+        executionId: 'execution-1',
+      },
+    })
     await reader.cancel()
-    await sandboxAborted
+    const resubscribe = await post(
+      app,
+      agentA.slug,
+      body('tasks/resubscribe', taskId),
+      { 'X-Payment-Signature': paymentHeader('907') },
+    )
+    const resubscribeTextPromise = resubscribe.text()
+    sandbox.release()
+    await waitForTaskState(taskStore, taskId, 'completed')
+    expect(sandbox.interruptCount).toBe(0)
+    expect(sandbox.dispatchCount).toBe(1)
+    const resubscribeText = await resubscribeTextPromise
+    expect(resubscribeText).toContain('"state":"completed"')
+    expect(sandbox.eventReads.filter(({ executionId }) => executionId === 'execution-1')).toHaveLength(2)
     await firstRead
   })
 
-  it('aborts sandbox work when the incoming request signal disconnects', async () => {
-    const { app, sandboxStarted, sandboxAborted } = await makeDisconnectHarness()
+  it('interrupts only the exact detached run for tasks/cancel', async () => {
+    const { app, sandbox, taskStore } = await makeDisconnectHarness()
+    const response = await post(
+      app,
+      agentA.slug,
+      body('message/stream'),
+      { 'X-Payment-Signature': paymentHeader('908') },
+    )
+    const reader = response.body!.getReader()
+    const firstRead = reader.read()
+    await sandbox.waitForStarted()
+    const taskId = response.headers.get('X-Task-Id')!
+    const cancel = await post(
+      app,
+      agentA.slug,
+      body('tasks/cancel', taskId),
+      { 'X-Payment-Signature': paymentHeader('909') },
+    )
+    const canceled = (await cancel.json()) as { result?: Task }
+    expect(canceled.result?.status.state).toBe('canceled')
+    expect(sandbox.interruptCount).toBe(1)
+    expect((await waitForTaskState(taskStore, taskId, 'canceled')).status.state).toBe('canceled')
+    await reader.cancel()
+    await firstRead
+  })
+
+  it('does not interrupt the run when the incoming request signal disconnects', async () => {
+    const { app, sandbox, taskStore } = await makeDisconnectHarness()
     const requestAbort = new AbortController()
     const request = new Request(`http://localhost/v1/agents/${agentA.slug}`, {
       method: 'POST',
@@ -439,10 +592,77 @@ describe('A2A client disconnect cancellation', () => {
     const response = await app.fetch(request)
     const reader = response.body!.getReader()
     const firstRead = reader.read()
-    await sandboxStarted
+    await sandbox.waitForStarted()
+    const taskId = response.headers.get('X-Task-Id')!
     requestAbort.abort()
-    await sandboxAborted
+    sandbox.release()
+    await waitForTaskState(taskStore, taskId, 'completed')
+    expect(sandbox.interruptCount).toBe(0)
     await reader.cancel()
     await firstRead
+  })
+
+  it('reconciles an expired detached run before tasks/get reports failure', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const recoverySandbox: SandboxBox = {
+      id: 'sandbox-recovery',
+      async *streamPrompt() {},
+      session: (sessionId) => ({
+        events: async function* () {},
+        result: async ({ executionId } = {}) => ({
+          success: true,
+          status: 'success',
+          executionId,
+          response: 'recovered',
+          usage: delayedUsage,
+        }),
+        interrupt: async ({ executionId } = {}) => ({ cancelled: executionId === 'execution-recovery' }),
+      }),
+    }
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
+      getSandbox: async () => recoverySandbox,
+    })))
+    const task: Task = {
+      kind: 'task',
+      id: 'task-expired-detached',
+      contextId: 'context-expired-detached',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      history: [message(undefined, 'recover this')],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agentA.id, agentSlug: agentA.slug },
+        gatewaySubmission: {
+          version: 1,
+          lease: { id: 'submission-expired-detached', expiresAt: Date.now() - 1 },
+          agentId: agentA.id,
+          agentSlug: agentA.slug,
+          requestId: 'request-expired-detached',
+          consumerId: 'consumer-recovery',
+        },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'request-expired-detached',
+          lease: { id: 'request-expired-detached', expiresAt: Date.now() - 1 },
+          runControlRef: {
+            environmentId: 'sandbox-recovery',
+            sessionId: 'session-recovery',
+            executionId: 'execution-recovery',
+          },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    const response = await post(
+      app,
+      agentA.slug,
+      body('tasks/get', task.id),
+    )
+    const recovered = (await response.json()) as { result?: Task }
+    expect(response.status).toBe(200)
+    expect(recovered.result?.status.state).toBe('completed')
+    expect(recovered.result?.artifacts?.[0]?.parts).toEqual([
+      { kind: 'text', text: 'recovered' },
+    ])
   })
 })

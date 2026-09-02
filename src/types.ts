@@ -190,6 +190,8 @@ export interface ApiKeyInfo {
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
+  /** Runtime event cursor used to resume a detached execution. */
+  id?: string
   type?: string
   data?: {
     part?: { type?: string; text?: string }
@@ -216,7 +218,44 @@ export interface SandboxStreamEvent {
   }
 }
 
+/** Exact identity accepted by the sandbox runtime for one execution. */
+export interface SandboxRunControlRef {
+  environmentId: string
+  sessionId: string
+  executionId: string
+}
+
+/** Result returned by a detached sandbox admission call. */
+export interface SandboxDispatchResult {
+  sessionId: string
+  executionId?: string
+  runControlRef?: SandboxRunControlRef
+}
+
+/** Terminal result for one exact detached sandbox execution. */
+export interface SandboxPromptResult {
+  success: boolean
+  status: string
+  executionId?: string
+  response?: string
+  error?: string
+  usage?: Partial<SandboxUsageReceipt>
+}
+
+/** Durable session controls exposed by the current sandbox SDK. */
+export interface SandboxDurableSession {
+  events: (opts?: {
+    since?: string
+    executionId?: string
+    signal?: AbortSignal
+  }) => AsyncIterable<SandboxStreamEvent>
+  result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
+  interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
+}
+
 export interface SandboxBox {
+  /** Stable sandbox/environment id from the provider, when available. */
+  id?: string
   streamPrompt(
     message: string,
     opts?: {
@@ -227,6 +266,20 @@ export interface SandboxBox {
       signal?: AbortSignal
     },
   ): AsyncIterable<SandboxStreamEvent>
+  /** Start one idempotent run and detach it from the caller's stream. */
+  dispatchPrompt?: (
+    message: string,
+    opts?: {
+      sessionId?: string
+      turnId?: string
+      systemPrompt?: string
+      maxOutputTokens?: number
+      executionBudget?: SandboxExecutionBudget
+      signal?: AbortSignal
+    },
+  ) => Promise<SandboxDispatchResult>
+  /** Resolve a lazy reference for one durable session. */
+  session?: (id: string) => SandboxDurableSession
 }
 
 /** Authenticated request identity supplied when the host resolves a sandbox. */

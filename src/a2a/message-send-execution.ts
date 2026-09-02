@@ -7,7 +7,11 @@ import {
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
-import { claimTaskExecution, renewTaskExecution } from './execution-fence'
+import {
+  attachTaskExecutionReference,
+  claimTaskExecution,
+  renewTaskExecution,
+} from './execution-fence'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
 import type { TaskStore } from './task-store'
 import { A2A_ERROR_CODES, type JSONRPCRequest, type Task } from './types'
@@ -52,10 +56,9 @@ export async function executeMessageSend(
   signal: AbortSignal,
 ): Promise<Response> {
   if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
-  const taskWithoutSubmission = clearTaskSubmission(task)
   let workingTask: Task = task.status.state === 'working'
-    ? taskWithoutSubmission
-    : { ...taskWithoutSubmission, status: { state: 'working', timestamp: nowIso() } }
+    ? task
+    : { ...task, status: { state: 'working', timestamp: nowIso() } }
   if (
     JSON.stringify(task) !== JSON.stringify(workingTask) &&
     !await compareAndSetTask(deps.taskStore, task, workingTask)
@@ -101,6 +104,18 @@ export async function executeMessageSend(
         await renewPaymentExecution(authz, deps.config)
       },
       buildGatewaySandboxContext(authz),
+      {
+        detached: true,
+        turnId: authz.requestId,
+        onExecutionAccepted: async (reference) => {
+          workingTask = await attachTaskExecutionReference(
+            deps.taskStore,
+            workingTask,
+            authz.requestId,
+            reference,
+          )
+        },
+      },
     )) {
       if (event.kind === 'text') {
         responseText += event.delta

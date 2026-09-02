@@ -17,10 +17,14 @@ import {
   type GatewayState,
   authenticateAndGuard,
   claimPayment,
+  estimateTokens,
 } from '../dispatch'
 import type {
+  AgentMeta,
   ChatMessage,
   GatewayConfig,
+  SandboxPromptResult,
+  SandboxUsageReceipt,
 } from '../types'
 import { buildAgentCard } from './agent-card'
 import {
@@ -28,6 +32,8 @@ import {
   hasExpiredTaskExecution,
   hasMalformedTaskExecution,
   inspectTaskExecution,
+  hasActiveTaskExecution,
+  readTaskExecutionReference,
 } from './execution-fence'
 import { executeMessageSend } from './message-send-execution'
 import { executeMessageStream } from './message-stream-execution'
@@ -36,7 +42,7 @@ import {
   type PushNotificationStore,
 } from './push-notifications'
 import { type TaskStore } from './task-store'
-import { extractTextFromMessage } from './translate'
+import { extractTextFromMessage, responseTextToArtifact } from './translate'
 import {
   A2A_ERROR_CODES,
   type JSONRPCRequest,
@@ -46,8 +52,10 @@ import {
 } from './types'
 import {
   attachPaymentRecoveryMarker,
+  clearPaymentRecoveryMarker,
   hasPaymentReleaseRecovery,
   preservePaymentRecoveryMarker,
+  readPaymentRecoveryMarker,
   releaseTaskPayment,
   recoverPaymentMarkerIfNeeded,
   recoverPaymentReleaseIfNeeded,
@@ -60,13 +68,13 @@ import {
 import {
   clearTaskSubmission,
   readTaskOrigin,
+  readTaskSubmission,
   recoverSubmissionIfNeeded,
   withTaskOrigin,
   withTaskSubmission,
 } from './task-submission-recovery'
 import { deliverTaskPush, type PushDeliveryDependencies } from './task-push-delivery'
 import {
-  bindRequestAbort,
   TaskCancellationRegistry,
 } from './task-cancellation'
 import {
@@ -77,6 +85,7 @@ import {
   handleTasksCancel,
   handleTasksGet,
   handleTasksResubscribe,
+  type TaskExecutionSource,
   type TaskMethodDependencies,
 } from './task-methods'
 import {
@@ -89,6 +98,7 @@ import {
 import {
   compareAndSetTask,
   cryptoRandomId,
+  agentMessage,
   isTerminal,
   shouldPreserveTask,
   nowIso,
@@ -128,6 +138,10 @@ function buildTaskMethodDependencies(
     recoverTask: (task, requestedAgentSlug) =>
       recoverTaskIfNeeded(task, deps, requestedAgentSlug),
     deliverPush: (task) => maybeDeliverPush(task, deps),
+    getTaskExecution: (task, requestedAgentSlug) =>
+      getTaskExecutionSource(task, deps, requestedAgentSlug),
+    reconcileTask: (task, requestedAgentSlug, allowActive) =>
+      reconcileTaskExecution(task, deps, requestedAgentSlug, allowActive),
   }
 }
 
@@ -236,7 +250,6 @@ async function handleMessageSend(
   const { authz, task } = guard
   setPaymentResponseHeaders(c, authz)
   const controller = cancels.register(task.id)
-  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const lifecycle = createTaskLifecycle(deps)
   try {
     return await executeMessageSend(
@@ -248,7 +261,6 @@ async function handleMessageSend(
       controller.signal,
     )
   } finally {
-    detachRequestAbort()
     cancels.clear(task.id)
   }
 }
@@ -668,20 +680,229 @@ async function recoverTaskIfNeeded(
     requestedAgentSlug,
   )
   const paymentRecovered = await recoverPaymentMarkerIfNeeded(finalized, lifecycle.payment)
-  const submissionRecovered = await recoverSubmissionIfNeeded(paymentRecovered, {
+  const executionRecovered = await recoverExpiredExecutionIfNeeded(
+    paymentRecovered,
+    deps,
+    requestedAgentSlug,
+  )
+  if (hasActiveTaskExecution(executionRecovered)) return executionRecovered
+  return recoverSubmissionIfNeeded(executionRecovered, {
     taskStore: deps.taskStore,
     deliverPush: lifecycle.finalization.deliverPush,
   })
-  return recoverExpiredExecutionIfNeeded(submissionRecovered, deps)
 }
 
-async function recoverExpiredExecutionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
+async function getTaskExecutionSource(
+  task: Task,
+  deps: A2AHandlerDeps,
+  requestedAgentSlug: string,
+): Promise<TaskExecutionSource | undefined> {
+  const reference = readTaskExecutionReference(task)
+  if (!reference) return undefined
+  const origin = readTaskOrigin(task)
+  const agent = await deps.config.resolveAgent(origin?.agentSlug ?? requestedAgentSlug)
+  if (!agent || !agent.enabled) throw new Error('A2A task execution agent is unavailable')
+  if (origin && origin.agentId !== agent.id) {
+    throw new Error('A2A task execution agent does not match task origin')
+  }
+  const box = await deps.config.getSandbox(agent)
+  const run = reference
+  if (box.id !== run.environmentId || typeof box.session !== 'function') {
+    throw new Error('A2A task execution sandbox reference is unavailable')
+  }
+  const session = box.session(run.sessionId)
+  if (
+    !session ||
+    typeof session.events !== 'function' ||
+    typeof session.result !== 'function' ||
+    typeof session.interrupt !== 'function'
+  ) throw new Error('A2A task execution session controls are unavailable')
+  return {
+    reference,
+    events: (options) => session.events({
+      ...(options ?? {}),
+      executionId: run.executionId,
+    }),
+    result: () => session.result({ executionId: run.executionId }),
+    interrupt: () => session.interrupt({ executionId: run.executionId }),
+  }
+}
+
+async function reconcileTaskExecution(
+  task: Task,
+  deps: A2AHandlerDeps,
+  requestedAgentSlug: string,
+  allowActive = false,
+): Promise<Task> {
+  if (
+    isTerminal(task.status.state) ||
+    task.status.state === 'input-required' ||
+    (hasActiveTaskExecution(task) && !allowActive)
+  ) return task
+  const source = await getTaskExecutionSource(task, deps, requestedAgentSlug)
+  if (!source) return task
+  const result = await source.result()
+  if (result.executionId !== undefined && result.executionId !== source.reference.executionId) {
+    throw new Error('A2A task execution result does not match its stored execution')
+  }
+  const current = await deps.taskStore.get(task.id) ?? task
+  if (isTerminal(current.status.state) || current.status.state === 'input-required') return current
+  if (readTaskExecutionReference(current)?.executionId !== source.reference.executionId) return current
+
+  const state = taskStateFromSandboxResult(result)
+  if (state === 'working') return current
+  if (state === 'failed' || state === 'canceled') {
+    const failed = withStatus(
+      current,
+      state,
+      result.error ? agentMessage(current, result.error) : undefined,
+    )
+    if (await compareAndSetTask(deps.taskStore, current, failed)) {
+      await maybeDeliverPush(failed, deps)
+      return failed
+    }
+    return await deps.taskStore.get(task.id) ?? failed
+  }
+
+  const usage = recoveredUsage(result)
+  const paymentRecoveryId = readPaymentRecoveryMarker(current)?.id
+  if (paymentRecoveryId) {
+    if (!deps.config.paymentRecovery) {
+      throw new Error('A2A durable payment recovery is unavailable')
+    }
+    const lifecycle = createTaskLifecycle(deps)
+    const recovered = await lifecycle.payment.recoverDurablePayment(paymentRecoveryId, {
+      force: true,
+      usage,
+    })
+    if (recovered?.state !== 'reconciled') {
+      throw new Error('A2A durable payment finalization is still pending')
+    }
+  } else {
+    const inspection = inspectTaskExecution(current)
+    if (inspection.state !== 'valid') return current
+    const agent = await deps.config.resolveAgent(readTaskOrigin(current)?.agentSlug ?? requestedAgentSlug)
+    if (!agent || !agent.enabled) throw new Error('A2A task execution agent is unavailable')
+    const authz = recoveredExecutionAuthz(current, inspection.marker.requestId, agent, deps.config)
+    const lifecycle = createTaskLifecycle(deps)
+    await lifecycle.finalization.settle(authz, usage)
+  }
+  const text = result.response ?? ''
+  const artifact = text
+    ? responseTextToArtifact(text, `${current.id}-artifact-0`)
+    : current.artifacts?.[0]
+  const next = withStatus(
+    clearPaymentRecoveryMarker(current),
+    state,
+    state === 'input-required' && result.error ? agentMessage(current, result.error) : undefined,
+    artifact ? [artifact] : current.artifacts,
+  )
+  if (await compareAndSetTask(deps.taskStore, current, next)) {
+    await maybeDeliverPush(next, deps)
+    return next
+  }
+  return await deps.taskStore.get(task.id) ?? next
+}
+
+function taskStateFromSandboxResult(result: SandboxPromptResult): Task['status']['state'] {
+  const status = result.status.toLowerCase()
+  if (result.success || status === 'success' || status === 'completed') return 'completed'
+  if (status === 'awaiting_question' || status === 'input-required' || status === 'input_required') {
+    return 'input-required'
+  }
+  if (status === 'running' || status === 'queued' || status === 'working') return 'working'
+  if (status === 'canceled' || status === 'cancelled') return 'canceled'
+  return 'failed'
+}
+
+function recoveredExecutionAuthz(
+  task: Task,
+  requestId: string,
+  agent: AgentMeta,
+  config: GatewayConfig,
+): AuthorizedRequest {
+  const submission = readTaskSubmission(task)
+  if (!submission || submission.requestId !== requestId || submission.agentId !== agent.id) {
+    throw new Error(`A2A task '${task.id}' execution context is unavailable`)
+  }
+  const latestUserMessage = [...(task.history ?? [])]
+    .reverse()
+    .find((message) => message.role === 'user')
+  const extracted = latestUserMessage ? extractTextFromMessage(latestUserMessage) : null
+  const userMessage = extracted && !('error' in extracted) ? extracted.text : '[recovered A2A task]'
+  const maxOutputTokens = config.maxOutputTokens ?? config.defaultOutputTokens ?? 1024
+  const maxReasoningTokens = config.executionBudget?.maxReasoningTokens ?? maxOutputTokens
+  const maxToolTokens = config.executionBudget?.maxToolTokens ?? maxOutputTokens
+  const maxToolCalls = config.executionBudget?.maxToolCalls ?? 8
+  const executionBudget = {
+    maxInputTokens: estimateTokens(userMessage),
+    maxOutputTokens,
+    maxReasoningTokens,
+    maxToolTokens,
+    maxToolCalls,
+    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
+      (estimateTokens(userMessage) + maxOutputTokens + maxReasoningTokens + maxToolTokens) *
+      agent.pricePerTokenUsd
+    ),
+  }
+  const parsedStartMs = Date.parse(task.status.timestamp)
+  return {
+    agent,
+    consumerId: submission.consumerId,
+    paymentMethod: 'apikey',
+    keyInfo: null,
+    userMessage,
+    rateLimitRemaining: undefined,
+    requestId,
+    startMs: Number.isFinite(parsedStartMs) ? parsedStartMs : Date.now(),
+    maxOutputTokens,
+    executionBudget,
+    requiredPaymentAmount: 0n,
+    paymentPayload: null,
+  }
+}
+
+function recoveredUsage(
+  result: SandboxPromptResult,
+): SandboxUsageReceipt {
+  const usage = result.usage
+  const tokenFields = ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const
+  if (
+    !usage ||
+    tokenFields.some((field) => !Number.isSafeInteger(usage[field]) || usage[field]! < 0) ||
+    typeof usage.providerCostUsd !== 'number' ||
+    !Number.isFinite(usage.providerCostUsd) ||
+    usage.providerCostUsd < 0 ||
+    typeof usage.budgetEnforced !== 'boolean'
+  ) throw new Error('sandbox detached result did not provide a complete usage receipt')
+  return usage as SandboxUsageReceipt
+}
+
+async function recoverExpiredExecutionIfNeeded(
+  task: Task,
+  deps: A2AHandlerDeps,
+  requestedAgentSlug: string,
+): Promise<Task> {
   const malformed = hasMalformedTaskExecution(task)
   if (
     task.status.state !== 'working' ||
     (isTaskFinalizing(task) && !malformed) ||
     (!malformed && !hasExpiredTaskExecution(task))
   ) return task
+  if (!malformed && readTaskExecutionReference(task)) {
+    try {
+      const reconciled = await reconcileTaskExecution(task, deps, requestedAgentSlug)
+      if (reconciled !== task && (
+        reconciled.status.state !== 'working' ||
+        !hasExpiredTaskExecution(reconciled)
+      )) return reconciled
+    } catch (error) {
+      console.error(
+        `[a2a] detached execution reconciliation failed for ${task.id}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
   const inspection = inspectTaskExecution(task)
   const failed: Task = {
     ...withStatus(task, 'failed'),

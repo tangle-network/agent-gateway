@@ -341,11 +341,33 @@ describe('PR #11 production regressions', () => {
     let deliveries = 0
     const config = durableConfig({
       getSandbox: async () => ({
-        async *streamPrompt() {
+        id: 'runtime-secret-sandbox',
+        async *streamPrompt() {},
+        async dispatchPrompt(_message: string, options?: { sessionId?: string }) {
           sandboxStarted()
-          await sandboxReleased
-          yield { type: 'sandbox.usage', data: { usage: usage() } }
+          return {
+            sessionId: options?.sessionId ?? 'runtime-secret-session',
+            executionId: 'runtime-secret-execution',
+            runControlRef: {
+              environmentId: 'runtime-secret-sandbox',
+              sessionId: options?.sessionId ?? 'runtime-secret-session',
+              executionId: 'runtime-secret-execution',
+            },
+          }
         },
+        session: (sessionId: string) => ({
+          events: async function* () {
+            await sandboxReleased
+            yield { type: 'sandbox.usage', data: { usage: usage() } }
+          },
+          result: async () => ({
+            success: true,
+            status: 'success',
+            executionId: 'runtime-secret-execution',
+            usage: usage(),
+          }),
+          interrupt: async () => ({ cancelled: false }),
+        }),
       }),
       x402: {
         operatorAddress,

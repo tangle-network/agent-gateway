@@ -1,3 +1,4 @@
+import type { SandboxRunControlRef } from '../types'
 import type { Task } from './types'
 
 interface ExecutionTaskStore {
@@ -21,6 +22,8 @@ export interface TaskExecutionMarker {
   version: typeof TASK_EXECUTION_VERSION
   requestId: string
   lease: { id: string; expiresAt: number }
+  /** Exact sandbox run accepted after the execution fence was claimed. */
+  runControlRef?: SandboxRunControlRef
 }
 
 export type TaskExecutionInspection =
@@ -109,6 +112,68 @@ export function hasMalformedTaskExecution(task: Task): boolean {
   return inspectTaskExecution(task).state === 'malformed'
 }
 
+/** Read the exact detached sandbox identity stored on a task. */
+export function readTaskExecutionReference(task: Task): SandboxRunControlRef | undefined {
+  const inspection = inspectTaskExecution(task)
+  if (inspection.state !== 'valid') return undefined
+  const marker = inspection.marker
+  if (
+    !marker.runControlRef ||
+    typeof marker.runControlRef.environmentId !== 'string' ||
+    marker.runControlRef.environmentId.length === 0 ||
+    typeof marker.runControlRef.sessionId !== 'string' ||
+    marker.runControlRef.sessionId.length === 0 ||
+    typeof marker.runControlRef.executionId !== 'string' ||
+    marker.runControlRef.executionId.length === 0
+  ) return undefined
+  return marker.runControlRef
+}
+
+/** Persist the sandbox admission before any response observation begins. */
+export async function attachTaskExecutionReference(
+  store: ExecutionTaskStore,
+  task: Task,
+  requestId: string,
+  reference: SandboxRunControlRef,
+  now = Date.now(),
+): Promise<Task> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const current = await store.get(task.id)
+    if (!current) throw new TaskExecutionCanceledError(task.id)
+    const inspection = inspectTaskExecution(current)
+    if (inspection.state === 'malformed') {
+      throw new Error(`A2A task '${task.id}' has a malformed execution marker`)
+    }
+    if (
+      inspection.state !== 'valid' ||
+      inspection.marker.requestId !== requestId ||
+      inspection.marker.lease.expiresAt <= now
+    ) throw new TaskExecutionCanceledError(task.id)
+    const existing = readTaskExecutionReference(current)
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(reference)) {
+        throw new Error(`A2A task '${task.id}' is bound to a different sandbox execution`)
+      }
+      return current
+    }
+    const next: Task = {
+      ...current,
+      metadata: {
+        ...(current.metadata ?? {}),
+        [TASK_EXECUTION_METADATA_KEY]: {
+          ...inspection.marker,
+          runControlRef: reference,
+        } satisfies TaskExecutionMarker,
+      },
+    }
+    if (
+      store.compareAndSetExecution &&
+      await store.compareAndSetExecution(current, next, requestId, now)
+    ) return next
+  }
+  throw new Error(`A2A task '${task.id}' changed while sandbox execution was attached`)
+}
+
 /** Remove the marker when the task reaches a terminal or paused state. */
 export function clearTaskExecution(task: Task): Task {
   if (!task.metadata || !(TASK_EXECUTION_METADATA_KEY in task.metadata)) return task
@@ -122,7 +187,12 @@ export function clearTaskExecution(task: Task): Task {
       })()
 }
 
-function withTaskExecution(task: Task, requestId: string, now: number): Task {
+function withTaskExecution(
+  task: Task,
+  requestId: string,
+  now: number,
+): Task {
+  const existing = readTaskExecution(task)
   return {
     ...task,
     metadata: {
@@ -131,6 +201,11 @@ function withTaskExecution(task: Task, requestId: string, now: number): Task {
         version: TASK_EXECUTION_VERSION,
         requestId,
         lease: { id: requestId, expiresAt: now + TASK_EXECUTION_LEASE_MS },
+        ...(existing
+          ? {
+              ...(existing.runControlRef ? { runControlRef: existing.runControlRef } : {}),
+            }
+          : {}),
       } satisfies TaskExecutionMarker,
     },
   }
@@ -158,5 +233,18 @@ export function inspectTaskExecution(task: Task): TaskExecutionInspection {
     typeof marker.lease.expiresAt !== 'number' ||
     !Number.isFinite(marker.lease.expiresAt)
   ) return { state: 'malformed', reason: 'marker fields are invalid' }
+  if (
+    marker.runControlRef !== undefined &&
+    (
+      !marker.runControlRef ||
+      typeof marker.runControlRef !== 'object' ||
+      typeof marker.runControlRef.environmentId !== 'string' ||
+      marker.runControlRef.environmentId.length === 0 ||
+      typeof marker.runControlRef.sessionId !== 'string' ||
+      marker.runControlRef.sessionId.length === 0 ||
+      typeof marker.runControlRef.executionId !== 'string' ||
+      marker.runControlRef.executionId.length === 0
+    )
+  ) return { state: 'malformed', reason: 'detached execution reference is incomplete' }
   return { state: 'valid', marker: marker as TaskExecutionMarker }
 }
