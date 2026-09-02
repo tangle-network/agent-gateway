@@ -2,6 +2,10 @@ import {
   assertMppChargeOperation,
   mppPaymentOperationId,
 } from './mpp-payment'
+import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from './api-keys'
 import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
 import {
   paymentNonceKey,
@@ -35,7 +39,46 @@ export async function claimPayment(
   hooks: PaymentClaimHooks = {},
 ): Promise<void> {
   assertX402V1SettlementSafe(authz, config)
-  if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
+  if (authz.paymentMethod === 'apikey') {
+    if (!authz.keyInfo) {
+      throw new ApiKeyRequestClaimUnavailableError('Verified API key identity is unavailable')
+    }
+    const claimRequest = config.claimApiKeyRequest
+    if (!claimRequest) {
+      if (
+        authz.keyInfo.rateLimitPerMinute !== undefined ||
+        authz.keyInfo.dailyLimit !== undefined
+      ) {
+        throw new ApiKeyRequestClaimUnavailableError(
+          'API key request limits are not configured',
+        )
+      }
+    } else {
+      let claim
+      try {
+        claim = await claimRequest({
+          keyInfo: authz.keyInfo,
+          requestId: authz.requestId,
+          requestedAt: new Date(authz.startMs),
+        })
+      } catch (error) {
+        if (
+          error instanceof ApiKeyRequestClaimUnavailableError ||
+          error instanceof ApiKeyRequestLimitExceededError
+        ) throw error
+        throw new ApiKeyRequestClaimUnavailableError(
+          'API key request limits could not be checked',
+          { cause: error },
+        )
+      }
+      assertApiKeyRequestClaim(claim)
+      if (!claim.allowed) throw new ApiKeyRequestLimitExceededError(claim)
+      authz.rateLimitRemaining = Math.min(
+        authz.rateLimitRemaining ?? claim.minuteRemaining,
+        claim.minuteRemaining,
+      )
+    }
+  } else if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
     const context = paymentAuthorizationContext(authz)
     if (config.x402.paymentProtocolVersion === 2) {
       await preparePaymentRecovery(authz, config, {
@@ -218,6 +261,33 @@ export async function claimPayment(
       '[agent-gateway] payment observer failed for ' + authz.requestId + ':',
       error instanceof Error ? error.message : String(error),
     )
+  }
+}
+
+function assertApiKeyRequestClaim(
+  claim: import('./types').ApiKeyRequestClaimResult,
+): void {
+  if (typeof claim.allowed !== 'boolean') {
+    throw new ApiKeyRequestClaimUnavailableError('API key request claim is invalid')
+  }
+  for (const [name, value] of [
+    ['minuteRemaining', claim.minuteRemaining],
+    ['dailyRemaining', claim.dailyRemaining],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new ApiKeyRequestClaimUnavailableError(`API key request claim ${name} is invalid`)
+    }
+  }
+  for (const [name, value] of [
+    ['minuteResetAt', claim.minuteResetAt],
+    ['dailyResetAt', claim.dailyResetAt],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new ApiKeyRequestClaimUnavailableError(`API key request claim ${name} is invalid`)
+    }
+  }
+  if (!claim.allowed && claim.reason !== 'minute' && claim.reason !== 'daily') {
+    throw new ApiKeyRequestClaimUnavailableError('API key request claim reason is invalid')
   }
 }
 

@@ -4,13 +4,17 @@
  * fetch the card from `<url>/.well-known/agent.json` per A2A convention.
  *
  * Auth schemes advertised reflect the gateway's actually-accepted payment
- * methods (x402 always; mpp and Bearer only when configured). Skills
+ * methods that the gateway can authenticate. Skills
  * fall back to a single synthesized "chat" skill when the AgentMeta doesn't
  * declare its own — most consumers will override.
  */
 
 import type { AgentMeta, GatewayConfig } from '../types'
-import { isApiKeyAuthEnabled, isMppAuthEnabled } from '../verify'
+import {
+  isApiKeyAuthEnabled,
+  isMppAuthEnabled,
+  isX402AuthEnabled,
+} from '../verify'
 import type { AgentCard, AgentSkill } from './types'
 
 export function buildAgentCard(
@@ -18,7 +22,8 @@ export function buildAgentCard(
   config: GatewayConfig,
   agentUrl: string,
 ): AgentCard {
-  const schemes: string[] = ['x402']
+  const schemes: string[] = []
+  if (isX402AuthEnabled(config)) schemes.push('x402')
   if (isMppAuthEnabled(config)) schemes.push('mpp')
   if (isApiKeyAuthEnabled(config)) schemes.push('Bearer')
 

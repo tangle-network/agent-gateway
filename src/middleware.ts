@@ -4,6 +4,10 @@ import { isChatMessageArray } from './chat-input'
 import { createA2AHandlers } from './a2a/handler'
 import { InMemoryTaskStore } from './a2a/task-store'
 import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from './api-keys'
+import {
   type AuthorizedRequest,
   type GatewayState,
   authenticateAndGuard,
@@ -297,6 +301,51 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     try {
       await claimPayment(authz, config, state)
     } catch (error) {
+      if (error instanceof ApiKeyRequestLimitExceededError) {
+        const resetAt = error.claim.reason === 'daily'
+          ? error.claim.dailyResetAt
+          : error.claim.minuteResetAt
+        const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
+        await obs?.onRateLimited?.(
+          {
+            requestId: authz.requestId,
+            agentSlug: authz.agent.slug,
+            startMs: authz.startMs,
+          },
+          { consumerId: authz.consumerId, retryAfterSeconds },
+        )
+        return c.json(
+          {
+            error: {
+              message: `API key ${error.claim.reason} request limit exceeded`,
+              type: 'rate_limit_error',
+              code: `api_key_${error.claim.reason}_limit_exceeded`,
+              retry_after: retryAfterSeconds,
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              'Retry-After': String(retryAfterSeconds),
+              'X-Request-Id': authz.requestId,
+              'X-RateLimit-Remaining': String(error.claim.minuteRemaining),
+              'X-RateLimit-Daily-Remaining': String(error.claim.dailyRemaining),
+            },
+          },
+        )
+      }
+      if (error instanceof ApiKeyRequestClaimUnavailableError) {
+        return c.json(
+          {
+            error: {
+              message: 'API key request limits are unavailable',
+              type: 'server_error',
+              code: error.code,
+            },
+          },
+          { status: 503, headers: { 'X-Request-Id': authz.requestId } },
+        )
+      }
       const replayedGenericMpp = error instanceof PaymentRecoveryReplayError &&
         authz.paymentMethod === 'mpp' &&
         authz.mppMethod !== 'blueprintevm'

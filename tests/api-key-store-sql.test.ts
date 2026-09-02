@@ -27,14 +27,15 @@ async function createKey(
   userId = 'user-1',
   keyHash = 'hash-1',
   spendingLimitCents = 500,
+  limits: { rateLimit?: number; dailyLimit?: number } = {},
 ) {
   return store.create(userId, {
     name: 'Production',
     keyHash,
     keyPrefix: 'ak_12345678',
     scopes: ['chat'],
-    rateLimit: 60,
-    dailyLimit: 1_000,
+    rateLimit: limits.rateLimit ?? 60,
+    dailyLimit: limits.dailyLimit ?? 1_000,
     spendingLimitCents,
     expiresAt: new Date('2030-01-01T00:00:00.999Z'),
   })
@@ -107,6 +108,104 @@ describe('SqlApiKeyStore', () => {
       const updated = await store.findByHash('hash-1')
       expect(updated?.spentCents).toBe(60)
       expect(updated?.lastUsedAt).toBeInstanceOf(Date)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('claims minute and daily request slots before work starts', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = await createStore(db)
+      const key = await createKey(
+        store,
+        'user-1',
+        'limited-hash',
+        500,
+        { rateLimit: 2, dailyLimit: 3 },
+      )
+      const minuteOne = new Date('2026-09-02T12:00:10.000Z')
+      const minuteTwo = new Date('2026-09-02T12:01:10.000Z')
+      const nextDay = new Date('2026-09-03T00:00:10.000Z')
+
+      await expect(store.claimRequest(key.id, 'request-1', minuteOne))
+        .resolves.toMatchObject({ allowed: true, minuteRemaining: 1, dailyRemaining: 2 })
+      await expect(store.claimRequest(key.id, 'request-2', minuteOne))
+        .resolves.toMatchObject({ allowed: true, minuteRemaining: 0, dailyRemaining: 1 })
+      await expect(store.claimRequest(key.id, 'request-3', minuteOne))
+        .resolves.toMatchObject({ allowed: false, reason: 'minute' })
+
+      await expect(store.claimRequest(key.id, 'request-3', minuteTwo))
+        .resolves.toMatchObject({ allowed: true, minuteRemaining: 1, dailyRemaining: 0 })
+      await expect(store.claimRequest(key.id, 'request-4', minuteTwo))
+        .resolves.toMatchObject({ allowed: false, reason: 'daily' })
+      await expect(store.claimRequest(key.id, 'request-4', nextDay))
+        .resolves.toMatchObject({ allowed: true, dailyRemaining: 2 })
+    } finally {
+      db.close()
+    }
+  })
+
+  it('deduplicates request claims and refuses every slot above the limit', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = await createStore(db)
+      const key = await createKey(
+        store,
+        'user-1',
+        'request-hash',
+        500,
+        { rateLimit: 5, dailyLimit: 5 },
+      )
+      const now = new Date('2026-09-02T12:00:10.000Z')
+      const claims = await Promise.all(Array.from(
+        { length: 20 },
+        (_, index) => store.claimRequest(key.id, `request-${index}`, now),
+      ))
+
+      expect(claims.filter((claim) => claim.allowed)).toHaveLength(5)
+      expect(claims.filter((claim) => !claim.allowed)).toHaveLength(15)
+      await expect(store.claimRequest(key.id, 'request-0', now))
+        .resolves.toMatchObject({ allowed: true, dailyRemaining: 0 })
+
+      const other = await createKey(store, 'user-2', 'other-hash')
+      await expect(store.claimRequest(other.id, 'request-0', now))
+        .rejects.toThrow(/another key/)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('bounds stored request claims while retaining the current and prior UTC day', async () => {
+    const db = new DatabaseSync(':memory:')
+    try {
+      const store = await createStore(db)
+      const key = await createKey(
+        store,
+        'user-1',
+        'retention-hash',
+        500,
+        { rateLimit: 300, dailyLimit: 300 },
+      )
+      await store.claimRequest(key.id, 'old-request', new Date('2026-09-01T12:00:00.000Z'))
+      await Promise.all(Array.from(
+        { length: 255 },
+        (_, index) => store.claimRequest(
+          key.id,
+          `current-request-${index}`,
+          new Date('2026-09-03T12:00:00.000Z'),
+        ),
+      ))
+
+      const old = db.prepare(
+        'SELECT request_id FROM agent_api_key_request WHERE request_id = ?',
+      ).all('old-request')
+      const current = db.prepare(
+        'SELECT COUNT(*) AS count FROM agent_api_key_request WHERE key_id = ?',
+      ).get(key.id) as { count: number }
+
+      expect(old).toEqual([])
+      expect(current.count).toBe(255)
     } finally {
       db.close()
     }

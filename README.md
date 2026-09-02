@@ -14,6 +14,7 @@ npm install @tangle-network/agent-gateway
 ```ts
 import {
   createAgentGateway,
+  createApiKeyRequestClaim,
   createApiKeyUsageSettlement,
   recoverPayments,
   SqlApiKeyStore,
@@ -34,6 +35,7 @@ app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
   recordUsage: usageStore.recordUsage,
+  claimApiKeyRequest: createApiKeyRequestClaim(apiKeyStore),
   settlePayment: createApiKeyUsageSettlement(apiKeyStore),
   x402: {
     operatorAddress: '0x…',
@@ -55,7 +57,12 @@ Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
 Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
 Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
 The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
-The API-key store records each request once and refuses a settlement that would exceed the key limit.
+The API-key store claims each request before compute starts.
+It enforces the key's rolling-minute and UTC-day request limits with durable database slots.
+Concurrent workers cannot claim the same slot, and a retry with the same request ID does not consume another slot.
+When `verifyApiKey` returns a minute or daily limit, configure `claimApiKeyRequest` or the request fails closed with `503`.
+The SQL store retains the current and previous UTC day, then prunes older claim rows every 256 accepted requests.
+The API-key store also records each usage settlement once and refuses a settlement that would exceed the spending limit.
 This check runs after work completes, so it does not reserve funds before an in-flight request.
 Use a payment authorization flow when the product requires a strict pre-run budget.
 The usage store writes USD values as integer nanodollars instead of SQL floating-point values.

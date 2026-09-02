@@ -69,9 +69,12 @@ export {
 } from './rate-limit'
 export {
   apiKeySettlementCostCents,
+  createApiKeyRequestClaim,
   createApiKeyUsageSettlement,
   createApiKeyRoutes,
   verifyApiKeyFromStore,
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
   type ApiKey,
   type ApiKeyCreateRequest,
   type ApiKeyStore,
@@ -120,6 +123,8 @@ export type {
   MppConfig,
   PaymentResult,
   ApiKeyInfo,
+  ApiKeyRequestClaimInput,
+  ApiKeyRequestClaimResult,
   GatewayUsageEvent,
   SandboxExecutionBudget,
   SandboxUsageReceipt,

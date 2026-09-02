@@ -1078,6 +1078,13 @@ describe('POST /:slug/chat/completions — auth paths', () => {
     }
     const { app } = buildHarness({
       verifyApiKey: async (auth) => (auth === 'Bearer ak_goodkey' ? customKey : null),
+      claimApiKeyRequest: async () => ({
+        allowed: true,
+        minuteRemaining: 29,
+        dailyRemaining: 999,
+        minuteResetAt: Date.now() + 60_000,
+        dailyResetAt: Date.now() + 86_400_000,
+      }),
     })
     const ok = await app.request('/v1/agents/test-agent/chat/completions', {
       method: 'POST',
@@ -1093,6 +1100,89 @@ describe('POST /:slug/chat/completions — auth paths', () => {
       body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
     })
     expect(bad.status).toBe(401)
+  })
+
+  it('claims durable API-key limits before sandbox work and returns 429 at the daily limit', async () => {
+    let claims = 0
+    const { app, sandbox } = buildHarness({
+      verifyApiKey: async () => ({
+        keyId: 'k-limited',
+        consumerId: 'apikey:k-limited',
+        scopes: ['chat'],
+        rateLimitPerMinute: 100,
+        dailyLimit: 1,
+      }),
+      claimApiKeyRequest: async () => {
+        claims += 1
+        return {
+          allowed: claims === 1,
+          ...(claims === 1 ? {} : { reason: 'daily' as const }),
+          minuteRemaining: 99,
+          dailyRemaining: 0,
+          minuteResetAt: Date.now() + 60_000,
+          dailyResetAt: Date.now() + 86_400_000,
+        }
+      },
+    })
+    const request = () => app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ak_limited' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    const first = await request()
+    expect(first.status).toBe(200)
+    await readSse(first)
+    const second = await request()
+
+    expect(second.status).toBe(429)
+    expect(second.headers.get('X-RateLimit-Daily-Remaining')).toBe('0')
+    expect((await second.json() as { error: { code: string } }).error.code)
+      .toBe('api_key_daily_limit_exceeded')
+    expect(claims).toBe(2)
+    expect(sandbox.receivedPrompt).toBe('hi')
+  })
+
+  it('fails closed when a verified daily limit has no durable request counter', async () => {
+    const { app, sandbox } = buildHarness({
+      verifyApiKey: async () => ({
+        keyId: 'k-unconfigured',
+        consumerId: 'apikey:k-unconfigured',
+        scopes: ['chat'],
+        dailyLimit: 10,
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ak_unconfigured' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'do not run' }] }),
+    })
+
+    expect(response.status).toBe(503)
+    expect((await response.json() as { error: { code: string } }).error.code)
+      .toBe('api_key.request_claim_unavailable')
+    expect(sandbox.receivedPrompt).toBeNull()
+  })
+
+  it('fails closed when a verified minute limit has no durable request counter', async () => {
+    const { app, sandbox } = buildHarness({
+      verifyApiKey: async () => ({
+        keyId: 'k-unconfigured-minute',
+        consumerId: 'apikey:k-unconfigured-minute',
+        scopes: ['chat'],
+        rateLimitPerMinute: 10,
+      }),
+    })
+    const response = await app.request('/v1/agents/test-agent/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ak_unconfigured' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'do not run' }] }),
+    })
+
+    expect(response.status).toBe(503)
+    expect((await response.json() as { error: { code: string } }).error.code)
+      .toBe('api_key.request_claim_unavailable')
+    expect(sandbox.receivedPrompt).toBeNull()
   })
 
   it('enforces required scope — regression: missing "chat" scope must be rejected with insufficient_scope', async () => {

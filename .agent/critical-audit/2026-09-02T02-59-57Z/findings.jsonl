@@ -1,0 +1,3 @@
+{"priorId":1,"severity":"HIGH","resolution":"resolved","evidence":"src/dispatch-payment.ts:48; tests/middleware.test.ts minute-only HTTP regression; 430/430 full tests"}
+{"priorId":2,"severity":"HIGH","resolution":"resolved","evidence":"src/a2a/handler.ts:462; tests/a2a.test.ts task absence assertion; 430/430 full tests"}
+{"priorId":3,"severity":"MEDIUM","resolution":"resolved","evidence":"src/api-key-store-sql.ts:457; tests/api-key-store-sql.test.ts retains 255/255 current rows and removes 1/1 expired row"}
