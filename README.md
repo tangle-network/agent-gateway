@@ -91,9 +91,11 @@ The fallback never settles the payer's larger authorization amount.
 Keep version 1 explicitly configured while old and new gateways coexist; shared nonce storage must reject a version 1 claim owned by a version 2 operation.
 Before it calls the verifier, the gateway requires the signed amount to cover the complete filtered conversation plus the requested output limit.
 The default bound includes system text, message roles, and JSON framing.
-Set `inputTokenBound` when the provider adds harness, tool, workspace, or other hidden context.
-The callback can read retained history asynchronously through its `threadId`.
-It runs before payment verification and receives no consumer identity.
+Set `unauthenticatedInputTokenBound` to a conservative bound when the provider adds hidden context.
+Set `inputTokenBound` when the final bound depends on retained history or another authorized consumer context.
+The asynchronous callback runs after payment authentication and `authorizeConsumer`.
+It receives the verified consumer, API-key owner, and `threadId` when one exists.
+The gateway recomputes the execution budget and rejects an underfunded payment before claiming it.
 The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
@@ -146,6 +148,7 @@ An `agent-app` host can use this context to drive its normal persisted chat rout
 
 The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
 Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
+Set `a2a: false` when the application does not expose A2A routes.
 Custom production task stores must implement atomic `createIfAbsent`, `compareAndSet`, and `compareAndSetExecution` methods.
 `compareAndSetExecution` must reject a renewal when the stored owner lease has expired.
 Task stores must retain payment recovery metadata until reconciliation clears it.

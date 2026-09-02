@@ -358,10 +358,16 @@ export interface GatewayConfig {
   defaultOutputTokens?: number
 
   /**
+   * Conservative complete-input bound used before payment authentication.
+   * Required when `inputTokenBound` is configured for an x402-capable gateway.
+   */
+  unauthenticatedInputTokenBound?: number
+
+  /**
    * Return a safe upper bound for the complete provider input.
    * Include system, chat framing, retained history, tools, harness, and workspace context.
-   * The callback runs before payment verification, so it receives no consumer
-   * identity. `threadId` is sufficient for a host to read its retained history.
+   * The callback runs after payment authentication and `authorizeConsumer`,
+   * so it may safely read consumer-owned retained history.
    */
   inputTokenBound?: (input: {
     agent: AgentMeta
@@ -369,6 +375,12 @@ export interface GatewayConfig {
     requestId: string
     /** Stable UI conversation id when `conversationMode` is `thread`. */
     threadId?: string
+    /** Verified payment identity. */
+    consumerId: string
+    paymentMethod: PaymentMethod
+    /** Verified API-key identity, when the request uses an API key. */
+    keyId?: string
+    ownerId?: string
   }) => number | Promise<number>
 
   /** Hidden provider spend limits included in the pre-execution payment quote. */
@@ -410,11 +422,12 @@ export interface GatewayConfig {
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel
+   * Set `a2a: false` to disable these routes and their setup checks.
    * Auth + rate-limit + injection-filter + authorization all share the
    * same pipeline as the OpenAI-compat path. Demo mode defaults to
    * `InMemoryTaskStore`; production must configure D1/postgres/DO storage.
   */
-  a2a?: {
+  a2a?: false | {
     /**
      * Authorize reads, cancellation, resubscription, and push configuration
      * for an existing task. Production control methods fail closed when this

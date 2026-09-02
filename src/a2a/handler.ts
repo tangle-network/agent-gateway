@@ -110,6 +110,10 @@ const MAX_A2A_BODY_BYTES = 64 * 1024
 
 class RequestBodyTooLargeError extends Error {}
 
+function a2aConfig(config: GatewayConfig): Exclude<GatewayConfig['a2a'], false | undefined> | undefined {
+  return config.a2a === false ? undefined : config.a2a
+}
+
 function createTaskLifecycle(deps: A2AHandlerDeps): TaskLifecycle {
   return buildTaskLifecycle({
     taskStore: deps.taskStore,
@@ -138,11 +142,12 @@ function buildTaskMethodDependencies(
 function buildPushConfigMethodDependencies(
   deps: A2AHandlerDeps,
 ): PushConfigMethodDependencies {
+  const config = a2aConfig(deps.config)
   return {
     taskStore: deps.taskStore,
     pushStore: deps.pushStore,
     demoMode: deps.config.x402.demoMode === true,
-    urlValidator: deps.config.a2a?.pushUrlValidator,
+    urlValidator: config?.pushUrlValidator,
     authorizeTaskAccess: (c, req, task) => authorizeTaskAccess(c, req, task, deps),
   }
 }
@@ -610,7 +615,7 @@ async function authorizeTaskAccess(
   } else if (!deps.config.x402.demoMode) {
     return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task origin is not recorded'), 403)
   }
-  const authorize = deps.config.a2a?.authorizeTaskAccess
+  const authorize = a2aConfig(deps.config)?.authorizeTaskAccess
   if (!authorize && deps.config.x402.demoMode) return undefined
   if (!authorize) {
     return c.json(
@@ -787,13 +792,14 @@ async function readJsonBody(request: Request): Promise<unknown> {
  * via `tasks/get` to confirm state.
  */
 async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void> {
+  const config = a2aConfig(deps.config)
   const pushDeps: PushDeliveryDependencies = {
     taskStore: deps.taskStore,
     pushStore: deps.pushStore,
     demoMode: deps.config.x402.demoMode === true,
-    webhookSecret: deps.config.a2a?.webhookSecret,
-    fetcher: deps.config.a2a?.pushFetcher,
-    urlValidator: deps.config.a2a?.pushUrlValidator,
+    webhookSecret: config?.webhookSecret,
+    fetcher: config?.pushFetcher,
+    urlValidator: config?.pushUrlValidator,
     onDeliveryFailure: (failedTask, result) => {
       void deps.state.obs?.onStreamError?.(
         { requestId: result.taskId, agentSlug: failedTask.id, startMs: Date.now() },
