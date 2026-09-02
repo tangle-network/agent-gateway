@@ -82,6 +82,11 @@ function buildApp(store: ApiKeyStore, userId: string | null = 'user_alice') {
   return app
 }
 
+async function hashRawKey(rawKey: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawKey))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 describe('createApiKeyRoutes — CRUD', () => {
   let store: MemoryApiKeyStore
 
@@ -106,6 +111,60 @@ describe('createApiKeyRoutes — CRUD', () => {
     })
     expect(res.status).toBe(400)
     expect((await res.json() as { error: string }).error).toMatch(/name/i)
+  })
+
+  it('POST rejects malformed JSON and non-object bodies', async () => {
+    const app = buildApp(store)
+    const malformed = await app.request('/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{broken',
+    })
+    const array = await app.request('/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([]),
+    })
+
+    expect(malformed.status).toBe(400)
+    expect(array.status).toBe(400)
+    expect(store.keys.size).toBe(0)
+  })
+
+  it.each([
+    ['rateLimit', 0],
+    ['rateLimit', 1.5],
+    ['dailyLimit', -1],
+    ['spendingLimitCents', -1],
+    ['spendingLimitCents', 0.5],
+    ['expiresAt', 'not-a-date'],
+  ])('POST rejects an invalid %s', async (field, value) => {
+    const app = buildApp(store)
+    const res = await app.request('/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'invalid', [field]: value }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(store.keys.size).toBe(0)
+  })
+
+  it('uses the first configured scope when chat is unavailable', async () => {
+    const app = new Hono()
+    app.route('/keys', createApiKeyRoutes({
+      store,
+      getAuthUserId: async () => 'user_alice',
+      validScopes: ['forms', 'admin'],
+    }))
+    const res = await app.request('/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'forms', scopes: ['unknown'] }),
+    })
+
+    expect(res.status).toBe(201)
+    expect((await res.json() as { scopes: string[] }).scopes).toEqual(['forms'])
   })
 
   it('POST returns a raw key exactly once — regression: exposed hash breaks the "show once" invariant', async () => {
@@ -225,37 +284,28 @@ describe('verifyApiKeyFromStore', () => {
   })
 
   it('rejects expired keys — regression: expired keys must stop working immediately', async () => {
-    // Mint a key that expired yesterday
+    const expiredRawKey = `ak_${'ab'.repeat(16)}`
     const yesterday = new Date(Date.now() - 86400_000)
-    const expired = await store.create('user_alice', {
+    await store.create('user_alice', {
       name: 'expired',
-      keyHash: 'HASH_EXPIRED',
-      keyPrefix: 'ak_expired',
+      keyHash: await hashRawKey(expiredRawKey),
+      keyPrefix: expiredRawKey.slice(0, 11),
       scopes: ['chat'],
       rateLimit: 60,
       dailyLimit: 1000,
       spendingLimitCents: null,
       expiresAt: yesterday,
     })
-    // Inject a direct-hash path: set a fake raw key that hashes to HASH_EXPIRED
-    // — simpler: verify against hash directly via a synthesized fetch
-    const found = await store.findByHash('HASH_EXPIRED')
-    expect(found).not.toBeNull()
-    expect(found!.expiresAt!.getTime()).toBe(yesterday.getTime())
 
-    // Now exercise the path: expiry check is in verifyApiKeyFromStore, but
-    // only if we pass a Bearer token whose hash matches. The store uses SHA-256
-    // internally via the route, so we test the expiry predicate by calling
-    // findByHash directly (guaranteeing the hash match) and asserting the
-    // expiry-check branch would reject.
-    expect(expired.expiresAt!.getTime()).toBeLessThan(Date.now())
+    await expect(verifyApiKeyFromStore(`Bearer ${expiredRawKey}`, store)).resolves.toBeNull()
   })
 
   it('rejects keys over their spending limit — regression: over-limit keys must not authorize more spend', async () => {
+    const limitedRawKey = `ak_${'cd'.repeat(16)}`
     const broke = await store.create('user_alice', {
       name: 'broke',
-      keyHash: 'HASH_BROKE',
-      keyPrefix: 'ak_broke',
+      keyHash: await hashRawKey(limitedRawKey),
+      keyPrefix: limitedRawKey.slice(0, 11),
       scopes: ['chat'],
       rateLimit: 60,
       dailyLimit: 1000,
@@ -264,12 +314,6 @@ describe('verifyApiKeyFromStore', () => {
     })
     await store.recordUsage(broke.id, 200) // overspent
 
-    const found = await store.findByHash('HASH_BROKE')
-    expect(found!.spentCents).toBe(200)
-    expect(found!.spendingLimitCents).toBe(100)
-    // verifyApiKeyFromStore short-circuits on spentCents >= spendingLimitCents
-    // We can't replay the bearer flow (fake hash), but the invariant the code
-    // depends on is recorded here: spent exceeds limit.
-    expect(found!.spentCents).toBeGreaterThanOrEqual(found!.spendingLimitCents!)
+    await expect(verifyApiKeyFromStore(`Bearer ${limitedRawKey}`, store)).resolves.toBeNull()
   })
 })
