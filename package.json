@@ -57,8 +57,12 @@
     "overrides": {
       "hono": "4.13.5",
       "nanoid": "3.3.18",
-      "postcss": "8.5.18",
-      "vite": "8.0.16"
+      "postcss": "8.5.23",
+      "vite": "8.0.16",
+      "esbuild": "0.28.1"
     }
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }
