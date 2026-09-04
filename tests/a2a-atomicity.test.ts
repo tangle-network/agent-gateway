@@ -8,6 +8,7 @@ import { MemoryPaymentOperations, type PaymentOperation } from '../src/payment-o
 import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 import type { AgentMeta, GatewayConfig, SandboxBox, SandboxUsageReceipt } from '../src/types'
 import type { Artifact, Task } from '../src/a2a/types'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'cd'.repeat(32)}`
@@ -122,7 +123,7 @@ function atomicityConfig(
   }
   return {
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
-    getSandbox: async () => sandbox,
+    getSandbox: async () => durableSandbox(sandbox, 'atomicity-sandbox'),
     recordUsage: async () => { counters.records += 1 },
     settlePayment: async () => { counters.settlements += 1 },
     x402: {
@@ -286,7 +287,7 @@ describe('A2A task atomicity and restart recovery', () => {
 
     const config: GatewayConfig = {
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
-      getSandbox: async () => ({ async *streamPrompt() { throw new Error('restart recovery must not execute sandbox') } }),
+      getSandbox: async () => durableSandbox({ async *streamPrompt() { throw new Error('restart recovery must not execute sandbox') } }, 'restart-sandbox'),
       recordUsage: async () => { counters.records += 1 },
       x402: {
         operatorAddress,
@@ -434,7 +435,7 @@ describe('A2A task atomicity and restart recovery', () => {
     })
     const config: GatewayConfig = {
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
-      getSandbox: async () => ({ async *streamPrompt() { throw new Error('recovery must not execute sandbox') } }),
+      getSandbox: async () => durableSandbox({ async *streamPrompt() { throw new Error('recovery must not execute sandbox') } }, 'recovery-sandbox'),
       recordUsage: async () => { records += 1 },
       x402: {
         operatorAddress,

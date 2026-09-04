@@ -3,12 +3,19 @@ import {
   type AuthorizedRequest,
   beginPaymentExecution,
   buildGatewaySandboxContext,
-  dispatchSandboxStreamRich,
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
-import { claimTaskExecution, renewTaskExecution } from './execution-fence'
+import {
+  attachTaskExecutionReference,
+  claimTaskExecution,
+  renewTaskExecution,
+} from './execution-fence'
+import {
+  dispatchDetachedSandboxStreamRich,
+  taskExecutionTurnId,
+} from './detached-sandbox'
 import { fail, ok } from './jsonrpc'
 import {
   clearPaymentRecoveryMarker,
@@ -23,7 +30,7 @@ import {
   withFinalizationRecord,
 } from './task-finalization'
 import { clearTaskSubmission } from './task-submission-recovery'
-import { bindRequestAbort, type TaskCancellationRegistry } from './task-cancellation'
+import type { TaskCancellationRegistry } from './task-cancellation'
 import type { TaskLifecycle } from './task-lifecycle'
 import {
   agentMessage,
@@ -64,7 +71,6 @@ export async function executeMessageStream(
 ): Promise<Response> {
   const controller = deps.cancels.register(task.id)
   const lifecycle = deps.lifecycle
-  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const workingStatus: TaskStatusUpdateEvent = {
     kind: 'status-update',
     taskId: task.id,
@@ -73,7 +79,6 @@ export async function executeMessageStream(
     final: false,
   }
   if (isTerminal(task.status.state)) {
-    detachRequestAbort()
     deps.cancels.clear(task.id)
     return c.json(ok(req.id, task))
   }
@@ -81,7 +86,6 @@ export async function executeMessageStream(
     ? task
     : { ...task, status: workingStatus.status }
   if (task.status.state !== 'working' && !await compareAndSetTask(deps.taskStore, task, workingTask)) {
-    detachRequestAbort()
     deps.cancels.clear(task.id)
     const current = await releaseTaskPayment(
       authz,
@@ -125,7 +129,7 @@ export async function executeMessageStream(
         try {
           send(workingStatus)
 
-          for await (const event of dispatchSandboxStreamRich(
+          for await (const event of dispatchDetachedSandboxStreamRich(
             authz.agent,
             authz.userMessage,
             authz.consumerId,
@@ -148,6 +152,17 @@ export async function executeMessageStream(
               await renewPaymentExecution(authz, deps.config)
             },
             buildGatewaySandboxContext(authz),
+            {
+              turnId: taskExecutionTurnId(task),
+              onExecutionAccepted: async (reference) => {
+                workingTask = await attachTaskExecutionReference(
+                  deps.taskStore,
+                  workingTask,
+                  authz.requestId,
+                  reference,
+                )
+              },
+            },
           )) {
             if (event.kind === 'text') {
               responseText += event.delta
@@ -371,7 +386,6 @@ export async function executeMessageStream(
           }
         } finally {
           clearInterval(keepaliveTimer)
-          detachRequestAbort()
           deps.cancels.clear(task.id)
           try {
             if (ctrl.desiredSize !== null) ctrl.close()
@@ -382,7 +396,8 @@ export async function executeMessageStream(
       })()
     },
     cancel() {
-      controller.abort()
+      // Closing the response only ends observation. The detached sandbox run
+      // remains owned by the task until it reaches a terminal state.
     },
   })
 

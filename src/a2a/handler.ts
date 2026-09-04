@@ -27,12 +27,7 @@ import type {
   GatewayConfig,
 } from '../types'
 import { buildAgentCard } from './agent-card'
-import {
-  clearTaskExecution,
-  hasExpiredTaskExecution,
-  hasMalformedTaskExecution,
-  inspectTaskExecution,
-} from './execution-fence'
+import { hasActiveTaskExecution } from './execution-fence'
 import { executeMessageSend } from './message-send-execution'
 import { executeMessageStream } from './message-stream-execution'
 import { fail, ok, parseEnvelope } from './jsonrpc'
@@ -41,6 +36,12 @@ import {
 } from './push-notifications'
 import { type TaskStore } from './task-store'
 import { extractTextFromMessage } from './translate'
+import { getTaskExecutionSource } from './detached-sandbox'
+import {
+  reconcileTaskExecution,
+  recoverExpiredExecutionIfNeeded,
+  type TaskExecutionRecoveryDependencies,
+} from './task-execution-recovery'
 import {
   A2A_ERROR_CODES,
   type JSONRPCRequest,
@@ -70,7 +71,6 @@ import {
 } from './task-submission-recovery'
 import { deliverTaskPush, type PushDeliveryDependencies } from './task-push-delivery'
 import {
-  bindRequestAbort,
   TaskCancellationRegistry,
 } from './task-cancellation'
 import {
@@ -123,6 +123,15 @@ function createTaskLifecycle(deps: A2AHandlerDeps): TaskLifecycle {
   })
 }
 
+function taskExecutionRecoveryDeps(deps: A2AHandlerDeps): TaskExecutionRecoveryDependencies {
+  return {
+    config: deps.config,
+    taskStore: deps.taskStore,
+    createLifecycle: () => createTaskLifecycle(deps),
+    deliverPush: (task) => maybeDeliverPush(task, deps),
+  }
+}
+
 function buildTaskMethodDependencies(
   deps: A2AHandlerDeps,
   cancels: TaskCancellationRegistry,
@@ -136,6 +145,10 @@ function buildTaskMethodDependencies(
     recoverTask: (task, requestedAgentSlug) =>
       recoverTaskIfNeeded(task, deps, requestedAgentSlug),
     deliverPush: (task) => maybeDeliverPush(task, deps),
+    getTaskExecution: (task, requestedAgentSlug) =>
+      getTaskExecutionSource(task, deps, requestedAgentSlug),
+    reconcileTask: (task, requestedAgentSlug, allowActive) =>
+      reconcileTaskExecution(task, taskExecutionRecoveryDeps(deps), requestedAgentSlug, allowActive),
   }
 }
 
@@ -155,7 +168,7 @@ function buildPushConfigMethodDependencies(
 export function createA2AHandlers(deps: A2AHandlerDeps) {
   const runtimeDeps: A2AHandlerDeps = {
     ...deps,
-    taskStore: normalizeTaskStore(deps.taskStore, deps.config.x402.demoMode === true),
+    taskStore: requireAtomicTaskStore(deps.taskStore),
   }
   const cancels = new TaskCancellationRegistry()
 
@@ -245,7 +258,6 @@ async function handleMessageSend(
   const { authz, task } = guard
   setPaymentResponseHeaders(c, authz)
   const controller = cancels.register(task.id)
-  const detachRequestAbort = bindRequestAbort(c.req.raw.signal, controller)
   const lifecycle = createTaskLifecycle(deps)
   try {
     return await executeMessageSend(
@@ -257,7 +269,6 @@ async function handleMessageSend(
       controller.signal,
     )
   } finally {
-    detachRequestAbort()
     cancels.clear(task.id)
   }
 }
@@ -658,55 +669,15 @@ async function createTask(taskStore: TaskStore, task: Task): Promise<boolean> {
   }
   return taskStore.createIfAbsent(task)
 }
-function normalizeTaskStore(taskStore: TaskStore, allowUnsafeFallback: boolean): TaskStore {
-  const hasCreateIfAbsent = typeof taskStore.createIfAbsent === 'function'
-  const hasCompareAndSet = typeof taskStore.compareAndSet === 'function'
-  const hasCompareAndSetExecution = typeof taskStore.compareAndSetExecution === 'function'
-  if (hasCreateIfAbsent && hasCompareAndSet && hasCompareAndSetExecution) {
-    return taskStore
-  }
-  if (!allowUnsafeFallback) {
-    throw new Error(
-      'A2A production task store must implement createIfAbsent, compareAndSet, and compareAndSetExecution',
-    )
-  }
-  return {
-    get: (id) => taskStore.get(id),
-    put: (task) => taskStore.put(task),
-    delete: (id) => taskStore.delete(id),
-    async createIfAbsent(task) {
-      if (hasCreateIfAbsent) return taskStore.createIfAbsent!(task)
-      if (await taskStore.get(task.id)) return false
-      await taskStore.put(task)
-      return true
-    },
-    async compareAndSet(expected, next) {
-      if (hasCompareAndSet) return taskStore.compareAndSet!(expected, next)
-      const current = await taskStore.get(expected.id)
-      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return false
-      await taskStore.put(next)
-      return true
-    },
-    async compareAndSetExecution(expected, next, requestId, now) {
-      if (hasCompareAndSetExecution) {
-        return taskStore.compareAndSetExecution!(expected, next, requestId, now)
-      }
-      const current = await taskStore.get(expected.id)
-      const expectedMarker = inspectTaskExecution(current ?? expected)
-      const nextMarker = inspectTaskExecution(next)
-      if (
-        !current ||
-        JSON.stringify(current) !== JSON.stringify(expected) ||
-        expectedMarker.state !== 'valid' ||
-        nextMarker.state !== 'valid' ||
-        expectedMarker.marker.requestId !== requestId ||
-        nextMarker.marker.requestId !== requestId ||
-        expectedMarker.marker.lease.expiresAt <= now
-      ) return false
-      await taskStore.put(next)
-      return true
-    },
-  }
+function requireAtomicTaskStore(taskStore: TaskStore): TaskStore {
+  if (
+    typeof taskStore.createIfAbsent !== 'function' ||
+    typeof taskStore.compareAndSet !== 'function' ||
+    typeof taskStore.compareAndSetExecution !== 'function'
+  ) throw new Error(
+    'A2A production task store must implement createIfAbsent, compareAndSet, and compareAndSetExecution',
+  )
+  return taskStore
 }
 
 async function recoverTaskIfNeeded(
@@ -722,37 +693,16 @@ async function recoverTaskIfNeeded(
     requestedAgentSlug,
   )
   const paymentRecovered = await recoverPaymentMarkerIfNeeded(finalized, lifecycle.payment)
-  const submissionRecovered = await recoverSubmissionIfNeeded(paymentRecovered, {
+  const executionRecovered = await recoverExpiredExecutionIfNeeded(
+    paymentRecovered,
+    taskExecutionRecoveryDeps(deps),
+    requestedAgentSlug,
+  )
+  if (hasActiveTaskExecution(executionRecovered)) return executionRecovered
+  return recoverSubmissionIfNeeded(executionRecovered, {
     taskStore: deps.taskStore,
     deliverPush: lifecycle.finalization.deliverPush,
   })
-  return recoverExpiredExecutionIfNeeded(submissionRecovered, deps)
-}
-
-async function recoverExpiredExecutionIfNeeded(task: Task, deps: A2AHandlerDeps): Promise<Task> {
-  const malformed = hasMalformedTaskExecution(task)
-  if (
-    task.status.state !== 'working' ||
-    (isTaskFinalizing(task) && !malformed) ||
-    (!malformed && !hasExpiredTaskExecution(task))
-  ) return task
-  const inspection = inspectTaskExecution(task)
-  const failed: Task = {
-    ...withStatus(task, 'failed'),
-    metadata: {
-      ...(clearTaskExecution(task).metadata ?? {}),
-      [EXECUTION_RECOVERY_METADATA_KEY]: {
-        error: inspection.state === 'malformed'
-          ? `A2A execution marker was malformed: ${inspection.reason}`
-          : 'A2A execution lease expired before a task result was stored',
-      },
-    },
-  }
-  if (await compareAndSetTask(deps.taskStore, task, failed)) {
-    await maybeDeliverPush(failed, deps)
-    return failed
-  }
-  return await deps.taskStore.get(task.id) ?? task
 }
 
 async function readJsonBody(request: Request): Promise<unknown> {

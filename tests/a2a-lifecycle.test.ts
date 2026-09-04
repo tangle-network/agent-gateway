@@ -7,6 +7,7 @@ import { MemoryNonceStore } from '../src/nonce-store'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
 import type { Task } from '../src/a2a/types'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ef'.repeat(32)}`
@@ -76,14 +77,19 @@ function standardSandbox(): SandboxBox {
 }
 
 function gatewayConfig(taskStore: TaskStore, overrides: Partial<GatewayConfig> = {}): GatewayConfig {
+  const getSandbox = overrides.getSandbox ?? (async () => standardSandbox())
+  let sandbox: SandboxBox | undefined
   return {
     resolveAgent: async (slug) => (slug === agentA.slug ? agentA : null),
-    getSandbox: async () => standardSandbox(),
     recordUsage: async () => undefined,
     x402: { operatorAddress, chainId: 1, demoMode: true },
     nonceStore: new MemoryNonceStore(),
     a2a: { taskStore, authorizeTaskAccess: async () => true },
     ...overrides,
+    getSandbox: async (agent, context) => {
+      sandbox ??= durableSandbox(await getSandbox(agent, context))
+      return sandbox
+    },
   }
 }
 
@@ -378,38 +384,55 @@ describe('A2A lifecycle recovery and ownership', () => {
 })
 
 describe('A2A client disconnect cancellation', () => {
+  const delayedUsage = {
+    inputTokens: 1,
+    outputTokens: 1,
+    reasoningTokens: 0,
+    toolTokens: 0,
+    toolCallCount: 0,
+    providerCostUsd: 0.000002,
+    budgetEnforced: true,
+  }
+
   async function makeDisconnectHarness() {
     const taskStore = new InMemoryTaskStore()
+    let runs = 0
+    let interrupts = 0
     let started!: () => void
-    let aborted!: () => void
-    const sandboxStarted = new Promise<void>((resolve) => { started = resolve })
-    const sandboxAborted = new Promise<void>((resolve) => { aborted = resolve })
-    const sandbox: SandboxBox = {
-      async *streamPrompt(_message, opts) {
-        const signal = opts?.signal
-        if (signal?.aborted) {
-          aborted()
-          return
-        }
-        signal?.addEventListener('abort', () => {
-          aborted()
-        }, { once: true })
-        started()
+    let release!: () => void
+    const startedPromise = new Promise<void>((resolve) => { started = resolve })
+    const releasePromise = new Promise<void>((resolve) => { release = resolve })
+    const sandbox = durableSandbox({
+      async *streamPrompt(_message, options) {
+        runs += 1
+        options?.signal?.addEventListener('abort', () => { interrupts += 1 }, { once: true })
         yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'started' } }
+        started()
         await new Promise<void>((resolve) => {
-          signal?.addEventListener('abort', resolve, { once: true })
+          options?.signal?.addEventListener('abort', resolve, { once: true })
+          releasePromise.then(resolve)
         })
+        yield { type: 'sandbox.usage', data: { usage: delayedUsage } }
       },
-    }
+    }, 'sandbox-disconnect')
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
       getSandbox: async () => sandbox,
     })))
-    return { app, sandboxStarted, sandboxAborted }
+    return { app, sandbox, taskStore, startedPromise, release: () => release(), runs: () => runs, interrupts: () => interrupts }
   }
 
-  it('aborts sandbox work when the response reader disconnects', async () => {
-    const { app, sandboxStarted, sandboxAborted } = await makeDisconnectHarness()
+  async function waitForTaskState(taskStore: InMemoryTaskStore, id: string, state: Task['status']['state']) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const task = await taskStore.get(id)
+      if (task?.status.state === state) return task
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error(`task '${id}' did not reach '${state}'`)
+  }
+
+  it('keeps the detached run alive after the response reader disconnects', async () => {
+    const { app, sandbox, taskStore, startedPromise, release, runs, interrupts } = await makeDisconnectHarness()
     const response = await post(
       app,
       agentA.slug,
@@ -418,31 +441,111 @@ describe('A2A client disconnect cancellation', () => {
     )
     const reader = response.body!.getReader()
     const firstRead = reader.read()
-    await sandboxStarted
+    await startedPromise
+    const taskId = response.headers.get('X-Task-Id')!
+    const executionMarker = (await taskStore.get(taskId))?.metadata?.gatewayExecution as Record<string, unknown>
+    expect(executionMarker).toMatchObject({
+      runControlRef: {
+        environmentId: sandbox.id,
+        sessionId: taskId,
+        executionId: `${sandbox.id}:execution:0`,
+      },
+    })
     await reader.cancel()
-    await sandboxAborted
+    const resubscribe = await post(
+      app,
+      agentA.slug,
+      body('tasks/resubscribe', taskId),
+      { 'X-Payment-Signature': paymentHeader('907') },
+    )
+    const resubscribeTextPromise = resubscribe.text()
+    release()
+    await waitForTaskState(taskStore, taskId, 'completed')
+    expect(interrupts()).toBe(0)
+    expect(runs()).toBe(1)
+    const resubscribeText = await resubscribeTextPromise
+    expect(resubscribeText).toContain('"state":"completed"')
     await firstRead
   })
 
-  it('aborts sandbox work when the incoming request signal disconnects', async () => {
-    const { app, sandboxStarted, sandboxAborted } = await makeDisconnectHarness()
-    const requestAbort = new AbortController()
-    const request = new Request(`http://localhost/v1/agents/${agentA.slug}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Payment-Signature': paymentHeader('906'),
-      },
-      body: JSON.stringify(body('message/stream')),
-      signal: requestAbort.signal,
-    })
-    const response = await app.fetch(request)
+  it('interrupts only the exact detached run for tasks/cancel', async () => {
+    const { app, sandbox, taskStore, startedPromise, interrupts } = await makeDisconnectHarness()
+    const response = await post(
+      app,
+      agentA.slug,
+      body('message/stream'),
+      { 'X-Payment-Signature': paymentHeader('908') },
+    )
     const reader = response.body!.getReader()
     const firstRead = reader.read()
-    await sandboxStarted
-    requestAbort.abort()
-    await sandboxAborted
+    await startedPromise
+    const taskId = response.headers.get('X-Task-Id')!
+    const cancel = await post(
+      app,
+      agentA.slug,
+      body('tasks/cancel', taskId),
+      { 'X-Payment-Signature': paymentHeader('909') },
+    )
+    const canceled = (await cancel.json()) as { result?: Task }
+    expect(canceled.result?.status.state).toBe('canceled')
+    expect(interrupts()).toBe(1)
+    expect((await waitForTaskState(taskStore, taskId, 'canceled')).status.state).toBe('canceled')
     await reader.cancel()
     await firstRead
+  })
+
+  it('reconciles an expired detached run before tasks/get reports failure', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const taskId = 'task-expired-detached'
+    const recoverySandbox = durableSandbox({
+      async *streamPrompt() {
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'recovered' } }
+        yield { type: 'sandbox.usage', data: { usage: delayedUsage } }
+      },
+    }, 'sandbox-recovery')
+    await recoverySandbox.dispatchPrompt!('recover this', {
+      sessionId: taskId,
+      turnId: `${taskId}:turn:1`,
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
+      getSandbox: async () => recoverySandbox,
+    })))
+    const task: Task = {
+      kind: 'task',
+      id: taskId,
+      contextId: 'context-expired-detached',
+      status: { state: 'working', timestamp: new Date().toISOString() },
+      history: [message(undefined, 'recover this')],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agentA.id, agentSlug: agentA.slug },
+        gatewaySubmission: {
+          version: 1,
+          lease: { id: 'submission-expired-detached', expiresAt: Date.now() - 1 },
+          agentId: agentA.id,
+          agentSlug: agentA.slug,
+          requestId: 'request-expired-detached',
+          consumerId: 'consumer-recovery',
+        },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'request-expired-detached',
+          lease: { id: 'request-expired-detached', expiresAt: Date.now() - 1 },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    const response = await post(
+      app,
+      agentA.slug,
+      body('tasks/get', task.id),
+    )
+    const recovered = (await response.json()) as { result?: Task }
+    expect(response.status).toBe(200)
+    expect(recovered.result?.status.state).toBe('completed')
+    expect(recovered.result?.artifacts?.[0]?.parts).toEqual([
+      { kind: 'text', text: 'recovered' },
+    ])
   })
 })

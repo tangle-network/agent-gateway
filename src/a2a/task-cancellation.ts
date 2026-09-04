@@ -38,13 +38,3 @@ export class TaskCancellationRegistry {
     return true
   }
 }
-
-export function bindRequestAbort(
-  requestSignal: AbortSignal,
-  controller: AbortController,
-): () => void {
-  const abort = () => controller.abort()
-  if (requestSignal.aborted) abort()
-  else requestSignal.addEventListener('abort', abort, { once: true })
-  return () => requestSignal.removeEventListener('abort', abort)
-}

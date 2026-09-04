@@ -477,7 +477,7 @@ function completeUsage(
   return completeLegacyUsage(observed, userMessage, outputText, budget)
 }
 
-function truncateUtf8(
+export function truncateUtf8(
   value: string,
   maxBytes: number,
   encoder: TextEncoder,

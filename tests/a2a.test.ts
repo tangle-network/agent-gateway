@@ -22,6 +22,7 @@ import { createAgentGateway } from '../src/middleware'
 import { MemoryNonceStore } from '../src/nonce-store'
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 import type {
   AgentMeta,
   ApiKeyInfo,
@@ -97,7 +98,7 @@ function buildHarness(
   const usage: GatewayUsageEvent[] = []
   const settlements: Array<{ method: string; cost: number }> = []
 
-  const gw = createAgentGateway({
+  const baseConfig: GatewayConfig = {
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async (evt) => {
@@ -125,6 +126,11 @@ function buildHarness(
     rateLimitStore: new MemoryRateLimitStore(),
     nonceStore: new MemoryNonceStore(),
     ...cfg,
+  }
+  const gw = createAgentGateway({
+    ...baseConfig,
+    getSandbox: async (requestedAgent, context) =>
+      durableSandbox(await baseConfig.getSandbox(requestedAgent, context)),
   })
 
   const app = new Hono()
@@ -771,27 +777,26 @@ describe('A2A — authenticated sandbox context', () => {
 
 describe('A2A — tasks/get', () => {
   it('fails closed for production task access without an authorization hook', async () => {
+    const taskStore = new InMemoryTaskStore()
     const { app } = buildHarness({
       x402: { operatorAddress, chainId: 3799, verifySigner: async () => true, demoMode: false },
-      a2a: { taskStore: new InMemoryTaskStore() },
+      a2a: { taskStore },
     })
-    const sendRes = await postJsonRpc(
-      app,
-      'test-agent',
-      {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'message/send',
-        params: { message: textMessage('hi') },
+    const task: Task = {
+      kind: 'task',
+      id: 'task-production-access',
+      contextId: 'context-production-access',
+      status: { state: 'completed', timestamp: new Date().toISOString() },
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: 'agent_1', agentSlug: 'test-agent' },
       },
-      apiKeyHeader(),
-    )
-    const sent = (await sendRes.json()) as JSONRPCSuccessResponse<Task>
+    }
+    await taskStore.put(task)
 
     const getRes = await postJsonRpc(
       app,
       'test-agent',
-      { jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { id: sent.result.id } },
+      { jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: task.id } },
       apiKeyHeader(),
     )
     const body = (await getRes.json()) as JSONRPCErrorResponse
