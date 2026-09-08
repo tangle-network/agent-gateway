@@ -127,6 +127,7 @@ function buildHarness(cfg: Partial<GatewayConfig> = {}, chunks = ['Hello', ', ',
   const settlements: Array<{ method: string; consumerId: string; requestId: string; cost: number }> = []
 
   const gw = createAgentGateway({
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async (evt) => { usage.push(evt) },
@@ -262,6 +263,7 @@ describe('GET /:slug/chat/completions (discovery)', () => {
   it('supports production API-key-only gateways without advertising x402', async () => {
     const sandbox = new StubSandbox(['api only'])
     const gateway = createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async (slug) => slug === 'test-agent' ? makeAgent() : null,
       getSandbox: async () => sandbox,
       recordUsage: async () => undefined,
@@ -1718,6 +1720,7 @@ describe('POST /:slug/chat/completions — malformed input', () => {
 describe('createAgentGateway — production-config guard', () => {
   it('refuses to boot when neither verifySigner nor demoMode is set', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
@@ -1727,6 +1730,7 @@ describe('createAgentGateway — production-config guard', () => {
 
   it('boots when demoMode: true is set explicitly (test path)', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
@@ -1738,6 +1742,7 @@ describe('createAgentGateway — production-config guard', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     try {
       const gateway = createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => null,
         getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
         recordUsage: async () => { /* unused */ },
@@ -1764,6 +1769,7 @@ describe('createAgentGateway — production-config guard', () => {
 
   it('boots when verifySigner is supplied (production path)', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
@@ -1773,6 +1779,7 @@ describe('createAgentGateway — production-config guard', () => {
 
   it('requires an explicit version when durable payment operations are configured', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
@@ -1787,6 +1794,7 @@ describe('createAgentGateway — production-config guard', () => {
 
   it('requires a durable recovery outbox for production payment protocol version 2', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },
@@ -1802,6 +1810,7 @@ describe('createAgentGateway — production-config guard', () => {
 
   it('keeps older custom A2A task stores source-compatible', () => {
     expect(() => createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => null,
       getSandbox: async () => ({ async *streamPrompt() { /* unused */ } }),
       recordUsage: async () => { /* unused */ },

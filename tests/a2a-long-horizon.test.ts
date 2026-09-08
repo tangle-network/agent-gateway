@@ -140,6 +140,7 @@ function buildHarness(
   const fetchMock = vi.fn(async () => new Response('ok', { status: 200 }))
 
   const gw = createAgentGateway({
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async () => {},

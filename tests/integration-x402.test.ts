@@ -214,6 +214,7 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
   }
 
   const gw = createAgentGateway({
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => new ReplySandbox(chunks),
     recordUsage: async (evt) => { usage.push(evt) },

@@ -98,6 +98,7 @@ function buildHarness(
   const settlements: Array<{ method: string; cost: number }> = []
 
   const gw = createAgentGateway({
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async (evt) => {
@@ -221,6 +222,7 @@ describe('A2A — AgentCard discovery', () => {
   it('advertises only Bearer when payment transports are disabled', async () => {
     const agent = makeAgent()
     const gateway = createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => new StubSandbox(['ok']),
       recordUsage: async () => undefined,

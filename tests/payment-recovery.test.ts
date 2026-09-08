@@ -140,6 +140,7 @@ function mppRecoveryConfig(
   timing: { leaseMs?: number; retryDelayMs?: number } = {},
 ): GatewayConfig {
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async () => agent,
     getSandbox: async () => ({ async *streamPrompt() {} }),
     recordUsage: async () => undefined,
@@ -262,6 +263,7 @@ describe('generic MPP charge lifecycle', () => {
     let runs = 0
     let legacySettlements = 0
     const app = mount({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -318,6 +320,7 @@ describe('generic MPP charge lifecycle', () => {
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let runs = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({ async *streamPrompt() { runs += 1 } }),
       recordUsage: async () => undefined,
@@ -454,6 +457,7 @@ describe('generic MPP charge lifecycle', () => {
     const observerGate = new Promise<void>((resolve) => { releaseObserver = resolve })
     let runs = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -514,6 +518,7 @@ describe('generic MPP charge lifecycle', () => {
     let runs = 0
     const secret = 'spt_same_secret'
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -576,6 +581,7 @@ describe('generic MPP charge lifecycle', () => {
     const usage: GatewayUsageEvent[] = []
     let starts = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         streamPrompt() {
@@ -626,6 +632,7 @@ describe('generic MPP charge lifecycle', () => {
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let runs = 0
     const app = mount({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({ async *streamPrompt() { runs += 1 } }),
       recordUsage: async () => undefined,
@@ -665,6 +672,7 @@ describe('durable OpenAI recovery', () => {
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let sandboxCalls = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -720,6 +728,7 @@ describe('durable OpenAI recovery', () => {
     }
     const operations = new FailingExecutionOperations()
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({ async *streamPrompt() {} }),
       recordUsage: async () => undefined,
@@ -765,6 +774,7 @@ describe('durable OpenAI recovery', () => {
     let recordAtSandboxStart: Awaited<ReturnType<typeof recoveryStore.get>>
     const operationId = `x402:${commitment}:501`
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -849,6 +859,7 @@ describe('durable OpenAI recovery', () => {
     })
     const usage = new Map<string, GatewayUsageEvent>()
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt(_message, options) {
@@ -934,6 +945,7 @@ describe('durable OpenAI recovery', () => {
     })
     const usage: GatewayUsageEvent[] = []
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -992,6 +1004,7 @@ describe('durable OpenAI recovery', () => {
     })
     let usageAttempts = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({ async *streamPrompt() {} }),
       recordUsage: async () => {
@@ -1098,6 +1111,7 @@ describe('A2A recovery retention', () => {
       onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {

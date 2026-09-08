@@ -116,6 +116,7 @@ export default {
     const pushStore = new SqlPushNotificationStore(db)
 
     const gw = createAgentGateway({
+  authorizeConsumer: authorizeAgentAccess,
       // ... your existing config ...
       a2a: {
         taskStore,
@@ -227,6 +228,7 @@ import {
 } from '@tangle-network/agent-gateway'
 
 createAgentGateway({
+  authorizeConsumer: authorizeAgentAccess,
   // ...
   a2a: {
     pushStore: new SqlPushNotificationStore(d1ToSqlAdapter(env.DB)),
@@ -314,6 +316,7 @@ If you need at-least-once or exactly-once delivery, wrap the gateway's fetcher w
 
 ```ts
 createAgentGateway({
+  authorizeConsumer: authorizeAgentAccess,
   a2a: {
     pushStore: yourStore,
     webhookSecret: secret,

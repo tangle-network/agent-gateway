@@ -79,6 +79,7 @@ function durableConfig(
   overrides: Partial<GatewayConfig> = {},
 ): GatewayConfig {
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async () => agent,
     getSandbox: async () => sandbox(),
     recordUsage: async () => undefined,
@@ -138,6 +139,7 @@ describe('PR #11 production regressions', () => {
     ): Promise<Response> => webhook.fetch(new Request('https://receiver.local/terminal', init))
 
     const config = (sandbox: GatewayConfig['getSandbox']): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: sandbox,
       recordUsage: async () => undefined,
@@ -509,6 +511,7 @@ describe('PR #11 production regressions', () => {
     let runs = 0
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => {
         if (worker === 'runner') {
@@ -611,6 +614,7 @@ describe('PR #11 production regressions', () => {
     const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve })
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -827,6 +831,7 @@ describe('PR #11 production regressions', () => {
     let invocations = 0
     const longHistory = 'history '.repeat(500)
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -1317,6 +1322,7 @@ describe('PR #11 production regressions', () => {
   it('keeps A2A unavailable when production omits its task store', async () => {
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => sandbox(),
       recordUsage: async () => undefined,
@@ -1345,6 +1351,7 @@ describe('PR #11 production regressions', () => {
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => sandbox(),
       recordUsage: async () => undefined,
@@ -1394,6 +1401,7 @@ describe('PR #11 production regressions', () => {
       const app = new Hono()
       const taskStore = new InMemoryTaskStore()
       app.route('/v1/agents', createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => sandbox([
           { type: 'input-required', data: { inputRequired: { prompt: 'Need one more detail' } } },

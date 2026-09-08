@@ -103,6 +103,7 @@ describe('final payment boundary protocol guards', () => {
       let sandboxRuns = 0
       const app = new Hono()
       app.route('/v1/agents', createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => ({
           async *streamPrompt() {
@@ -156,6 +157,7 @@ describe('final payment boundary protocol guards', () => {
       let sandboxRuns = 0
       const app = new Hono()
       app.route('/v1/agents', createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => ({
           async *streamPrompt() {
@@ -218,6 +220,7 @@ describe('final payment boundary protocol guards', () => {
     let sandboxRuns = 0
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -272,6 +275,7 @@ describe('final payment boundary protocol guards', () => {
     await taskStore.put(paused)
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box(),
       recordUsage: async () => undefined,
@@ -328,6 +332,7 @@ describe('final payment boundary protocol guards', () => {
     let releaseLegacy!: () => void
     const legacyRelease = new Promise<void>((resolve) => { releaseLegacy = resolve })
     const shared = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box(),
       recordUsage: async () => undefined,
@@ -400,6 +405,7 @@ describe('final payment boundary protocol guards', () => {
     const apps = stores.map((operations) => {
       const app = new Hono()
       app.route('/v1/agents', createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => ({
           async *streamPrompt() {
@@ -458,6 +464,7 @@ describe('final payment boundary protocol guards', () => {
     let runs = 0
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {

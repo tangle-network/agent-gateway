@@ -77,6 +77,7 @@ function standardSandbox(): SandboxBox {
 
 function gatewayConfig(taskStore: TaskStore, overrides: Partial<GatewayConfig> = {}): GatewayConfig {
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agentA.slug ? agentA : null),
     getSandbox: async () => standardSandbox(),
     recordUsage: async () => undefined,

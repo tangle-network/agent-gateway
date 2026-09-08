@@ -72,6 +72,7 @@ describe('version 2 payment operations', () => {
       onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -532,6 +533,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -575,6 +577,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -609,6 +612,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -665,6 +669,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -723,6 +728,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -768,6 +774,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -810,6 +817,7 @@ describe('bounded request pricing and sandbox receipts', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         streamPrompt: () => ({ [Symbol.asyncIterator]: () => iterator }),
@@ -865,6 +873,7 @@ describe('bounded request pricing and sandbox receipts', () => {
         },
       }
       const config: GatewayConfig = {
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => ({
           streamPrompt: () => ({ [Symbol.asyncIterator]: () => iterator }),
@@ -948,6 +957,7 @@ async function collectUsage(
   } = {},
 ): Promise<SandboxUsageReceipt> {
   const config: GatewayConfig = {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async () => agent,
     getSandbox: async () => ({
       async *streamPrompt() {
