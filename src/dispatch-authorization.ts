@@ -394,13 +394,13 @@ export async function authenticateAndGuard(
     requestId,
     ...(threadId ? { threadId } : {}),
   })
-  if (!authz.allow) {
+  if (authz?.allow !== true) {
     return c.json(
       {
         error: {
-          message: authz.reason,
+          message: authz?.allow === false ? authz.reason : 'Invalid consumer authorization decision',
           type: 'authorization_denied',
-          code: authz.code,
+          code: authz?.allow === false ? authz.code : 'invalid_authorization_decision',
         },
       },
       { status: 403, headers: { 'X-Request-Id': requestId } },

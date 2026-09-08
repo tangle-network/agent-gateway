@@ -116,7 +116,7 @@ export default {
     const pushStore = new SqlPushNotificationStore(db)
 
     const gw = createAgentGateway({
-  authorizeConsumer: authorizeAgentAccess,
+      authorizeConsumer: authorizeAgentAccess,
       // ... your existing config ...
       a2a: {
         taskStore,
