@@ -187,6 +187,7 @@ export interface ApiKeyInfo {
   rateLimitPerMinute?: number
   /** Per-key daily limit override. */
   dailyLimit?: number
+  spendingLimitCents?: number | null
 }
 
 /** Resolve the URL where a caller can obtain an API key for one agent. */
@@ -198,7 +199,8 @@ export type ApiKeyPurchaseUrl =
 export interface ApiKeyRequestClaimResult {
   allowed: boolean
   /** The exhausted policy when `allowed` is false. */
-  reason?: 'minute' | 'daily'
+  reason?: 'minute' | 'daily' | 'spending'
+  reservedCents?: number
   minuteRemaining: number
   dailyRemaining: number
   minuteResetAt: number
@@ -210,6 +212,7 @@ export interface ApiKeyRequestClaimInput {
   keyInfo: ApiKeyInfo
   requestId: string
   requestedAt: Date
+  reservationCents?: number
 }
 
 // --- Sandbox interface ---
@@ -240,16 +243,24 @@ export interface SandboxStreamEvent {
   }
 }
 
+export type SandboxPromptOptions = {
+  sessionId?: string
+  systemPrompt?: string
+  maxOutputTokens?: number
+  executionBudget?: SandboxExecutionBudget
+  signal?: AbortSignal
+}
+
 export interface SandboxBox {
+  /** Prepare without starting compute. The returned stream must enforce every supplied budget across retries and child calls. */
+  prepareBudgetedPrompt?(message: string, opts: SandboxPromptOptions & { executionBudget: SandboxExecutionBudget }): Promise<
+    | { status: 'unsupported'; reason: string }
+    | { status: 'prepared'; start: () => AsyncIterable<SandboxStreamEvent> }
+  >
+
   streamPrompt(
     message: string,
-    opts?: {
-      sessionId?: string
-      systemPrompt?: string
-      maxOutputTokens?: number
-      executionBudget?: SandboxExecutionBudget
-      signal?: AbortSignal
-    },
+    opts?: SandboxPromptOptions,
   ): AsyncIterable<SandboxStreamEvent>
 }
 
@@ -260,6 +271,7 @@ export interface GatewaySandboxContext {
   keyInfo: ApiKeyInfo | null
   requestId: string
   messages: ChatMessage[]
+  apiKeyReservation?: { cents: number; executionBudget: SandboxExecutionBudget }
   /** Stable UI conversation id when `conversationMode` is `thread`. */
   threadId?: string
 }
@@ -333,6 +345,11 @@ export interface GatewayConfig {
    * Atomically count an accepted API-key request before compute starts.
    * Required when `verifyApiKey` returns a minute or daily request limit.
    */
+  apiKeyReservationLifecycle?: {
+    begin(keyId: string, requestId: string): Promise<void>
+    release(keyId: string, requestId: string): Promise<void>
+  }
+
   claimApiKeyRequest?: (
     input: ApiKeyRequestClaimInput,
   ) => Promise<ApiKeyRequestClaimResult>

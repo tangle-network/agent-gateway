@@ -1,4 +1,5 @@
 import type { ApiKey, ApiKeyStore } from './api-keys'
+import { ApiKeyReservationsSql } from './api-key-reservations-sql'
 import type { SqlAdapter } from './a2a/task-store-sql'
 import { requireSqlIdentifier } from './sql'
 import type { ApiKeyRequestClaimResult } from './types'
@@ -43,6 +44,7 @@ export interface SqlApiKeyStoreOptions {
   table?: string
   usageTable?: string
   requestTable?: string
+  reservationTable?: string
 }
 
 const REQUEST_CLAIM_PRUNE_INTERVAL = 256
@@ -53,6 +55,7 @@ export function sqlApiKeyStoreSchemaStatements(
   const table = requireSqlIdentifier(options.table ?? 'agent_api_key')
   const usageTable = requireSqlIdentifier(options.usageTable ?? `${table}_usage`)
   const requestTable = requireSqlIdentifier(options.requestTable ?? `${table}_request`)
+  const reservationTable = requireSqlIdentifier(options.reservationTable ?? `${table}_reservation`)
   return [
     `CREATE TABLE IF NOT EXISTS ${table} (
       id TEXT PRIMARY KEY,
@@ -93,6 +96,12 @@ export function sqlApiKeyStoreSchemaStatements(
       ON ${requestTable} (key_id, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_${requestTable}_day
       ON ${requestTable} (key_id, day_bucket)`,
+    `CREATE TABLE IF NOT EXISTS ${reservationTable} (
+      request_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, reserved_cents BIGINT NOT NULL,
+      state TEXT NOT NULL, created_at BIGINT NOT NULL,
+      FOREIGN KEY (key_id) REFERENCES ${table}(id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_${reservationTable}_key ON ${reservationTable} (key_id)`,
   ]
 }
 
@@ -141,6 +150,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
   private readonly table: string
   private readonly usageTable: string
   private readonly requestTable: string
+  readonly reservations: ApiKeyReservationsSql
 
   constructor(
     private readonly db: SqlAdapter,
@@ -149,8 +159,10 @@ export class SqlApiKeyStore implements ApiKeyStore {
     this.table = requireSqlIdentifier(options.table ?? 'agent_api_key')
     this.usageTable = requireSqlIdentifier(options.usageTable ?? `${this.table}_usage`)
     this.requestTable = requireSqlIdentifier(options.requestTable ?? `${this.table}_request`)
-    if (new Set([this.table, this.usageTable, this.requestTable]).size !== 3) {
-      throw new TypeError('API key, usage, and request table names must differ')
+    const reservationTable = requireSqlIdentifier(options.reservationTable ?? `${this.table}_reservation`)
+    this.reservations = new ApiKeyReservationsSql(db, reservationTable, this.table, this.usageTable)
+    if (new Set([this.table, this.usageTable, this.requestTable, reservationTable]).size !== 4) {
+      throw new TypeError('API key, usage, request, and reservation table names must differ')
     }
   }
 
@@ -160,6 +172,7 @@ export class SqlApiKeyStore implements ApiKeyStore {
       table: this.table,
       usageTable: this.usageTable,
       requestTable: this.requestTable,
+      reservationTable: this.reservations.table,
     })) {
       await this.db.exec(statement)
     }
@@ -256,7 +269,21 @@ export class SqlApiKeyStore implements ApiKeyStore {
     return result.rowsAffected > 0
   }
 
-  async claimRequest(
+  async claimRequest(keyId: string, requestId: string, requestedAt = new Date(), reservationCents?: number): Promise<ApiKeyRequestClaimResult> {
+    const claim = await this.claimRateRequest(keyId, requestId, requestedAt)
+    if (!claim.allowed) return claim
+    if (reservationCents === undefined) {
+      const current = (await this.db.query<{ spending_limit_cents: number | null }>(
+        `SELECT spending_limit_cents FROM ${this.table} WHERE id = ?`, [keyId],
+      ))[0]
+      if (!current || current.spending_limit_cents !== null) throw new Error('Finite API key caps require a spending reservation quote')
+      return claim
+    }
+    const reserved = await this.reservations.reserve(keyId, requestId, reservationCents)
+    return reserved ? { ...claim, reservedCents: reservationCents } : { ...claim, allowed: false, reason: 'spending' }
+  }
+
+  private async claimRateRequest(
     keyId: string,
     requestId: string,
     requestedAt = new Date(),
@@ -352,10 +379,12 @@ export class SqlApiKeyStore implements ApiKeyStore {
            k.spending_limit_cents IS NULL OR
            k.spent_cents + COALESCE((
              SELECT SUM(u.cost_cents) FROM ${this.usageTable} AS u WHERE u.key_id = k.id
-           ), 0) + ? <= k.spending_limit_cents
+           ), 0) + ${this.reservations.outstanding(true)} + ? <= k.spending_limit_cents
          )
+         AND NOT EXISTS (SELECT 1 FROM ${this.reservations.table} r WHERE r.request_id = ?
+           AND (r.key_id <> k.id OR r.state = 'released' OR r.reserved_cents < ?))
        ON CONFLICT(request_id) DO NOTHING`,
-      [usageRequestId, costCents, createdAt, keyId, costCents],
+      [usageRequestId, costCents, createdAt, keyId, usageRequestId, costCents, usageRequestId, costCents],
     )
     if (result.rowsAffected === 1) return
 

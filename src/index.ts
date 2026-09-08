@@ -1,3 +1,4 @@
+export { ApiKeyBudgetUnsupportedError } from './api-key-budget'
 export { createAgentGateway } from './middleware'
 export { maximumBillableInputTokens, reclaimPayment, SandboxStreamError } from './dispatch'
 export {
@@ -130,6 +131,7 @@ export type {
   SandboxUsageReceipt,
   SandboxStreamEvent,
   SandboxBox,
+  SandboxPromptOptions,
   GatewaySandboxContext,
   ApiKeyGatewayConfig,
   CreateAgentGatewayConfig,

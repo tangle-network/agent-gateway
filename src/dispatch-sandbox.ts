@@ -1,3 +1,4 @@
+import { prepareApiKeyPrompt } from './api-key-budget'
 import { redactSystemPromptFromOutput } from './filter'
 import type { A2ADispatchEvent, AuthorizedRequest } from './dispatch-types'
 import {
@@ -23,6 +24,7 @@ export function buildGatewaySandboxContext(
     keyInfo: authz.keyInfo,
     requestId: authz.requestId,
     messages: authz.messages ?? [],
+    ...(authz.apiKeyReservedCents !== undefined ? { apiKeyReservation: { cents: authz.apiKeyReservedCents, executionBudget: authz.executionBudget } } : {}),
     ...(authz.threadId !== undefined ? { threadId: authz.threadId } : {}),
   }
 }
@@ -121,37 +123,34 @@ export async function* dispatchSandboxStreamRich(
   const executionController = new AbortController()
   const forwardAbort = () => executionController.abort()
   if (signal?.aborted) return
-  signal?.addEventListener('abort', forwardAbort, { once: true })
-  const executionBudget: SandboxExecutionBudget = {
-    maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
-    maxOutputTokens: outputLimit,
-    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
-    maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
-    maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
-    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
-      (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit +
-        (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
-        (config.executionBudget?.maxToolTokens ?? outputLimit)
-    ) * agent.pricePerTokenUsd,
-  }
-  if (executionController.signal.aborted) return
-  await onExecutionStart?.()
-  if (executionController.signal.aborted) return
   let heartbeatError: unknown
   let heartbeatInFlight: Promise<void> | undefined
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined
   let iterator: AsyncIterator<SandboxStreamEvent> | undefined
   try {
+    signal?.addEventListener('abort', forwardAbort, { once: true })
+    const executionBudget: SandboxExecutionBudget = sandboxContext?.apiKeyReservation?.executionBudget ?? {
+      maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
+      maxOutputTokens: outputLimit,
+      maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
+      maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
+      maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
+      maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
+        (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit +
+          (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
+          (config.executionBudget?.maxToolTokens ?? outputLimit)
+      ) * agent.pricePerTokenUsd,
+    }
+    const { prepared, promptOptions } = await prepareApiKeyPrompt(box, userMessage, consumerId,
+      agent.systemPrompt, executionBudget, executionController.signal, sessionId, sandboxContext)
+    if (prepared) requiresReceipt = true
+    if (executionController.signal.aborted) return
+    await onExecutionStart?.()
+    if (executionController.signal.aborted) return
     // This durable handoff is after sandbox acquisition and immediately before
     // the adapter call that may start paid work.
     await onSandboxStart?.()
-    const promptStream = box.streamPrompt(userMessage, {
-      sessionId: sessionId ?? `consumer:${consumerId}`,
-      systemPrompt: agent.systemPrompt,
-      maxOutputTokens: outputLimit,
-      executionBudget,
-      signal: executionController.signal,
-    })
+    const promptStream = prepared ? prepared.start() : box.streamPrompt(userMessage, promptOptions)
     iterator = promptStream[Symbol.asyncIterator]()
     const heartbeatMs = onExecutionHeartbeat
       ? Math.max(100, Math.min(

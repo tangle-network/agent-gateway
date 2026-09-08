@@ -1,3 +1,4 @@
+import { ApiKeyBudgetUnsupportedError } from './api-key-budget'
 import { Hono } from 'hono'
 
 import { isChatMessageArray } from './chat-input'
@@ -673,9 +674,9 @@ async function completeChatCompletion(
     await reportCompletionError(obs, ctx, authz.consumerId, error)
     await releaseCompletionAfterFailure(authz, config, error, workObserved, usage)
     return c.json(
-      { error: { message: safeCompletionErrorMessage(error), type: 'server_error' } },
+      { error: { message: safeCompletionErrorMessage(error), type: 'server_error', ...(error instanceof ApiKeyBudgetUnsupportedError ? { code: error.code } : {}) } },
       {
-        status: 500,
+        status: error instanceof ApiKeyBudgetUnsupportedError ? 503 : 500,
         headers: completionHeaders(authz, false),
       },
     )
@@ -783,7 +784,7 @@ function streamChatCompletions(
         ) {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
+              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error', ...(err instanceof ApiKeyBudgetUnsupportedError ? { code: err.code } : {}) } })}\n\n`,
             ),
           )
         }
