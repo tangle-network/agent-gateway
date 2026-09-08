@@ -121,6 +121,7 @@ function atomicityConfig(
     },
   }
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => sandbox,
     recordUsage: async () => { counters.records += 1 },
@@ -285,6 +286,7 @@ describe('A2A task atomicity and restart recovery', () => {
     await taskStore.put(task)
 
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
       getSandbox: async () => ({ async *streamPrompt() { throw new Error('restart recovery must not execute sandbox') } }),
       recordUsage: async () => { counters.records += 1 },
@@ -433,6 +435,7 @@ describe('A2A task atomicity and restart recovery', () => {
       },
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
       getSandbox: async () => ({ async *streamPrompt() { throw new Error('recovery must not execute sandbox') } }),
       recordUsage: async () => { records += 1 },

@@ -49,6 +49,9 @@ import { isApiKeyAuthEnabled, isMppAuthEnabled, isX402AuthEnabled } from './veri
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
 export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
+  if (typeof inputConfig.authorizeConsumer !== 'function') {
+    throw new Error('createAgentGateway: authorizeConsumer must be an explicit authorization function')
+  }
   let config: GatewayConfig = inputConfig.x402
     ? inputConfig
     : {

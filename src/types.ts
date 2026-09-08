@@ -277,11 +277,11 @@ export interface GatewayConfig {
   getSandbox: (agent: AgentMeta, context?: GatewaySandboxContext) => Promise<SandboxBox>
 
   /**
-   * Optional host authorization hook fired after payment verification
+   * Required host authorization hook fired after payment verification
    * and before sandbox resolution. Use it for per-agent allowlists,
    * per-consumer quotas, contract scope checks, and instance ownership.
    */
-  authorizeConsumer?: (
+  authorizeConsumer: (
     agent: AgentMeta,
     consumer: {
       method: PaymentMethod

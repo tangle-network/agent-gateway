@@ -176,6 +176,7 @@ describe('Observer integrated with middleware', () => {
   function buildApp(observer: GatewayObserver) {
     const sandbox = new StubSandbox(['hello'])
     const gw = createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => makeAgent(),
       getSandbox: async () => sandbox,
       recordUsage: async () => {},
@@ -256,6 +257,7 @@ describe('Observer integrated with middleware', () => {
     const events: unknown[] = []
     const sandbox = new StubSandbox(['ok'])
     const gw = createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => makeAgent(),
       getSandbox: async () => sandbox,
       recordUsage: async () => {},

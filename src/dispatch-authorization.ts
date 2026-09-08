@@ -386,27 +386,25 @@ export async function authenticateAndGuard(
     }
   }
 
-  if (config.authorizeConsumer) {
-    const authz = await config.authorizeConsumer(agent, {
-      method: paymentMethod,
-      consumerId: consumerId,
-      keyId: keyInfo?.keyId,
-      ownerId: keyInfo?.ownerId,
-      requestId,
-      ...(threadId ? { threadId } : {}),
-    })
-    if (!authz.allow) {
-      return c.json(
-        {
-          error: {
-            message: authz.reason,
-            type: 'authorization_denied',
-            code: authz.code,
-          },
+  const authz = await config.authorizeConsumer(agent, {
+    method: paymentMethod,
+    consumerId: consumerId,
+    keyId: keyInfo?.keyId,
+    ownerId: keyInfo?.ownerId,
+    requestId,
+    ...(threadId ? { threadId } : {}),
+  })
+  if (authz?.allow !== true) {
+    return c.json(
+      {
+        error: {
+          message: authz?.allow === false ? authz.reason : 'Invalid consumer authorization decision',
+          type: 'authorization_denied',
+          code: authz?.allow === false ? authz.code : 'invalid_authorization_decision',
         },
-        { status: 403, headers: { 'X-Request-Id': requestId } },
-      )
-    }
+      },
+      { status: 403, headers: { 'X-Request-Id': requestId } },
+    )
   }
 
   const authorizedQuote = await resolveAuthorizedInputQuote(

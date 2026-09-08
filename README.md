@@ -34,6 +34,7 @@ await usageStore.migrate()
 app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
+  authorizeConsumer: authorizeAgentAccess,
   recordUsage: usageStore.recordUsage,
   claimApiKeyRequest: createApiKeyRequestClaim(apiKeyStore),
   settlePayment: createApiKeyUsageSettlement(apiKeyStore),
@@ -52,6 +53,12 @@ app.route('/v1/agents', createAgentGateway({
   verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
+
+Starting with 0.9.0, every gateway requires an explicit `authorizeConsumer` policy.
+Authentication or payment does not grant access to a private workspace.
+For private agents, resolve workspace and thread permissions from the verified consumer identity.
+Public services may explicitly allow consumers only when their execution environment contains approved public resources.
+Omitting the policy rejects gateway construction.
 
 Configure `continueOnDisconnect` when the host keeps agent turns alive after a caller closes the API stream.
 The gateway then consumes the final usage receipt and settles payment in background time.
