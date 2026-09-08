@@ -45,6 +45,7 @@ export interface AuthorizedRequest {
   executionBudget: SandboxExecutionBudget
   requiredPaymentAmount: bigint
   paymentPayload: Record<string, unknown> | null
+  apiKeyReservedCents?: number
   paymentNonceKey?: string
   mppMethod?: string
   /** Live generic MPP credential. Never write it to the recovery store. */

@@ -37,6 +37,7 @@ app.route('/v1/agents', createAgentGateway({
   authorizeConsumer: authorizeAgentAccess,
   recordUsage: usageStore.recordUsage,
   claimApiKeyRequest: createApiKeyRequestClaim(apiKeyStore),
+  apiKeyReservationLifecycle: apiKeyStore.reservations,
   settlePayment: createApiKeyUsageSettlement(apiKeyStore),
   x402: {
     operatorAddress: '0x…',
@@ -82,8 +83,28 @@ Concurrent workers cannot claim the same slot, and a retry with the same request
 When `verifyApiKey` returns a minute or daily limit, configure `claimApiKeyRequest` or the request fails closed with `503`.
 The SQL store retains the current and previous UTC day, then prunes older claim rows every 256 accepted requests.
 The API-key store also records each usage settlement once and refuses a settlement that would exceed the spending limit.
-This check runs after work completes, so it does not reserve funds before an in-flight request.
-Use a payment authorization flow when the product requires a strict pre-run budget.
+Finite-cap keys also reserve the full quoted customer charge before execution.
+The quote uses the greater of service-token charges and the provider-cost ceiling, matching settlement pricing.
+Reservations use whole cents; provider budgets remain USD, and token limits remain token counts.
+Concurrent workers cannot reserve more than the remaining key cap.
+Settlement records actual charges once and releases the unused portion of the matching reservation.
+Only a pre-execution reservation can be released after failure.
+An execution without a final receipt retains its reservation until an authoritative receipt reconciles it.
+Reservation rows are separate from rate counters and never expire through rate-counter pruning.
+
+Existing installations must add the reservation table from `sqlApiKeyStoreSchemaStatements()` before adopting this version.
+Its default name is `${table}_reservation`; `reservationTable` overrides it for custom schemas.
+Wire `apiKeyReservationLifecycle: apiKeyStore.reservations` alongside the claim and settlement callbacks.
+Do not delete executing reservations to recover capacity without first reconciling the underlying work.
+
+Capped execution requires `SandboxBox.prepareBudgetedPrompt`.
+Preparation must start no compute and return either an unsupported result or a prepared stream that enforces every supplied limit.
+Enforcement includes provider calls, retries, child calls, and tools throughout that stream.
+The gateway uses only this prepared stream for capped requests and requires a complete, enforced usage receipt.
+Missing support fails with `api_key.execution_budget_unsupported` before compute; explicitly uncapped keys keep their existing execution path.
+A receipt ceiling alone does not prove that upstream provider spending was bounded.
+Current remote agent-app chat adapters forward execution limits but do not implement this preparation contract.
+They remain unsupported for capped execution until the maintained Sandbox backend enforces per-turn limits across its complete execution lifecycle.
 The usage store writes USD values as integer nanodollars instead of SQL floating-point values.
 
 Production requires either `x402.verifySigner` or `verifyApiKey`.

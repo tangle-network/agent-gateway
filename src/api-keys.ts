@@ -69,6 +69,7 @@ export interface ApiKeyStore {
     keyId: string,
     requestId: string,
     requestedAt?: Date,
+    reservationCents?: number,
   ): Promise<ApiKeyRequestClaimResult>
 }
 
@@ -121,6 +122,7 @@ export function createApiKeyRequestClaim(
     input.keyInfo.keyId,
     input.requestId,
     input.requestedAt,
+    input.reservationCents,
   )
 }
 
@@ -163,7 +165,7 @@ export async function verifyApiKeyFromStore(
   authHeader: string,
   store: ApiKeyStore,
   prefix = 'ak_',
-): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
+): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number; spendingLimitCents: number | null } | null> {
   const bearerPrefix = `Bearer ${prefix}`
   if (!authHeader.startsWith(bearerPrefix)) return null
 
@@ -186,6 +188,7 @@ export async function verifyApiKeyFromStore(
     scopes: key.scopes,
     rateLimitPerMinute: key.rateLimit,
     dailyLimit: key.dailyLimit,
+    spendingLimitCents: key.spendingLimitCents,
   }
 }
 

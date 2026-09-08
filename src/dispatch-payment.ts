@@ -1,3 +1,4 @@
+import { apiKeyReservationQuote, assertApiKeyRequestClaim } from './api-key-budget'
 import {
   assertMppChargeOperation,
   mppPaymentOperationId,
@@ -47,19 +48,22 @@ export async function claimPayment(
     if (!claimRequest) {
       if (
         authz.keyInfo.rateLimitPerMinute !== undefined ||
-        authz.keyInfo.dailyLimit !== undefined
+        authz.keyInfo.dailyLimit !== undefined ||
+        (authz.keyInfo.spendingLimitCents !== undefined && authz.keyInfo.spendingLimitCents !== null)
       ) {
         throw new ApiKeyRequestClaimUnavailableError(
           'API key request limits are not configured',
         )
       }
     } else {
+      const reservationCents = apiKeyReservationQuote(authz, config)
       let claim
       try {
         claim = await claimRequest({
           keyInfo: authz.keyInfo,
           requestId: authz.requestId,
           requestedAt: new Date(authz.startMs),
+          ...(reservationCents !== undefined ? { reservationCents } : {}),
         })
       } catch (error) {
         if (
@@ -73,6 +77,10 @@ export async function claimPayment(
       }
       assertApiKeyRequestClaim(claim)
       if (!claim.allowed) throw new ApiKeyRequestLimitExceededError(claim)
+      if (reservationCents !== undefined) {
+        if (claim.reservedCents !== reservationCents) throw new ApiKeyRequestClaimUnavailableError('API key spending reservation is invalid')
+        authz.apiKeyReservedCents = reservationCents
+      }
       authz.rateLimitRemaining = Math.min(
         authz.rateLimitRemaining ?? claim.minuteRemaining,
         claim.minuteRemaining,
@@ -264,39 +272,15 @@ export async function claimPayment(
   }
 }
 
-function assertApiKeyRequestClaim(
-  claim: import('./types').ApiKeyRequestClaimResult,
-): void {
-  if (typeof claim.allowed !== 'boolean') {
-    throw new ApiKeyRequestClaimUnavailableError('API key request claim is invalid')
-  }
-  for (const [name, value] of [
-    ['minuteRemaining', claim.minuteRemaining],
-    ['dailyRemaining', claim.dailyRemaining],
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new ApiKeyRequestClaimUnavailableError(`API key request claim ${name} is invalid`)
-    }
-  }
-  for (const [name, value] of [
-    ['minuteResetAt', claim.minuteResetAt],
-    ['dailyResetAt', claim.dailyResetAt],
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new ApiKeyRequestClaimUnavailableError(`API key request claim ${name} is invalid`)
-    }
-  }
-  if (!claim.allowed && claim.reason !== 'minute' && claim.reason !== 'daily') {
-    throw new ApiKeyRequestClaimUnavailableError('API key request claim reason is invalid')
-  }
-}
-
 /** Release an owned operation when execution cannot produce a valid receipt. */
 export async function releasePayment(
   authz: AuthorizedRequest,
   config: GatewayConfig,
   reason: string,
 ): Promise<void> {
+  if (authz.apiKeyReservedCents !== undefined && authz.keyInfo) {
+    await config.apiKeyReservationLifecycle!.release(authz.keyInfo.keyId, authz.requestId)
+  }
   const ownsX402 = authz.paymentOperation &&
     authz.paymentOperationAcquired === true &&
     config.x402.paymentOperations
@@ -356,6 +340,9 @@ export async function markPaymentExecutionStarted(
   authz: AuthorizedRequest,
   config: GatewayConfig,
 ): Promise<void> {
+  if (authz.apiKeyReservedCents !== undefined && authz.keyInfo) {
+    await config.apiKeyReservationLifecycle!.begin(authz.keyInfo.keyId, authz.requestId)
+  }
   await updateExecutionLease(authz, config, true)
 }
 

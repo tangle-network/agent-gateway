@@ -26,7 +26,7 @@ async function createKey(
   store: SqlApiKeyStore,
   userId = 'user-1',
   keyHash = 'hash-1',
-  spendingLimitCents = 500,
+  spendingLimitCents: number | null = 500,
   limits: { rateLimit?: number; dailyLimit?: number } = {},
 ) {
   return store.create(userId, {
@@ -121,7 +121,7 @@ describe('SqlApiKeyStore', () => {
         store,
         'user-1',
         'limited-hash',
-        500,
+        null,
         { rateLimit: 2, dailyLimit: 3 },
       )
       const minuteOne = new Date('2026-09-02T12:00:10.000Z')
@@ -154,7 +154,7 @@ describe('SqlApiKeyStore', () => {
         store,
         'user-1',
         'request-hash',
-        500,
+        null,
         { rateLimit: 5, dailyLimit: 5 },
       )
       const now = new Date('2026-09-02T12:00:10.000Z')
@@ -184,7 +184,7 @@ describe('SqlApiKeyStore', () => {
         store,
         'user-1',
         'retention-hash',
-        500,
+        null,
         { rateLimit: 300, dailyLimit: 300 },
       )
       await store.claimRequest(key.id, 'old-request', new Date('2026-09-01T12:00:00.000Z'))
