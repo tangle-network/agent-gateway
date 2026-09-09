@@ -132,13 +132,11 @@ export async function* dispatchSandboxStreamRich(
     const executionBudget: SandboxExecutionBudget = sandboxContext?.apiKeyReservation?.executionBudget ?? {
       maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
       maxOutputTokens: outputLimit,
-      maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
-      maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
+      ...(config.executionBudget?.maxReasoningTokens !== undefined ? { maxReasoningTokens: config.executionBudget.maxReasoningTokens } : {}),
+      ...(config.executionBudget?.maxToolTokens !== undefined ? { maxToolTokens: config.executionBudget.maxToolTokens } : {}),
       maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
       maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
-        (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit +
-          (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
-          (config.executionBudget?.maxToolTokens ?? outputLimit)
+        (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit
       ) * agent.pricePerTokenUsd,
     }
     const { prepared, promptOptions } = await prepareApiKeyPrompt(box, userMessage, consumerId,
@@ -377,10 +375,10 @@ function enforceUsageBudget(
   if (usage.outputTokens !== undefined && usage.outputTokens > budget.maxOutputTokens) {
     throw new Error('sandbox exceeded max output tokens')
   }
-  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > budget.maxReasoningTokens) {
+  if (budget.maxReasoningTokens !== undefined && usage.reasoningTokens !== undefined && usage.reasoningTokens > budget.maxReasoningTokens) {
     throw new Error('sandbox exceeded max reasoning tokens')
   }
-  if (usage.toolTokens !== undefined && usage.toolTokens > budget.maxToolTokens) {
+  if (budget.maxToolTokens !== undefined && usage.toolTokens !== undefined && usage.toolTokens > budget.maxToolTokens) {
     throw new Error('sandbox exceeded max tool tokens')
   }
   if (usage.toolCallCount !== undefined && usage.toolCallCount > budget.maxToolCalls) {
@@ -395,13 +393,17 @@ function finalizeUsage(
   parts: Partial<SandboxUsageReceipt>,
   budget: SandboxExecutionBudget,
 ): SandboxUsageReceipt {
-  const fields = ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd', 'budgetEnforced'] as const
+  const fields = ['inputTokens', 'outputTokens', 'toolCallCount', 'providerCostUsd', 'budgetEnforced'] as const
   if (fields.some((field) => parts[field] === undefined)) {
     throw new Error('sandbox did not provide a complete usage receipt')
   }
+  if ((budget.maxReasoningTokens !== undefined && parts.reasoningTokens === undefined)
+    || (budget.maxToolTokens !== undefined && parts.toolTokens === undefined)) {
+    throw new Error('sandbox did not provide usage for an explicit token cap')
+  }
   const usage = parts as SandboxUsageReceipt
   for (const field of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const) {
-    if (!Number.isSafeInteger(usage[field]) || usage[field] < 0) {
+    if (usage[field] !== undefined && (!Number.isSafeInteger(usage[field]) || usage[field]! < 0)) {
       throw new Error(`sandbox usage field ${field} is invalid`)
     }
   }
@@ -412,7 +414,7 @@ function finalizeUsage(
     throw new Error('sandbox usage budget flag is invalid')
   }
   if (!Number.isSafeInteger(
-    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens,
+    usage.inputTokens + usage.outputTokens,
   )) {
     throw new Error('sandbox usage token total exceeds safe integer range')
   }
@@ -431,14 +433,14 @@ function completeLegacyUsage(
   const usage = {
     inputTokens: parts.inputTokens ?? estimateTokens(userMessage),
     outputTokens: parts.outputTokens ?? estimateTokens(outputText),
-    reasoningTokens: parts.reasoningTokens ?? 0,
-    toolTokens: parts.toolTokens ?? 0,
+    ...(parts.reasoningTokens !== undefined ? { reasoningTokens: parts.reasoningTokens } : {}),
+    ...(parts.toolTokens !== undefined ? { toolTokens: parts.toolTokens } : {}),
     toolCallCount: parts.toolCallCount ?? 0,
     providerCostUsd: parts.providerCostUsd ?? 0,
     budgetEnforced: false,
   }
   if (!Number.isSafeInteger(
-    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens,
+    usage.inputTokens + usage.outputTokens,
   )) {
     throw new Error('sandbox usage token total exceeds safe integer range')
   }
@@ -465,8 +467,6 @@ function completeUsage(
   const complete = [
     'inputTokens',
     'outputTokens',
-    'reasoningTokens',
-    'toolTokens',
     'toolCallCount',
     'providerCostUsd',
   ] as const

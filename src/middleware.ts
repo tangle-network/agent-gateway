@@ -114,11 +114,11 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   }
   const executionBudget = config.executionBudget
   for (const [name, value] of [
-    ['maxReasoningTokens', executionBudget?.maxReasoningTokens ?? maxOutputTokens],
-    ['maxToolTokens', executionBudget?.maxToolTokens ?? maxOutputTokens],
+    ['maxReasoningTokens', executionBudget?.maxReasoningTokens],
+    ['maxToolTokens', executionBudget?.maxToolTokens],
     ['maxToolCalls', executionBudget?.maxToolCalls ?? 8],
   ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new Error(`createAgentGateway: executionBudget.${name} must be a non-negative safe integer`)
     }
   }
@@ -214,8 +214,8 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     maxLen: config.maxMessageLength ?? 8000,
     maxOutputTokens,
     defaultOutputTokens,
-    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? maxOutputTokens,
-    maxToolTokens: config.executionBudget?.maxToolTokens ?? maxOutputTokens,
+    maxReasoningTokens: config.executionBudget?.maxReasoningTokens,
+    maxToolTokens: config.executionBudget?.maxToolTokens,
     maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
     maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd,
     obs: config.observer,

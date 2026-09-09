@@ -22,8 +22,8 @@ export interface GatewayState {
   maxLen: number
   maxOutputTokens: number
   defaultOutputTokens: number
-  maxReasoningTokens: number
-  maxToolTokens: number
+  maxReasoningTokens?: number
+  maxToolTokens?: number
   maxToolCalls: number
   maxProviderCostUsd?: number
   obs?: GatewayObserver
@@ -31,6 +31,8 @@ export interface GatewayState {
 
 /** Successful output from the request authorization pipeline. */
 export interface AuthorizedRequest {
+  /** Only historical recovery records use additive accounting. Live requests use inclusive totals. */
+  tokenAccounting?: 'inclusive' | 'additive'
   agent: AgentMeta
   consumerId: string
   paymentMethod: PaymentMethod

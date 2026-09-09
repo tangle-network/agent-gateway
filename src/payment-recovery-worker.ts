@@ -338,7 +338,11 @@ function baseUnitsToNumber(amount: bigint, decimals: number): number {
 
 function authorizedRequest(record: PaymentRecoveryRecord): AuthorizedRequest {
   const attribution = record.attribution
+  if (attribution.tokenAccounting !== undefined && attribution.tokenAccounting !== 'inclusive') {
+    throw new Error('unsupported payment token accounting basis')
+  }
   return {
+    tokenAccounting: attribution.tokenAccounting ?? 'additive',
     agent: recoveryAgent(record),
     consumerId: attribution.consumerId,
     paymentMethod: attribution.paymentMethod,
@@ -435,7 +439,7 @@ async function persistRecoveredUsage(
   config: GatewayConfig,
   now: number,
 ): Promise<PaymentRecoveryRecord> {
-  assertRecoveryUsage(usage)
+  assertRecoveryUsage(usage, record.attribution.tokenAccounting ?? 'additive')
   return updateOwnedPaymentRecovery(
     config.paymentRecovery!.store,
     record.id,
@@ -457,7 +461,7 @@ async function persistRecoveredUsage(
   )
 }
 
-function assertRecoveryUsage(usage: SandboxUsageReceipt): void {
+function assertRecoveryUsage(usage: SandboxUsageReceipt, tokenAccounting: 'inclusive' | 'additive'): void {
   for (const [name, value] of [
     ['inputTokens', usage.inputTokens],
     ['outputTokens', usage.outputTokens],
@@ -465,7 +469,8 @@ function assertRecoveryUsage(usage: SandboxUsageReceipt): void {
     ['toolTokens', usage.toolTokens],
     ['toolCallCount', usage.toolCallCount],
   ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
+    if (value === undefined && tokenAccounting === 'inclusive' && (name === 'reasoningTokens' || name === 'toolTokens')) continue
+    if (value === undefined || !Number.isSafeInteger(value) || value < 0) {
       throw new Error(`payment recovery ${name} must be a non-negative safe integer`)
     }
   }

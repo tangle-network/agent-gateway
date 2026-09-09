@@ -37,6 +37,8 @@ const FINALIZATION_LEASE_MS = 5 * 60 * 1000
 export type FinalizationState = 'completed' | 'input-required' | 'canceled'
 
 export interface FinalizationRecord {
+  /** Absent on historical records with additive reasoning/tool charges. */
+  tokenAccounting?: 'inclusive'
   version: 1
   lease: { id: string; expiresAt: number }
   agentSlug: string
@@ -97,6 +99,7 @@ export function buildFinalizationRecord(
   const operation = authz.paymentOperation
   return {
     version: 1,
+    tokenAccounting: 'inclusive',
     lease: { id: cryptoRandomId(), expiresAt: Date.now() + FINALIZATION_LEASE_MS },
     agentSlug: authz.agent.slug,
     requestId: authz.requestId,
@@ -128,6 +131,7 @@ export function readFinalizationRecord(task: Task): FinalizationRecord | undefin
   if (!raw || typeof raw !== 'object') return undefined
   const record = raw as Partial<FinalizationRecord>
   if (
+    (record.tokenAccounting !== undefined && record.tokenAccounting !== 'inclusive') ||
     record.version !== 1 ||
     !record.lease ||
     typeof record.lease.id !== 'string' ||
@@ -354,6 +358,7 @@ export async function recoverFinalizationIfNeeded(
     }
 
     const authz: AuthorizedRequest = {
+      tokenAccounting: renewed.tokenAccounting ?? 'additive',
       agent,
       consumerId: renewed.consumerId,
       paymentMethod: renewed.paymentMethod,
