@@ -141,6 +141,20 @@ OpenAI chat requests return a JSON `chat.completion` by default; set `stream: tr
 Set `apiKeyPurchaseUrl` to override the API-key purchase link in payment errors; without it, `baseUrl` keeps the `/agents/{slug}/api-keys` default.
 An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
 Sandbox adapters should emit a complete `sandbox.usage` receipt.
+Input and output token counts are inclusive provider totals across all model calls.
+Input totals include tool-result messages and applicable cache accounting.
+Output totals include reasoning tokens when the provider reports them as completion tokens.
+Reasoning and tool token fields are optional measured subsets; never add them again when billing.
+The gateway charges the greater of inclusive token charges and provider cost.
+It does not invent reasoning or tool token caps when the host omits them.
+Explicit detail caps, including zero, remain enforced and require the corresponding measured receipt field.
+Missing detail fields remain absent; absence does not mean measured zero.
+
+This accounting contract changes in 0.11.0.
+Normalize an adapter's provider totals before upgrading; do not report visible text alone as inclusive output.
+New payment outbox and A2A finalization records store `tokenAccounting: 'inclusive'`.
+Historical records without that field retain additive settlement arithmetic during recovery.
+Do not backfill the marker onto historical pending operations or replace their original quoted amounts.
 Requests with a version 2 operation or generic MPP charge reject missing receipts.
 API-key requests keep the legacy visible-token estimate path.
 recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.

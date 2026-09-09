@@ -36,6 +36,8 @@ export interface SerializedPaymentOperation {
 }
 
 export interface PaymentRecoveryAttribution {
+  /** Absent on historical rows, whose reasoning/tool counts were billed additively. */
+  tokenAccounting?: 'inclusive'
   requestId: string
   agentId: string
   agentSlug: string

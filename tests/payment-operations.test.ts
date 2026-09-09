@@ -438,8 +438,6 @@ describe('bounded request pricing and sandbox receipts', () => {
     await expect(collectUsage([partialUsageEvent()])).resolves.toEqual({
       inputTokens: 40,
       outputTokens: 20,
-      reasoningTokens: 0,
-      toolTokens: 0,
       toolCallCount: 0,
       providerCostUsd: 0.0123,
       budgetEnforced: false,

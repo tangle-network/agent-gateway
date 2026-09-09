@@ -8,7 +8,7 @@ export function apiKeyReservationQuote(authz: AuthorizedRequest, config: Gateway
   if (!config.apiKeyReservationLifecycle) throw new ApiKeyRequestClaimUnavailableError('API key spending reservations are not configured')
   const budget = authz.executionBudget
   return apiKeySettlementCostCents(Math.max(
-    (budget.maxInputTokens + budget.maxOutputTokens + budget.maxReasoningTokens + budget.maxToolTokens) * authz.agent.pricePerTokenUsd,
+    (budget.maxInputTokens + budget.maxOutputTokens) * authz.agent.pricePerTokenUsd,
     budget.maxProviderCostUsd,
   ))
 }

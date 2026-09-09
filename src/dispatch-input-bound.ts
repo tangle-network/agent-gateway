@@ -28,12 +28,12 @@ function quote(
   messageInputBound: number,
 ): InputQuote {
   const maxProviderCostUsd = state.maxProviderCostUsd ??
-    (inputTokens + maxOutputTokens + state.maxReasoningTokens + state.maxToolTokens) * agent.pricePerTokenUsd
+    (inputTokens + maxOutputTokens) * agent.pricePerTokenUsd
   const executionBudget: SandboxExecutionBudget = {
     maxInputTokens: inputTokens,
     maxOutputTokens,
-    maxReasoningTokens: state.maxReasoningTokens,
-    maxToolTokens: state.maxToolTokens,
+    ...(state.maxReasoningTokens !== undefined ? { maxReasoningTokens: state.maxReasoningTokens } : {}),
+    ...(state.maxToolTokens !== undefined ? { maxToolTokens: state.maxToolTokens } : {}),
     maxToolCalls: state.maxToolCalls,
     maxProviderCostUsd,
   }
