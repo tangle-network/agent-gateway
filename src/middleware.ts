@@ -1,3 +1,4 @@
+import { SandboxStreamError } from './dispatch-sandbox'
 import { ApiKeyBudgetUnsupportedError } from './api-key-budget'
 import { Hono } from 'hono'
 
@@ -605,6 +606,7 @@ async function releaseCompletionAfterFailure(
       config,
       error instanceof Error ? error.message : String(error),
       workObserved || usage !== undefined,
+      error instanceof SandboxStreamError ? usage : undefined,
     )
   } catch (releaseError) {
     console.error(

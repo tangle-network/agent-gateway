@@ -48,6 +48,7 @@ export interface PaymentRecoveryDependencies {
     authz: AuthorizedRequest,
     reason: string,
     workObserved: boolean,
+    usage?: SandboxUsageReceipt,
   ) => Promise<void>
   recoverDurablePayment: (
     recoveryId: string,
@@ -128,6 +129,7 @@ export async function releaseTaskPayment(
   deps: PaymentRecoveryDependencies,
   reason: string,
   workObserved: boolean,
+  usage?: SandboxUsageReceipt,
 ): Promise<Task> {
   if (
     !workObserved &&
@@ -166,7 +168,7 @@ export async function releaseTaskPayment(
   }
 
   try {
-    await deps.releasePaymentAfterFailure(authz, reason, workObserved)
+    await deps.releasePaymentAfterFailure(authz, reason, workObserved, usage)
   } catch (releaseError) {
     console.error(
       `[a2a] payment release failed for ${authz.requestId}:`,
@@ -174,9 +176,7 @@ export async function releaseTaskPayment(
     )
   }
   const current = await deps.taskStore.get(task.id) ?? task
-  return workObserved
-    ? current
-    : clearReconciledPaymentRecoveryMarker(current, deps)
+  return clearReconciledPaymentRecoveryMarker(current, deps)
 }
 
 async function beginPaymentReleaseRecovery(

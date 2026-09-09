@@ -1,3 +1,5 @@
+import { SandboxStreamError } from './sandbox-stream-error'
+export { SandboxStreamError } from './sandbox-stream-error'
 import { prepareApiKeyPrompt } from './api-key-budget'
 import { redactSystemPromptFromOutput } from './filter'
 import type { A2ADispatchEvent, AuthorizedRequest } from './dispatch-types'
@@ -26,29 +28,6 @@ export function buildGatewaySandboxContext(
     messages: authz.messages ?? [],
     ...(authz.apiKeyReservedCents !== undefined ? { apiKeyReservation: { cents: authz.apiKeyReservedCents, executionBudget: authz.executionBudget } } : {}),
     ...(authz.threadId !== undefined ? { threadId: authz.threadId } : {}),
-  }
-}
-
-/** Terminal failure reported by the sandbox event protocol. */
-export class SandboxStreamError extends Error {
-  readonly eventType: string
-  readonly code?: string
-  readonly details?: Record<string, unknown>
-
-  constructor(event: SandboxStreamEvent) {
-    const rawMessage = event.data?.message
-    const message = typeof rawMessage === 'string' && rawMessage.trim().length > 0
-      ? rawMessage.trim()
-      : 'Sandbox stream failed'
-    super(message)
-    this.name = 'SandboxStreamError'
-    this.eventType = event.type ?? 'unknown'
-    if (typeof event.data?.code === 'string' && event.data.code.length > 0) {
-      this.code = event.data.code
-    }
-    if (event.data?.details && typeof event.data.details === 'object' && !Array.isArray(event.data.details)) {
-      this.details = event.data.details
-    }
   }
 }
 
@@ -177,10 +156,20 @@ export async function* dispatchSandboxStreamRich(
       }
       if (next.done) break
       const event = next.value
+      if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
       if (event.type === 'error' || event.type === 'session.run.failed') {
+        // A failed run can still have a final, provider-enforced charge.
+        // The producer must send that receipt before its terminal error.
+        let usage: SandboxUsageReceipt
+        try {
+          usage = finalizeUsage(withObservedUsage(usageParts, observedReasoningTokens,
+            observedToolTokens, observedToolCalls), executionBudget)
+        } catch (cause) {
+          throw new SandboxStreamError(event, { cause })
+        }
+        yield { kind: 'usage', usage }
         throw new SandboxStreamError(event)
       }
-      if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
       if (event.data?.reasoning?.tokens !== undefined) {
         observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
         yield { kind: 'activity' }

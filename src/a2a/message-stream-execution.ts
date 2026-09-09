@@ -1,3 +1,4 @@
+import { SandboxStreamError } from '../dispatch-sandbox'
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
@@ -322,6 +323,7 @@ export async function executeMessageStream(
             lifecycle.payment,
             err instanceof Error ? err.message : String(err),
             workObserved || usage !== undefined,
+            err instanceof SandboxStreamError ? usage : undefined,
           )
           if (finalizationLeaseId) {
             const retained = await retainFinalizationForRecovery(

@@ -30,8 +30,8 @@ export function createTaskLifecycle(deps: TaskLifecycleDependencies): TaskLifecy
     paymentOperations: deps.config.x402.paymentOperations,
     paymentRecovery: deps.config.paymentRecovery,
     releasePayment: (authz, reason) => releasePayment(authz, deps.config, reason),
-    releasePaymentAfterFailure: (authz, reason, workObserved) =>
-      releasePaymentAfterFailure(authz, deps.config, reason, workObserved),
+    releasePaymentAfterFailure: (authz, reason, workObserved, usage) =>
+      releasePaymentAfterFailure(authz, deps.config, reason, workObserved, usage),
     recoverDurablePayment: (recoveryId, options) =>
       recoverDurablePayment(recoveryId, deps.config, options),
     deliverPush: deps.deliverPush,

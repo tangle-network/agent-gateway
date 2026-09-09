@@ -1,6 +1,6 @@
 {
   "name": "@tangle-network/agent-gateway",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "packageManager": "pnpm@10.28.0",
   "engines": {
     "node": ">=22.13.0"
@@ -45,13 +45,17 @@
     "hono": "^4.13.5"
   },
   "devDependencies": {
+    "@tangle-network/agent-app": "0.47.6",
+    "@tangle-network/agent-interface": "2.3.0",
+    "@tangle-network/agent-runtime": "0.192.2",
+    "@tangle-network/sandbox": "0.37.0",
     "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.11",
     "tsup": "^8.0.0",
     "typescript": "^5.9.3",
     "viem": "^2.56.2",
-    "vitest": "^4.1.11",
-    "vite": "8.0.16"
+    "vite": "8.0.16",
+    "vitest": "^4.1.11"
   },
   "pnpm": {
     "overrides": {

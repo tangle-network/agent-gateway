@@ -156,7 +156,12 @@ New payment outbox and A2A finalization records store `tokenAccounting: 'inclusi
 Historical records without that field retain additive settlement arithmetic during recovery.
 Do not backfill the marker onto historical pending operations or replace their original quoted amounts.
 Requests with a version 2 operation or generic MPP charge reject missing receipts.
-API-key requests keep the legacy visible-token estimate path.
+Uncapped API-key requests keep the legacy visible-token estimate path on successful completion.
+Capped requests require enforced usage receipts.
+A failed run must emit its complete, enforced receipt before `error` or `session.run.failed`.
+The gateway settles that measured usage while preserving the failed response or task state.
+Missing, invalid, or unenforced failed-run receipts never become estimated usage charges.
+Payment recovery retains unresolved ownership under its configured recovery policy.
 recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.
 Explicit demo mode exposes A2A with an in-memory task store.
 Production must configure an atomic durable task store; otherwise A2A returns `503` while the OpenAI surface remains available.
