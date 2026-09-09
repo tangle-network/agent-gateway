@@ -1,3 +1,4 @@
+import { SandboxStreamError } from '../sandbox-stream-error'
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
@@ -122,6 +123,7 @@ export async function executeMessageSend(
       deps.payment,
       err instanceof Error ? err.message : String(err),
       workObserved || usage !== undefined,
+      err instanceof SandboxStreamError ? usage : undefined,
     )
     const currentTask = await deps.taskStore.get(task.id) ?? releasedTask
     const failed = shouldPreserveTask(currentTask)

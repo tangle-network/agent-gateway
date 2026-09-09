@@ -22,14 +22,14 @@ async function fixture(cap: number | null = 1) {
 }
 
 
-function gateway(store: SqlApiKeyStore, box: SandboxBox) {
+function gateway(store: SqlApiKeyStore, box: SandboxBox, maxProviderCostUsd = 0.01) {
   return createAgentGateway({
       resolveAgent: async () => ({ id: 'agent', ownerId: 'owner', slug: 'agent', enabled: true, pricePerTokenUsd: 0, platformFeePercent: 0, sandboxEndpoint: null, remoteSandboxId: null, remoteBearerToken: null }),
       authorizeConsumer: async () => ({ allow: true }),
       verifyApiKey: header => verifyApiKeyFromStore(header, store),
       claimApiKeyRequest: createApiKeyRequestClaim(store), apiKeyReservationLifecycle: store.reservations,
       settlePayment: createApiKeyUsageSettlement(store), recordUsage: async () => {}, getSandbox: async () => box,
-      executionBudget: { maxProviderCostUsd: 0.01 }, a2a: false,
+      executionBudget: { maxProviderCostUsd }, a2a: false,
     })
 }
 
@@ -38,6 +38,41 @@ function request(app: ReturnType<typeof createAgentGateway>, token: string) {
 }
 
 describe('API key spending reservations', () => {
+  it.each([true, false])('settles a failed run from its enforced receipt (stream=%s)', async (stream) => {
+    const { db, store, token } = await fixture(20)
+    const app = gateway(store, {
+      async *streamPrompt() { throw new Error('Unbounded execution is forbidden') },
+      async prepareBudgetedPrompt() { return { status: 'prepared', start: async function* () {
+        yield { type: 'sandbox.usage', data: { usage: { inputTokens: 0, outputTokens: 1, toolCallCount: 0, providerCostUsd: 0.02, budgetEnforced: true } } }
+        yield { type: 'error', data: { message: 'Tool failed after paid inference' } }
+      } } },
+    }, 0.1)
+    try {
+      const response = await app.request('/agent/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }], stream }) })
+      expect(await response.text()).toContain('Tool failed after paid inference')
+      expect((await store.list('owner'))[0].spentCents).toBe(2)
+      expect(db.prepare('SELECT cost_cents FROM agent_api_key_usage').get()).toMatchObject({ cost_cents: 2 })
+      expect((await store.claimRequest((await store.list('owner'))[0].id, 'remaining', undefined, 18)).allowed).toBe(true)
+    } finally { db.close() }
+  })
+
+  it.each([undefined, false])('retains failed-run ownership without enforced usage (%s)', async (budgetEnforced) => {
+    const { db, store, token } = await fixture()
+    const app = gateway(store, {
+      async *streamPrompt() { throw new Error('Unbounded execution is forbidden') },
+      async prepareBudgetedPrompt() { return { status: 'prepared', start: async function* () {
+        if (budgetEnforced !== undefined) yield { type: 'sandbox.usage', data: { usage: { inputTokens: 0, outputTokens: 1, toolCallCount: 0, providerCostUsd: 0.002, budgetEnforced } } }
+        yield { type: 'error', data: { message: 'Tool failed after paid inference' } }
+      } } },
+    })
+    try {
+      expect(await (await request(app, token)).text()).toContain('Tool failed after paid inference')
+      expect((await store.list('owner'))[0].spentCents).toBe(0)
+      expect(db.prepare('SELECT state FROM agent_api_key_reservation').get()).toMatchObject({ state: 'executing' })
+      expect((await request(app, token)).status).toBe(429)
+    } finally { db.close() }
+  })
+
   it.each(['preparation', 'execution-start'])('removes abort forwarding when %s fails', async (failure) => {
     const controller = new AbortController()
     const added = vi.spyOn(controller.signal, 'addEventListener')

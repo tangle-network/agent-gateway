@@ -1,3 +1,4 @@
+import { settleAndRecord } from './dispatch-settlement'
 import { apiKeyReservationQuote, assertApiKeyRequestClaim } from './api-key-budget'
 import {
   assertMppChargeOperation,
@@ -378,15 +379,27 @@ async function updateExecutionLease(
 }
 
 /**
- * Release only when no sandbox work was observed. Once output or a receipt
- * exists, retain the owner for settlement or background recovery.
+ * Settle enforced failed-run usage; release only before sandbox work.
+ * Retain unresolved ownership and measured receipts for background recovery.
  */
 export async function releasePaymentAfterFailure(
   authz: AuthorizedRequest,
   config: GatewayConfig,
   reason: string,
   workObserved: boolean,
+  usage?: import('./types').SandboxUsageReceipt,
 ): Promise<void> {
+  if (usage?.budgetEnforced === true) {
+    try {
+      await settleAndRecord(authz.agent, authz, usage, config, config.observer)
+      return
+    } catch (error) {
+      // Settlement owns durable receipt capture before external effects. Keep
+      // its measured recovery record if acknowledgement or attribution failed.
+      console.error(`[agent-gateway] failed-run receipt settlement pending for ${authz.requestId}:`,
+        error instanceof Error ? error.message : String(error))
+    }
+  }
   if (workObserved) {
     const recovery = config.paymentRecovery
     if (recovery && authz.paymentRecoveryId) {
