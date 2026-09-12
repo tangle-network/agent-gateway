@@ -31,6 +31,7 @@ Existing default-scope behavior still applies when scopes are omitted or contain
 Dependencies must name configured scopes in a plain record.
 Use a computed property (`['__proto__']`) if that literal scope needs prerequisites.
 `requireExpiryForScopes` rejects missing or nonfuture expiry dates for any matching normalized scope before storage.
+The expiry check uses whole seconds to match the bundled SQL store.
 Other scopes retain the existing optional-expiry behavior.
 Request-time authentication must still enforce all required permissions, expiry, revocation, and workspace access.
 
