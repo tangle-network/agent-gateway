@@ -104,6 +104,42 @@ describe('createApiKeyRoutes — CRUD', () => {
     expect(res.status).toBe(401)
   })
 
+  it.each([
+    [['run'], 400, ['read']],
+    [['read', 'run'], 201, []],
+    [['read'], 201, []],
+    [['read', 'run', 'schedule'], 201, []],
+    [['read', 'schedule'], 400, ['run']],
+    [['run', 'schedule'], 400, ['read']],
+  ])('enforces scope prerequisites before storing %j', async (scopes, status, missing) => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store,
+      getAuthUserId: async () => 'user_alice',
+      validScopes: ['read', 'run', 'schedule'],
+      scopeDependencies: { run: ['read'], schedule: ['run'] },
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Operator', scopes }),
+    })
+    expect(response.status).toBe(status)
+    if (status === 400) {
+      expect(await response.json()).toMatchObject({ code: 'api_key.scope_dependency', missingScopes: missing })
+      expect(store.keys.size).toBe(0)
+    } else {
+      expect((await response.json() as { scopes: string[] }).scopes).toEqual(scopes)
+      expect(store.keys.size).toBe(1)
+    }
+  })
+
+  it('rejects dependency configuration containing unavailable scopes', () => {
+    for (const scopeDependencies of [{ run: ['missing'] }, { missing: ['read'] }]) {
+      expect(() => createApiKeyRoutes({
+        store, getAuthUserId: async () => 'user_alice', validScopes: ['read', 'run'], scopeDependencies,
+      })).toThrow(/dependencies must use configured scopes/)
+    }
+  })
+
   it('POST with empty name returns 400 — regression: silent success on invalid input masks UX bugs', async () => {
     const app = buildApp(store)
     const res = await app.request('/keys', {

@@ -202,6 +202,8 @@ export interface ApiKeyRoutesConfig {
   prefix?: string
   /** Valid scopes for this agent (default: ["chat"]) */
   validScopes?: string[]
+  /** Prerequisites callers must explicitly include when requesting a scope. */
+  scopeDependencies?: Readonly<Record<string, readonly string[]>>
 }
 
 function positiveInteger(value: unknown, fallback: number): number | null {
@@ -216,6 +218,12 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
   const prefix = config.prefix ?? 'ak_'
   const validScopes = config.validScopes ?? ['chat']
   if (validScopes.length === 0) throw new TypeError('At least one API key scope is required')
+  const dependencies = config.scopeDependencies ?? {}
+  for (const [scope, required] of Object.entries(dependencies)) {
+    if (!validScopes.includes(scope) || required.some(value => !validScopes.includes(value))) {
+      throw new TypeError(`API key scope dependencies must use configured scopes: ${scope}`)
+    }
+  }
   const defaultScope = validScopes.includes('chat') ? 'chat' : validScopes[0]
 
   // List keys
@@ -253,6 +261,12 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
       (scope): scope is string => typeof scope === 'string' && validScopes.includes(scope),
     ))]
     if (scopes.length === 0) scopes.push(defaultScope)
+    for (const scope of scopes) {
+      const missing = (dependencies[scope] ?? []).filter(required => !scopes.includes(required))
+      if (missing.length) {
+        return c.json({ error: `${scope} requires ${missing.join(', ')}`, code: 'api_key.scope_dependency', scope, missingScopes: missing }, 400)
+      }
+    }
 
     const rateLimit = positiveInteger(body.rateLimit, 60)
     if (rateLimit === null) return c.json({ error: 'rateLimit must be a positive integer' }, 400)
