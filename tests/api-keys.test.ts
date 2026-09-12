@@ -153,6 +153,27 @@ describe('createApiKeyRoutes — CRUD', () => {
     expect(store.keys.size).toBe(1)
   })
 
+  it('rejects prototype configuration instead of silently losing a prerequisite', () => {
+    expect(() => createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read', '__proto__'],
+      scopeDependencies: { __proto__: ['read'] },
+    })).toThrow(/dependencies must be a plain record/)
+  })
+
+  it('enforces an explicit own __proto__ prerequisite', async () => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read', '__proto__'],
+      scopeDependencies: { ['__proto__']: ['read'] },
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Operator', scopes: ['__proto__'] }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ code: 'api_key.scope_dependency', missingScopes: ['read'] })
+    expect(store.keys.size).toBe(0)
+  })
+
   it('POST with empty name returns 400 — regression: silent success on invalid input masks UX bugs', async () => {
     const app = buildApp(store)
     const res = await app.request('/keys', {

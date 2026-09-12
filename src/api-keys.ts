@@ -218,7 +218,13 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
   const prefix = config.prefix ?? 'ak_'
   const validScopes = config.validScopes ?? ['chat']
   if (validScopes.length === 0) throw new TypeError('At least one API key scope is required')
-  const dependencies = new Map(Object.entries(config.scopeDependencies ?? {}))
+  const configuredDependencies = config.scopeDependencies ?? {}
+  const prototype = Object.getPrototypeOf(configuredDependencies)
+  // A literal __proto__ entry changes the prototype instead of defining a scope.
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('API key scope dependencies must be a plain record')
+  }
+  const dependencies = new Map(Object.entries(configuredDependencies))
   for (const [scope, required] of dependencies) {
     if (!validScopes.includes(scope) || [...required].some(value => !validScopes.includes(value))) {
       throw new TypeError(`API key scope dependencies must use configured scopes: ${scope}`)

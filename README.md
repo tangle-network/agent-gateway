@@ -25,8 +25,10 @@ createApiKeyRoutes({
 ```
 
 Missing prerequisites return HTTP 400 with `api_key.scope_dependency` before key creation.
-The issuer never adds permissions the caller did not request.
-Dependencies must name configured scopes.
+The issuer never adds missing prerequisites automatically.
+Existing default-scope behavior still applies when scopes are omitted or contain no configured values.
+Dependencies must name configured scopes in a plain record.
+Use a computed property (`['__proto__']`) if that literal scope needs prerequisites.
 Request-time authentication must still enforce all required permissions, expiry, revocation, and workspace access.
 
 ## Usage
