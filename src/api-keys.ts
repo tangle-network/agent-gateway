@@ -204,6 +204,8 @@ export interface ApiKeyRoutesConfig {
   validScopes?: string[]
   /** Prerequisites callers must explicitly include when requesting a scope. */
   scopeDependencies?: Readonly<Record<string, readonly string[]>>
+  /** Scopes that require an explicit finite future expiry when issued. */
+  requireExpiryForScopes?: readonly string[]
 }
 
 function positiveInteger(value: unknown, fallback: number): number | null {
@@ -229,6 +231,13 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
     if (!validScopes.includes(scope) || [...required].some(value => !validScopes.includes(value))) {
       throw new TypeError(`API key scope dependencies must use configured scopes: ${scope}`)
     }
+  }
+  if (config.requireExpiryForScopes !== undefined && !Array.isArray(config.requireExpiryForScopes)) {
+    throw new TypeError('API key expiry requirements must be an array of configured scopes')
+  }
+  const expiryScopes = new Set(config.requireExpiryForScopes ?? [])
+  if ([...expiryScopes].some(scope => !validScopes.includes(scope))) {
+    throw new TypeError('API key expiry requirements must use configured scopes')
   }
   const defaultScope = validScopes.includes('chat') ? 'chat' : validScopes[0]
 
@@ -305,6 +314,10 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
     const rawKey = generateRawKey(prefix)
     const keyHash = await hashKey(rawKey)
     const keyPrefix = rawKey.slice(0, prefix.length + 8)
+
+    if (scopes.some(scope => expiryScopes.has(scope)) && (!expiresAt || expiresAt.getTime() <= Date.now())) {
+      return c.json({ error: 'These scopes require a future expiresAt', code: 'api_key.expiry_required' }, 400)
+    }
 
     const created = await config.store.create(userId, {
       name,
