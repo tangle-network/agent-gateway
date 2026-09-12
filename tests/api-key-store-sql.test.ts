@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { Hono } from 'hono'
+import { createApiKeyRoutes } from '../src/api-keys'
 
 import { SqlApiKeyStore, sqlApiKeyStoreSchemaStatements } from '../src/api-key-store-sql'
 import type { SqlAdapter } from '../src/a2a/task-store-sql'
@@ -42,6 +44,33 @@ async function createKey(
 }
 
 describe('SqlApiKeyStore', () => {
+  it('rejects scoped expiry that is already expired at SQL precision', async () => {
+    const db = new DatabaseSync(':memory:')
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2030-01-01T00:00:00.500Z'))
+    try {
+      const store = await createStore(db)
+      const app = new Hono().route('/keys', createApiKeyRoutes({
+        store, getAuthUserId: async () => 'owner', validScopes: ['read'], requireExpiryForScopes: ['read'],
+      }))
+      for (const [expiresAt, status] of [
+        ['2030-01-01T00:00:00.999Z', 400],
+        ['2030-01-01T00:00:01.000Z', 201],
+      ] as const) {
+        const response = await app.request('/keys', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'SQL precision', scopes: ['read'], expiresAt }),
+        })
+        expect(response.status).toBe(status)
+        const keys = await store.list('owner')
+        expect(keys).toHaveLength(status === 201 ? 1 : 0)
+        if (status === 201) expect(keys[0]!.expiresAt!.getTime()).toBeGreaterThan(Date.now())
+      }
+    } finally {
+      now.mockRestore()
+      db.close()
+    }
+  })
+
   it('migrates idempotently and preserves the API key contract', async () => {
     const db = new DatabaseSync(':memory:')
     try {

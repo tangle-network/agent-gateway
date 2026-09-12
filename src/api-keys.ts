@@ -315,7 +315,7 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
     const keyHash = await hashKey(rawKey)
     const keyPrefix = rawKey.slice(0, prefix.length + 8)
 
-    if (scopes.some(scope => expiryScopes.has(scope)) && (!expiresAt || expiresAt.getTime() <= Date.now())) {
+    if (scopes.some(scope => expiryScopes.has(scope)) && (!expiresAt || Math.floor(expiresAt.getTime() / 1000) * 1000 <= Date.now())) {
       return c.json({ error: 'These scopes require a future expiresAt', code: 'api_key.expiry_required' }, 400)
     }
 
