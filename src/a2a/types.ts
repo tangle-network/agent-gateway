@@ -161,6 +161,8 @@ export interface MessageSendParams {
 
 export interface TaskIdParams {
   id: string
+  /** Last sandbox event already observed by a reconnecting client. */
+  lastEventId?: string
   metadata?: Record<string, unknown>
 }
 

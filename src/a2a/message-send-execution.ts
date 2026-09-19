@@ -2,13 +2,20 @@ import { SandboxStreamError } from '../sandbox-stream-error'
 import type { Context } from 'hono'
 import {
   type AuthorizedRequest,
-  dispatchSandboxStreamRich,
   buildGatewaySandboxContext,
   beginPaymentExecution,
   markPaymentExecutionStarted,
   renewPaymentExecution,
 } from '../dispatch'
-import { claimTaskExecution, renewTaskExecution } from './execution-fence'
+import {
+  attachTaskExecutionReference,
+  claimTaskExecution,
+  renewTaskExecution,
+} from './execution-fence'
+import {
+  dispatchDetachedSandboxStreamRich,
+  taskExecutionTurnId,
+} from './detached-sandbox'
 import type { GatewayConfig, SandboxUsageReceipt } from '../types'
 import type { TaskStore } from './task-store'
 import { A2A_ERROR_CODES, type JSONRPCRequest, type Task } from './types'
@@ -53,10 +60,9 @@ export async function executeMessageSend(
   signal: AbortSignal,
 ): Promise<Response> {
   if (isTerminal(task.status.state)) return c.json(ok(req.id, task))
-  const taskWithoutSubmission = clearTaskSubmission(task)
   let workingTask: Task = task.status.state === 'working'
-    ? taskWithoutSubmission
-    : { ...taskWithoutSubmission, status: { state: 'working', timestamp: nowIso() } }
+    ? task
+    : { ...task, status: { state: 'working', timestamp: nowIso() } }
   if (
     JSON.stringify(task) !== JSON.stringify(workingTask) &&
     !await compareAndSetTask(deps.taskStore, task, workingTask)
@@ -79,7 +85,7 @@ export async function executeMessageSend(
   let inputRequiredSeen = false
   let finalizationLeaseId: string | undefined
   try {
-    for await (const event of dispatchSandboxStreamRich(
+    for await (const event of dispatchDetachedSandboxStreamRich(
       authz.agent,
       authz.userMessage,
       authz.consumerId,
@@ -102,6 +108,17 @@ export async function executeMessageSend(
         await renewPaymentExecution(authz, deps.config)
       },
       buildGatewaySandboxContext(authz),
+      {
+        turnId: taskExecutionTurnId(task),
+        onExecutionAccepted: async (reference) => {
+          workingTask = await attachTaskExecutionReference(
+            deps.taskStore,
+            workingTask,
+            authz.requestId,
+            reference,
+          )
+        },
+      },
     )) {
       if (event.kind === 'text') {
         responseText += event.delta

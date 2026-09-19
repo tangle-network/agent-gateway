@@ -218,6 +218,8 @@ export interface ApiKeyRequestClaimInput {
 // --- Sandbox interface ---
 
 export interface SandboxStreamEvent {
+  /** Runtime event cursor used to resume a detached execution. */
+  id?: string
   type?: string
   data?: {
     part?: { type?: string; text?: string }
@@ -243,6 +245,32 @@ export interface SandboxStreamEvent {
   }
 }
 
+export type SandboxRunControlRef = { environmentId: string; sessionId: string; executionId: string }
+
+interface SandboxDispatchResult {
+  sessionId: string
+  executionId?: string
+  runControlRef?: SandboxRunControlRef
+  dispatched?: boolean
+}
+
+export interface SandboxPromptResult {
+  success: boolean
+  status: string
+  executionId?: string
+  response?: string
+  error?: string
+  question?: string
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  costUsd?: number
+}
+
+interface SandboxDurableSession {
+  events: (opts?: { since?: string; executionId?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
+  result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
+  interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
+}
+
 export type SandboxPromptOptions = {
   sessionId?: string
   systemPrompt?: string
@@ -252,6 +280,8 @@ export type SandboxPromptOptions = {
 }
 
 export interface SandboxBox {
+  /** Stable sandbox/environment id from the provider, when available. */
+  id?: string
   /** Prepare without starting compute. The returned stream must enforce every supplied budget across retries and child calls. */
   prepareBudgetedPrompt?(message: string, opts: SandboxPromptOptions & { executionBudget: SandboxExecutionBudget }): Promise<
     | { status: 'unsupported'; reason: string }
@@ -262,6 +292,13 @@ export interface SandboxBox {
     message: string,
     opts?: SandboxPromptOptions,
   ): AsyncIterable<SandboxStreamEvent>
+  /** Start one idempotent run and detach it from the caller's stream. */
+  dispatchPrompt?: (
+    message: string,
+    opts?: SandboxPromptOptions & { turnId?: string },
+  ) => Promise<SandboxDispatchResult>
+  /** Resolve a lazy reference for one durable session. */
+  session?: (id: string) => SandboxDurableSession
 }
 
 /** Authenticated request identity supplied when the host resolves a sandbox. */

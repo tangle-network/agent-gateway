@@ -1,5 +1,6 @@
 import { InMemoryTaskStore } from '../src/a2a/task-store'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 import { describe, expect, it } from 'vitest'
 import { createAgentGateway } from '../src/middleware'
 import { MemoryPaymentOperations } from '../src/payment-operations'
@@ -88,10 +89,11 @@ describe('failed execution receipts', () => {
     const f = fixture()
     const tasks = new ServerAssignedTaskStore(new InMemoryTaskStore(), 'failed-paid-task')
     f.config.a2a = { taskStore: tasks, authorizeTaskAccess: async () => true }
-    f.config.getSandbox = async () => ({ async *streamPrompt() {
+    // A2A runs fail closed without durable dispatch controls; the adapter supplies them.
+    f.config.getSandbox = async () => durableSandbox({ async *streamPrompt() {
       yield { type: 'usage', data: { usage: totals } }
       yield { type: 'error', data: { message: 'Paid tool failure' } }
-    } })
+    } }, `failed-receipts-${method.replace('/', '-')}`)
     const response = await createAgentGateway(f.config).request('/inclusive', {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': JSON.stringify({
         commitment, signature: '0xsig', operator: '0x1', amount: '1000000', nonce: '42',

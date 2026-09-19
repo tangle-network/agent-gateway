@@ -10,13 +10,23 @@ import { MemoryPaymentRecoveryStore } from '../src/payment-recovery'
 import { recoverPayment } from '../src/payment-recovery-worker'
 import type { AgentMeta, GatewayConfig, SandboxBox } from '../src/types'
 import { ServerAssignedTaskStore } from './server-assigned-task-store'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 const commitment = `0x${'ab'.repeat(32)}`
 
 function createTestGateway(config: GatewayConfig) {
+  let sandbox: SandboxBox | undefined
   return createAgentGateway({
     ...config,
+    getSandbox: async (requestedAgent, context) => {
+      sandbox ??= durableSandbox(
+        await config.getSandbox(requestedAgent, context),
+        'payment-race-sandbox',
+      )
+      return sandbox
+    },
+    x402: { ...config.x402, demoMode: config.x402.demoMode ?? true },
     paymentRecovery: config.paymentRecovery ?? { store: new MemoryPaymentRecoveryStore() },
   })
 }
@@ -224,7 +234,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const continuation = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: {
@@ -1268,7 +1278,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const send = app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: {
@@ -1338,7 +1348,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const request = (method: 'message/send' | 'message/stream', requestId: string, token: string) =>
       app.request('/v1/agents/a2a-races', {
         method: 'POST',
@@ -1409,7 +1419,7 @@ describe('A2A payment ownership races', () => {
       a2a: { taskStore, authorizeTaskAccess: async () => true },
     }
     const app = new Hono()
-    app.route('/v1/agents', createAgentGateway(config))
+    app.route('/v1/agents', createTestGateway(config))
     const sent = await app.request('/v1/agents/a2a-races', {
       method: 'POST',
       headers: {

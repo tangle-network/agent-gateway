@@ -33,6 +33,7 @@ import type {
   SandboxBox,
   SandboxStreamEvent,
 } from '../src/types'
+import { durableSandbox } from './detached-sandbox'
 
 const operatorAddress = '0x1111111111111111111111111111111111111111'
 
@@ -142,7 +143,7 @@ function buildHarness(
   const gw = createAgentGateway({
     authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
-    getSandbox: async () => sandbox,
+    getSandbox: async () => durableSandbox(sandbox),
     recordUsage: async () => {},
     settlePayment: async () => {},
     verifyApiKey: async (header) => {
