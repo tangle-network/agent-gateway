@@ -11,6 +11,10 @@
  */
 
 import type { Context } from 'hono'
+import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from '../api-keys'
 
 import {
   type AuthorizedRequest,
@@ -106,6 +110,10 @@ const MAX_A2A_BODY_BYTES = 64 * 1024
 
 class RequestBodyTooLargeError extends Error {}
 
+function a2aConfig(config: GatewayConfig): Exclude<GatewayConfig['a2a'], false | undefined> | undefined {
+  return config.a2a === false ? undefined : config.a2a
+}
+
 function createTaskLifecycle(deps: A2AHandlerDeps): TaskLifecycle {
   return buildTaskLifecycle({
     taskStore: deps.taskStore,
@@ -147,11 +155,12 @@ function buildTaskMethodDependencies(
 function buildPushConfigMethodDependencies(
   deps: A2AHandlerDeps,
 ): PushConfigMethodDependencies {
+  const config = a2aConfig(deps.config)
   return {
     taskStore: deps.taskStore,
     pushStore: deps.pushStore,
     demoMode: deps.config.x402.demoMode === true,
-    urlValidator: deps.config.a2a?.pushUrlValidator,
+    urlValidator: config?.pushUrlValidator,
     authorizeTaskAccess: (c, req, task) => authorizeTaskAccess(c, req, task, deps),
   }
 }
@@ -465,7 +474,14 @@ async function claimTaskPayment(
         )
       },
     })
-  } catch {
+  } catch (claimError) {
+    const apiKeyFailure = apiKeyClaimFailureResponse(c, req, authz, claimError)
+    if (apiKeyFailure && !paymentFailureTask) {
+      // This task id has not left the request yet, and API-key admission owns
+      // no payment recovery state. Do not retain one task per rejected call.
+      await deps.taskStore.delete(task.id)
+      return apiKeyFailure
+    }
     let recoveryTask = paymentTask
     try {
       recoveryTask = await retainPaymentRecoveryMarker(
@@ -507,6 +523,7 @@ async function claimTaskPayment(
         taskError instanceof Error ? taskError.message : String(taskError),
       )
     }
+    if (apiKeyFailure) return apiKeyFailure
     return c.json(fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'Payment authorization failed'))
   }
 
@@ -543,6 +560,43 @@ async function claimTaskPayment(
   }
 }
 
+function apiKeyClaimFailureResponse(
+  c: Context,
+  req: JSONRPCRequest,
+  authz: AuthorizedRequest,
+  error: unknown,
+): Response | undefined {
+  if (error instanceof ApiKeyRequestLimitExceededError) {
+    const resetAt = error.claim.reason === 'daily'
+      ? error.claim.dailyResetAt
+      : error.claim.minuteResetAt
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
+    return c.json(
+      fail(
+        req.id,
+        A2A_ERROR_CODES.INTERNAL_ERROR,
+        `API key ${error.claim.reason} request limit exceeded`,
+      ),
+      {
+        status: 429,
+        headers: {
+          'Retry-After': String(retryAfterSeconds),
+          'X-Request-Id': authz.requestId,
+          'X-RateLimit-Remaining': String(error.claim.minuteRemaining),
+          'X-RateLimit-Daily-Remaining': String(error.claim.dailyRemaining),
+        },
+      },
+    )
+  }
+  if (error instanceof ApiKeyRequestClaimUnavailableError) {
+    return c.json(
+      fail(req.id, A2A_ERROR_CODES.INTERNAL_ERROR, 'API key request limits are unavailable'),
+      { status: 503, headers: { 'X-Request-Id': authz.requestId } },
+    )
+  }
+  return undefined
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 const EXECUTION_RECOVERY_METADATA_KEY = 'gatewayExecutionRecovery'
@@ -572,7 +626,7 @@ async function authorizeTaskAccess(
   } else if (!deps.config.x402.demoMode) {
     return c.json(fail(req.id, A2A_ERROR_CODES.TASK_ACCESS_DENIED, 'task origin is not recorded'), 403)
   }
-  const authorize = deps.config.a2a?.authorizeTaskAccess
+  const authorize = a2aConfig(deps.config)?.authorizeTaskAccess
   if (!authorize && deps.config.x402.demoMode) return undefined
   if (!authorize) {
     return c.json(
@@ -688,13 +742,14 @@ async function readJsonBody(request: Request): Promise<unknown> {
  * via `tasks/get` to confirm state.
  */
 async function maybeDeliverPush(task: Task, deps: A2AHandlerDeps): Promise<void> {
+  const config = a2aConfig(deps.config)
   const pushDeps: PushDeliveryDependencies = {
     taskStore: deps.taskStore,
     pushStore: deps.pushStore,
     demoMode: deps.config.x402.demoMode === true,
-    webhookSecret: deps.config.a2a?.webhookSecret,
-    fetcher: deps.config.a2a?.pushFetcher,
-    urlValidator: deps.config.a2a?.pushUrlValidator,
+    webhookSecret: config?.webhookSecret,
+    fetcher: config?.pushFetcher,
+    urlValidator: config?.pushUrlValidator,
     onDeliveryFailure: (failedTask, result) => {
       void deps.state.obs?.onStreamError?.(
         { requestId: result.taskId, agentSlug: failedTask.id, startMs: Date.now() },

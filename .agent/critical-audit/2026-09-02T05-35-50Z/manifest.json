@@ -1,0 +1,11 @@
+{
+  "skill": "critical-audit",
+  "scope": "23d9f8a..1ff6f0d",
+  "base": "23d9f8a4bf74016b7df25dade31ab3a7a421d53a",
+  "head": "1ff6f0dd4148713351ffcac8a80311db3493dd03",
+  "files": 6,
+  "projectType": "TypeScript package",
+  "reviewers": ["correctness-security", "architecture-quality", "standards-real-system"],
+  "mode": "serial",
+  "verdict": "APPROVE"
+}

@@ -104,6 +104,132 @@ describe('createApiKeyRoutes — CRUD', () => {
     expect(res.status).toBe(401)
   })
 
+  it.each([
+    [['run'], 400, ['read']],
+    [['read', 'run'], 201, []],
+    [['read'], 201, []],
+    [['read', 'run', 'schedule'], 201, []],
+    [['read', 'schedule'], 400, ['run']],
+    [['run', 'schedule'], 400, ['read']],
+  ])('enforces scope prerequisites before storing %j', async (scopes, status, missing) => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store,
+      getAuthUserId: async () => 'user_alice',
+      validScopes: ['read', 'run', 'schedule'],
+      scopeDependencies: { run: ['read'], schedule: ['run'] },
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Operator', scopes }),
+    })
+    expect(response.status).toBe(status)
+    if (status === 400) {
+      expect(await response.json()).toMatchObject({ code: 'api_key.scope_dependency', missingScopes: missing })
+      expect(store.keys.size).toBe(0)
+    } else {
+      expect((await response.json() as { scopes: string[] }).scopes).toEqual(scopes)
+      expect(store.keys.size).toBe(1)
+    }
+  })
+
+  it.each([
+    [['read'], undefined, 400],
+    [['read'], null, 400],
+    [['read'], 'invalid', 400],
+    [['read'], '2029-12-31T23:59:59.000Z', 400],
+    [['read'], '2030-01-01T00:00:00.000Z', 400],
+    [['read'], '2030-01-01T00:01:00.000Z', 201],
+    [['chat', 'read'], undefined, 400],
+    [['chat'], undefined, 201],
+  ])('requires a future expiry for configured scopes %j with %j', async (scopes, expiresAt, status) => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2030-01-01T00:00:00.000Z'))
+    try {
+      const app = new Hono().route('/keys', createApiKeyRoutes({
+        store, getAuthUserId: async () => 'user_alice', validScopes: ['chat', 'read'],
+        requireExpiryForScopes: ['read'],
+      }))
+      const response = await app.request('/keys', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Expiry policy', scopes, expiresAt }),
+      })
+      expect(response.status).toBe(status)
+      expect(store.keys.size).toBe(status === 201 ? 1 : 0)
+      if (status === 201) {
+        expect([...store.keys.values()][0]!.expiresAt?.toISOString() ?? null).toBe(expiresAt ?? null)
+      }
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('applies expiry policy to the normalized default scope', async () => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read'], requireExpiryForScopes: ['read'],
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Default scope' }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ code: 'api_key.expiry_required' })
+    expect(store.keys.size).toBe(0)
+  })
+
+  it.each([null, 'read', {}])('rejects a non-array expiry policy: %j', value => {
+    expect(() => createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read'], requireExpiryForScopes: value as never,
+    })).toThrow(/expiry requirements must be an array/)
+  })
+
+  it('rejects unavailable or sparse expiry policy scopes at construction', () => {
+    for (const requireExpiryForScopes of [['missing'], new Array<string>(1)]) {
+      expect(() => createApiKeyRoutes({
+        store, getAuthUserId: async () => 'user_alice', validScopes: ['read'], requireExpiryForScopes,
+      })).toThrow(/expiry requirements must use configured scopes/)
+    }
+  })
+
+  it('rejects dependency configuration containing unavailable scopes', () => {
+    for (const scopeDependencies of [{ run: ['missing'] }, { missing: ['read'] }, { run: new Array<string>(1) }]) {
+      expect(() => createApiKeyRoutes({
+        store, getAuthUserId: async () => 'user_alice', validScopes: ['read', 'run'], scopeDependencies,
+      })).toThrow(/dependencies must use configured scopes/)
+    }
+  })
+
+  it.each(['toString', 'constructor', '__proto__'])('issues a configured prototype-named scope: %s', async (scope) => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: [scope],
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Operator', scopes: [scope] }),
+    })
+    expect(response.status).toBe(201)
+    expect((await response.json() as { scopes: string[] }).scopes).toEqual([scope])
+    expect(store.keys.size).toBe(1)
+  })
+
+  it('rejects prototype configuration instead of silently losing a prerequisite', () => {
+    expect(() => createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read', '__proto__'],
+      scopeDependencies: { __proto__: ['read'] },
+    })).toThrow(/dependencies must be a plain record/)
+  })
+
+  it('enforces an explicit own __proto__ prerequisite', async () => {
+    const app = new Hono().route('/keys', createApiKeyRoutes({
+      store, getAuthUserId: async () => 'user_alice', validScopes: ['read', '__proto__'],
+      scopeDependencies: { ['__proto__']: ['read'] },
+    }))
+    const response = await app.request('/keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Operator', scopes: ['__proto__'] }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ code: 'api_key.scope_dependency', missingScopes: ['read'] })
+    expect(store.keys.size).toBe(0)
+  })
+
   it('POST with empty name returns 400 — regression: silent success on invalid input masks UX bugs', async () => {
     const app = buildApp(store)
     const res = await app.request('/keys', {

@@ -43,6 +43,7 @@ export async function preparePaymentRecovery(
     state: 'claiming',
     payment,
     attribution: {
+      tokenAccounting: 'inclusive',
       requestId: authz.requestId,
       agentId: authz.agent.id,
       agentSlug: authz.agent.slug,

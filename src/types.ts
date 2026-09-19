@@ -187,6 +187,32 @@ export interface ApiKeyInfo {
   rateLimitPerMinute?: number
   /** Per-key daily limit override. */
   dailyLimit?: number
+  spendingLimitCents?: number | null
+}
+
+/** Resolve the URL where a caller can obtain an API key for one agent. */
+export type ApiKeyPurchaseUrl =
+  | string
+  | ((slug: string) => string | undefined)
+
+/** Durable result for one accepted API-key request. */
+export interface ApiKeyRequestClaimResult {
+  allowed: boolean
+  /** The exhausted policy when `allowed` is false. */
+  reason?: 'minute' | 'daily' | 'spending'
+  reservedCents?: number
+  minuteRemaining: number
+  dailyRemaining: number
+  minuteResetAt: number
+  dailyResetAt: number
+}
+
+/** Identity supplied to the durable API-key request counter. */
+export interface ApiKeyRequestClaimInput {
+  keyInfo: ApiKeyInfo
+  requestId: string
+  requestedAt: Date
+  reservationCents?: number
 }
 
 // --- Sandbox interface ---
@@ -207,9 +233,8 @@ export interface SandboxStreamEvent {
      * Optional sandbox-side signal that the agent has paused and is waiting
      * for additional input from the caller. The A2A gateway translates this
      * into an `input-required` task status; the caller can then submit a
-     * follow-up `message/send` with the same `taskId` to continue. Ignored
-     * by the OpenAI-compat path. Carry an optional `prompt` to surface to
-     * the caller (rendered as the input-required message body).
+     * follow-up `message/send` with the same `taskId` to continue. The
+     * OpenAI-compat path renders an optional `prompt` in the assistant body.
      */
     inputRequired?: { prompt?: string }
     /** Provider receipt fields. Version 2 operations require every field. */
@@ -246,30 +271,31 @@ interface SandboxDurableSession {
   interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
 }
 
+export type SandboxPromptOptions = {
+  sessionId?: string
+  systemPrompt?: string
+  maxOutputTokens?: number
+  executionBudget?: SandboxExecutionBudget
+  signal?: AbortSignal
+}
+
 export interface SandboxBox {
   /** Stable sandbox/environment id from the provider, when available. */
   id?: string
+  /** Prepare without starting compute. The returned stream must enforce every supplied budget across retries and child calls. */
+  prepareBudgetedPrompt?(message: string, opts: SandboxPromptOptions & { executionBudget: SandboxExecutionBudget }): Promise<
+    | { status: 'unsupported'; reason: string }
+    | { status: 'prepared'; start: () => AsyncIterable<SandboxStreamEvent> }
+  >
+
   streamPrompt(
     message: string,
-    opts?: {
-      sessionId?: string
-      systemPrompt?: string
-      maxOutputTokens?: number
-      executionBudget?: SandboxExecutionBudget
-      signal?: AbortSignal
-    },
+    opts?: SandboxPromptOptions,
   ): AsyncIterable<SandboxStreamEvent>
   /** Start one idempotent run and detach it from the caller's stream. */
   dispatchPrompt?: (
     message: string,
-    opts?: {
-      sessionId?: string
-      turnId?: string
-      systemPrompt?: string
-      maxOutputTokens?: number
-      executionBudget?: SandboxExecutionBudget
-      signal?: AbortSignal
-    },
+    opts?: SandboxPromptOptions & { turnId?: string },
   ) => Promise<SandboxDispatchResult>
   /** Resolve a lazy reference for one durable session. */
   session?: (id: string) => SandboxDurableSession
@@ -282,6 +308,7 @@ export interface GatewaySandboxContext {
   keyInfo: ApiKeyInfo | null
   requestId: string
   messages: ChatMessage[]
+  apiKeyReservation?: { cents: number; executionBudget: SandboxExecutionBudget }
   /** Stable UI conversation id when `conversationMode` is `thread`. */
   threadId?: string
 }
@@ -299,11 +326,11 @@ export interface GatewayConfig {
   getSandbox: (agent: AgentMeta, context?: GatewaySandboxContext) => Promise<SandboxBox>
 
   /**
-   * Optional host authorization hook fired after payment verification
+   * Required host authorization hook fired after payment verification
    * and before sandbox resolution. Use it for per-agent allowlists,
    * per-consumer quotas, contract scope checks, and instance ownership.
    */
-  authorizeConsumer?: (
+  authorizeConsumer: (
     agent: AgentMeta,
     consumer: {
       method: PaymentMethod
@@ -325,6 +352,13 @@ export interface GatewayConfig {
    */
   recordUsage: (event: GatewayUsageEvent) => Promise<void>
 
+  /**
+   * Keep the gateway task alive after the HTTP client disconnects.
+   * Pass a Worker execution context's `waitUntil` method here.
+   * When omitted, disconnecting aborts sandbox work.
+   */
+  continueOnDisconnect?: (task: Promise<void>) => void
+
   /** x402 payment configuration */
   x402: X402Config
 
@@ -345,6 +379,19 @@ export interface GatewayConfig {
   verifyApiKey?: (authHeader: string) => Promise<ApiKeyInfo | null>
 
   /**
+   * Atomically count an accepted API-key request before compute starts.
+   * Required when `verifyApiKey` returns a minute or daily request limit.
+   */
+  apiKeyReservationLifecycle?: {
+    begin(keyId: string, requestId: string): Promise<void>
+    release(keyId: string, requestId: string): Promise<void>
+  }
+
+  claimApiKeyRequest?: (
+    input: ApiKeyRequestClaimInput,
+  ) => Promise<ApiKeyRequestClaimResult>
+
+  /**
    * Settle a legacy payment after usage attribution is recorded.
    * Version 2 x402 operations use `x402.paymentOperations` instead.
    * Production x402 version 1 rejects this callback before nonce claim.
@@ -355,6 +402,13 @@ export interface GatewayConfig {
 
   /** Base URL for API key purchase links (e.g. "https://film.tangle.tools") */
   baseUrl?: string
+
+  /**
+   * Override the API-key purchase URL shown in payment errors.
+   * A string is used as-is; a function receives the agent slug.
+   * Without this override, `baseUrl` keeps its historical `/agents/{slug}/api-keys` path.
+   */
+  apiKeyPurchaseUrl?: ApiKeyPurchaseUrl
 
   /** Public API key prefix shown by discovery. Defaults to `sk_agent_`. */
   apiKeyPrefix?: string
@@ -376,13 +430,30 @@ export interface GatewayConfig {
   defaultOutputTokens?: number
 
   /**
+   * Conservative complete-input bound used before payment authentication.
+   * Required when `inputTokenBound` is configured for an x402-capable gateway.
+   */
+  unauthenticatedInputTokenBound?: number
+
+  /**
    * Return a safe upper bound for the complete provider input.
    * Include system, chat framing, retained history, tools, harness, and workspace context.
+   * The callback runs after payment authentication and `authorizeConsumer`,
+   * so it may safely read consumer-owned retained history.
    */
   inputTokenBound?: (input: {
     agent: AgentMeta
     messages: ChatMessage[]
-  }) => number
+    requestId: string
+    /** Stable UI conversation id when `conversationMode` is `thread`. */
+    threadId?: string
+    /** Verified payment identity. */
+    consumerId: string
+    paymentMethod: PaymentMethod
+    /** Verified API-key identity, when the request uses an API key. */
+    keyId?: string
+    ownerId?: string
+  }) => number | Promise<number>
 
   /** Hidden provider spend limits included in the pre-execution payment quote. */
   executionBudget?: {
@@ -423,11 +494,12 @@ export interface GatewayConfig {
    *   GET  /:slug/.well-known/agent.json   — AgentCard discovery
    *   POST /:slug                          — JSON-RPC 2.0 endpoint
    *     methods: message/send, message/stream, tasks/get, tasks/cancel
+   * Set `a2a: false` to disable these routes and their setup checks.
    * Auth + rate-limit + injection-filter + authorization all share the
    * same pipeline as the OpenAI-compat path. Demo mode defaults to
    * `InMemoryTaskStore`; production must configure D1/postgres/DO storage.
   */
-  a2a?: {
+  a2a?: false | {
     /**
      * Authorize reads, cancellation, resubscription, and push configuration
      * for an existing task. Production control methods fail closed when this
@@ -513,4 +585,23 @@ export interface ChatCompletionChunk {
     delta: { content?: string; role?: string }
     finish_reason: string | null
   }>
+}
+
+export interface ChatCompletionUsage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+}
+
+export interface ChatCompletion {
+  id: string
+  object: 'chat.completion'
+  created: number
+  model: string
+  choices: Array<{
+    index: number
+    message: { role: 'assistant'; content: string }
+    finish_reason: string | null
+  }>
+  usage: ChatCompletionUsage
 }

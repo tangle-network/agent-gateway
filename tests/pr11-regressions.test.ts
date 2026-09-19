@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { maximumBillableInputTokens as rootMaximumBillableInputTokens } from '../src'
 import { InMemoryTaskStore, type TaskStore } from '../src/a2a/task-store'
 import { SqlTaskStore, type SqlAdapter } from '../src/a2a/task-store-sql'
 import { InMemoryPushNotificationStore } from '../src/a2a/push-notifications'
@@ -38,12 +39,16 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-function paymentHeader(nonce: string, expiry = Math.floor(Date.now() / 1000) + 600): string {
+function paymentHeader(
+  nonce: string,
+  expiry = Math.floor(Date.now() / 1000) + 600,
+  amount = '1000000000',
+): string {
   return JSON.stringify({
     commitment,
     signature: '0xsig',
     operator: operatorAddress,
-    amount: '1000000000',
+    amount,
     nonce,
     expiry: String(expiry),
   })
@@ -76,6 +81,7 @@ function durableConfig(
 ): GatewayConfig {
   const getSandbox = overrides.getSandbox ?? (async () => sandbox())
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async () => agent,
     recordUsage: async () => undefined,
     x402: {
@@ -94,6 +100,16 @@ function durableConfig(
 }
 
 describe('PR #11 production regressions', () => {
+  it('exports the conservative input bound from the package root', () => {
+    expect(rootMaximumBillableInputTokens({ ...agent, systemPrompt: '' }, '😀')).toBe(4)
+  })
+
+  it('requires a conservative pre-auth bound for dynamic x402 input pricing', () => {
+    expect(() => createAgentGateway(durableConfig({
+      inputTokenBound: async () => 4_096,
+    }))).toThrow(/unauthenticatedInputTokenBound/)
+  })
+
   it('claims one terminal webhook when cancellation races fenced settlement on two workers', async () => {
     const taskStore = new ServerAssignedTaskStore(
       new InMemoryTaskStore(),
@@ -127,6 +143,7 @@ describe('PR #11 production regressions', () => {
 
     let sharedSandbox: SandboxBox | undefined
     const config = (sandbox: GatewayConfig['getSandbox']): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async (requestedAgent, context) => {
         sharedSandbox ??= durableSandbox(
@@ -526,6 +543,7 @@ describe('PR #11 production regressions', () => {
     let runs = 0
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => {
         if (worker === 'runner') {
@@ -628,6 +646,7 @@ describe('PR #11 production regressions', () => {
     const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve })
 
     const makeConfig = (worker: 'runner' | 'canceler'): GatewayConfig => ({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => durableSandbox({
         async *streamPrompt() {
@@ -844,6 +863,7 @@ describe('PR #11 production regressions', () => {
     let invocations = 0
     const longHistory = 'history '.repeat(500)
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => durableSandbox({
         async *streamPrompt() {
@@ -905,22 +925,42 @@ describe('PR #11 production regressions', () => {
       .toBe('completed')
   })
 
-  it('uses the configured complete provider input bound before quoting', async () => {
-    let quotedMessages: Array<{ role: string; content: string }> | undefined
-    const inputTokenBound = ({ messages }: { messages: Array<{ role: string; content: string }> }) => {
-      quotedMessages = messages
+  it('quotes a static bound before auth, then resolves private context after authorization', async () => {
+    const events: string[] = []
+    let callbackInput: Parameters<NonNullable<GatewayConfig['inputTokenBound']>>[0] | undefined
+    let sandboxBudget: GatewayConfig['executionBudget'] | undefined
+    const inputTokenBound: NonNullable<GatewayConfig['inputTokenBound']> = async (input) => {
+      events.push('bound')
+      await Promise.resolve()
+      callbackInput = input
       return 4_096
     }
+    const initialBound = 8_192
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway(durableConfig({
+      conversationMode: 'thread',
       maxOutputTokens: 1_024,
       defaultOutputTokens: 1_024,
+      unauthenticatedInputTokenBound: initialBound,
       inputTokenBound,
+      authorizeConsumer: async () => {
+        events.push('authorize')
+        return { allow: true }
+      },
+      getSandbox: async () => ({
+        async *streamPrompt(_message, options) {
+          sandboxBudget = options?.executionBudget
+          yield { type: 'sandbox.usage', data: { usage: usage() } }
+        },
+      }),
     })))
 
-    const response = await app.request('/v1/agents/pr11/chat/completions', {
+    const unauthenticated = await app.request('/v1/agents/pr11/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tangle-Thread-Id': 'thread-existing-1',
+      },
       body: JSON.stringify({
         messages: [
           { role: 'user', content: 'first turn' },
@@ -929,20 +969,177 @@ describe('PR #11 production regressions', () => {
         ],
       }),
     })
-    const body = await response.json() as {
+    const unauthenticatedBody = await unauthenticated.json() as {
       error?: { x402?: { required_amount?: string } }
     }
 
-    expect(response.status).toBe(402)
-    expect(quotedMessages).toEqual([
+    expect(unauthenticated.status).toBe(402)
+    expect(events).toEqual([])
+    expect(callbackInput).toBeUndefined()
+    expect(unauthenticatedBody.error?.x402?.required_amount).toBe(
+      requiredX402Amount(agent.pricePerTokenUsd, initialBound, 1_024, 6, 1_024, 1_024)
+        .toString(),
+    )
+
+    const authenticated = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tangle-Thread-Id': 'thread-existing-1',
+        'X-Payment-Signature': paymentHeader('9015'),
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: 'first turn' },
+          { role: 'assistant', content: 'prior answer' },
+          { role: 'user', content: 'current turn' },
+        ],
+      }),
+    })
+    expect(authenticated.status).toBe(200)
+    await authenticated.text()
+
+    expect(events).toEqual(['authorize', 'bound'])
+    expect(callbackInput?.messages).toEqual([
       { role: 'user', content: 'first turn' },
       { role: 'assistant', content: 'prior answer' },
       { role: 'user', content: 'current turn' },
     ])
-    expect(body.error?.x402?.required_amount).toBe(
-      requiredX402Amount(agent.pricePerTokenUsd, 4_096, 1_024, 6, 1_024, 1_024)
-        .toString(),
+    expect(callbackInput?.threadId).toBe('thread-existing-1')
+    expect(callbackInput?.requestId).toMatch(/^req_[0-9a-f]{32}$/)
+    expect(callbackInput?.consumerId).toBe(commitment)
+    expect(callbackInput?.paymentMethod).toBe('x402')
+    expect(callbackInput?.keyId).toBeUndefined()
+    expect(callbackInput?.ownerId).toBeUndefined()
+    expect(sandboxBudget?.maxInputTokens).toBe(4_096)
+  })
+
+  it('rechecks the final bound before claiming a payment', async () => {
+    const events: string[] = []
+    let claims = 0
+    let sandboxCalls = 0
+    const initialBound = 64
+    const operations = new MemoryPaymentOperations({
+      onClaim: async () => { claims += 1 },
+      onReclaim: async () => undefined,
+    })
+    const config = durableConfig({
+      maxOutputTokens: 1_024,
+      defaultOutputTokens: 1_024,
+      unauthenticatedInputTokenBound: initialBound,
+      inputTokenBound: async () => {
+        events.push('bound')
+        return 4_096
+      },
+      authorizeConsumer: async () => {
+        events.push('authorize')
+        return { allow: true }
+      },
+      getSandbox: async () => {
+        sandboxCalls += 1
+        return sandbox()
+      },
+      x402: {
+        operatorAddress,
+        chainId: 1,
+        demoMode: true,
+        paymentProtocolVersion: 2,
+        paymentOperations: operations,
+      },
+    })
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(config))
+    const message = [{ role: 'user' as const, content: 'hi' }]
+    const quotedInput = Math.max(initialBound, rootMaximumBillableInputTokens(agent, message))
+    const quotedAmount = requiredX402Amount(
+      agent.pricePerTokenUsd,
+      quotedInput,
+      1_024,
+      6,
+      1_024,
+      1_024,
     )
+
+    const response = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Signature': paymentHeader('9016', undefined, quotedAmount.toString()),
+      },
+      body: JSON.stringify({ messages: message }),
+    })
+    const body = await response.json() as { error?: { code?: string; required_amount?: string } }
+    expect(response.status).toBe(402)
+    expect(body.error?.code).toBe('insufficient_payment')
+    expect(body.error?.required_amount).toBe(
+      requiredX402Amount(agent.pricePerTokenUsd, 4_096, 1_024, 6, 1_024, 1_024).toString(),
+    )
+    expect(events).toEqual(['authorize', 'bound'])
+    expect(claims).toBe(0)
+    expect(sandboxCalls).toBe(0)
+  })
+
+  it('does not resolve private input context for a denied consumer', async () => {
+    let boundCalls = 0
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      unauthenticatedInputTokenBound: 8_192,
+      inputTokenBound: async () => {
+        boundCalls += 1
+        return 8_192
+      },
+      authorizeConsumer: async () => ({
+        allow: false,
+        reason: 'thread is not owned by this consumer',
+        code: 'thread_not_owned',
+      }),
+    })))
+
+    const response = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tangle-Thread-Id': 'private-thread',
+        'X-Payment-Signature': paymentHeader('9017'),
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'continue' }] }),
+    })
+
+    expect(response.status).toBe(403)
+    expect(boundCalls).toBe(0)
+  })
+
+  it('passes the verified API-key owner to the post-auth input bound callback', async () => {
+    let callbackInput: Parameters<NonNullable<GatewayConfig['inputTokenBound']>>[0] | undefined
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      unauthenticatedInputTokenBound: 4_096,
+      inputTokenBound: async (input) => {
+        callbackInput = input
+        return 4_096
+      },
+      verifyApiKey: async () => ({
+        keyId: 'key-owner-a',
+        consumerId: 'consumer-owner-a',
+        ownerId: 'owner-a',
+        scopes: ['chat'],
+      }),
+    })))
+
+    const response = await app.request('/v1/agents/pr11/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer owner-a-key',
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'private work' }] }),
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(callbackInput?.consumerId).toBe('consumer-owner-a')
+    expect(callbackInput?.paymentMethod).toBe('apikey')
+    expect(callbackInput?.keyId).toBe('key-owner-a')
+    expect(callbackInput?.ownerId).toBe('owner-a')
   })
 
   it('reconciles an x402 claiming row when the provider has no operation', async () => {
@@ -1157,6 +1354,7 @@ describe('PR #11 production regressions', () => {
   it('keeps A2A unavailable when production omits its task store', async () => {
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => sandbox(),
       recordUsage: async () => undefined,
@@ -1185,6 +1383,7 @@ describe('PR #11 production regressions', () => {
     }
     const app = new Hono()
     app.route('/v1/agents', createAgentGateway({
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => sandbox(),
       recordUsage: async () => undefined,
@@ -1234,6 +1433,7 @@ describe('PR #11 production regressions', () => {
       const app = new Hono()
       const taskStore = new InMemoryTaskStore()
       app.route('/v1/agents', createAgentGateway({
+        authorizeConsumer: async () => ({ allow: true }),
         resolveAgent: async () => agent,
         getSandbox: async () => durableSandbox(sandbox([
           { type: 'input-required', data: { inputRequired: { prompt: 'Need one more detail' } } },

@@ -214,6 +214,7 @@ function buildHarness(chunks = ['Hello', ', ', 'world!']): Harness {
   }
 
   const gw = createAgentGateway({
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => new ReplySandbox(chunks),
     recordUsage: async (evt) => { usage.push(evt) },
@@ -295,7 +296,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
         'Content-Type': 'application/json',
         'X-Payment-Signature': JSON.stringify(spendAuth),
       },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }], stream: true }),
     })
 
     // Transport invariants
@@ -359,7 +360,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
         'Content-Type': 'application/json',
         'X-Payment-Signature': JSON.stringify(payload),
       },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }], stream: true }),
     })
 
     // Reject with 402 — operator check in verifyX402 fires BEFORE verifySigner,
@@ -401,7 +402,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
         'Content-Type': 'application/json',
         'X-Payment-Signature': JSON.stringify(payload),
       },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }], stream: true }),
     })
 
     // verifySigner was called but returned false — recovery address != commitment
@@ -422,7 +423,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const first = await harness.app.request('/v1/agents/production-agent/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': payloadStr },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'first' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'first' }], stream: true }),
     })
     expect(first.status).toBe(200)
     await drainSseToText(first)
@@ -431,7 +432,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const replay = await harness.app.request('/v1/agents/production-agent/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': payloadStr },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'replay' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'replay' }], stream: true }),
     })
     expect(replay.status).toBe(402)
 
@@ -456,7 +457,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
         'Content-Type': 'application/json',
         'X-Payment-Signature': JSON.stringify(spendAuth),
       },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }], stream: true }),
     })
 
     expect(res.status).toBe(402)
@@ -485,7 +486,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const r1 = await alice.app.request('/v1/agents/production-agent/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': JSON.stringify(aliceAuth) },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'alice' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'alice' }], stream: true }),
     })
     expect(r1.status).toBe(200)
     await drainSseToText(r1)
@@ -493,7 +494,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
     const r2 = await alice.app.request('/v1/agents/production-agent/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Payment-Signature': JSON.stringify(bobAuth) },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'bob' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'bob' }], stream: true }),
     })
     expect(r2.status).toBe(200)
     await drainSseToText(r2)
@@ -516,7 +517,7 @@ describe('x402 end-to-end — real EIP-712 signatures, real gateway, real sandbo
         'Content-Type': 'application/json',
         'X-Payment-Signature': JSON.stringify(spendAuth),
       },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }] }),
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ping' }], stream: true }),
     })
 
     expect(res.status).toBe(402)

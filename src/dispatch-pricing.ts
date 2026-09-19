@@ -61,23 +61,46 @@ export function requiredX402Amount(
   if (!Number.isFinite(maxProviderCostUsd) || maxProviderCostUsd < 0) {
     throw new Error('maxProviderCostUsd must be finite and non-negative')
   }
-  const tokenCount = inputTokens + maxOutputTokens + maxReasoningTokens + maxToolTokens
+  const tokenCount = inputTokens + maxOutputTokens
   if (!Number.isSafeInteger(tokenCount)) throw new Error('token budget exceeds safe integer range')
   return amountForTokens(pricePerTokenUsd, tokenCount, currencyDecimals, maxProviderCostUsd)
+}
+
+/** Historical recovery alone retains additive token accounting. */
+export function billableTokenCount(
+  inputTokens: number,
+  outputTokens: number,
+  reasoningTokens?: number,
+  toolTokens?: number,
+  tokenAccounting: 'inclusive' | 'additive' = 'inclusive',
+): number {
+  if (tokenAccounting === 'additive' && (reasoningTokens === undefined || toolTokens === undefined)) {
+    throw new Error('historical additive accounting requires complete token details')
+  }
+  for (const count of [inputTokens, outputTokens, reasoningTokens, toolTokens]) {
+    if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) {
+      throw new Error('billable token count is invalid')
+    }
+  }
+  const total = inputTokens + outputTokens + (tokenAccounting === 'additive'
+    ? (reasoningTokens ?? 0) + (toolTokens ?? 0) : 0)
+  if (!Number.isSafeInteger(total) || total < 0) throw new Error('billable token total is invalid')
+  return total
 }
 
 export function actualX402Amount(
   pricePerTokenUsd: number,
   inputTokens: number,
   outputTokens: number,
-  reasoningTokens: number,
-  toolTokens: number,
+  reasoningTokens: number | undefined,
+  toolTokens: number | undefined,
   currencyDecimals = 6,
   providerCostUsd = 0,
+  tokenAccounting: 'inclusive' | 'additive' = 'inclusive',
 ): bigint {
   return amountForTokens(
     pricePerTokenUsd,
-    inputTokens + outputTokens + reasoningTokens + toolTokens,
+    billableTokenCount(inputTokens, outputTokens, reasoningTokens, toolTokens, tokenAccounting),
     currencyDecimals,
     providerCostUsd,
   )

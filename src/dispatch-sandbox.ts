@@ -1,3 +1,6 @@
+import { SandboxStreamError } from './sandbox-stream-error'
+export { SandboxStreamError } from './sandbox-stream-error'
+import { prepareApiKeyPrompt } from './api-key-budget'
 import { redactSystemPromptFromOutput } from './filter'
 import type { A2ADispatchEvent, AuthorizedRequest } from './dispatch-types'
 import {
@@ -23,30 +26,8 @@ export function buildGatewaySandboxContext(
     keyInfo: authz.keyInfo,
     requestId: authz.requestId,
     messages: authz.messages ?? [],
+    ...(authz.apiKeyReservedCents !== undefined ? { apiKeyReservation: { cents: authz.apiKeyReservedCents, executionBudget: authz.executionBudget } } : {}),
     ...(authz.threadId !== undefined ? { threadId: authz.threadId } : {}),
-  }
-}
-
-/** Terminal failure reported by the sandbox event protocol. */
-export class SandboxStreamError extends Error {
-  readonly eventType: string
-  readonly code?: string
-  readonly details?: Record<string, unknown>
-
-  constructor(event: SandboxStreamEvent) {
-    const rawMessage = event.data?.message
-    const message = typeof rawMessage === 'string' && rawMessage.trim().length > 0
-      ? rawMessage.trim()
-      : 'Sandbox stream failed'
-    super(message)
-    this.name = 'SandboxStreamError'
-    this.eventType = event.type ?? 'unknown'
-    if (typeof event.data?.code === 'string' && event.data.code.length > 0) {
-      this.code = event.data.code
-    }
-    if (event.data?.details && typeof event.data.details === 'object' && !Array.isArray(event.data.details)) {
-      this.details = event.data.details
-    }
   }
 }
 
@@ -121,37 +102,32 @@ export async function* dispatchSandboxStreamRich(
   const executionController = new AbortController()
   const forwardAbort = () => executionController.abort()
   if (signal?.aborted) return
-  signal?.addEventListener('abort', forwardAbort, { once: true })
-  const executionBudget: SandboxExecutionBudget = {
-    maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
-    maxOutputTokens: outputLimit,
-    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? outputLimit,
-    maxToolTokens: config.executionBudget?.maxToolTokens ?? outputLimit,
-    maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
-    maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
-      (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit +
-        (config.executionBudget?.maxReasoningTokens ?? outputLimit) +
-        (config.executionBudget?.maxToolTokens ?? outputLimit)
-    ) * agent.pricePerTokenUsd,
-  }
-  if (executionController.signal.aborted) return
-  await onExecutionStart?.()
-  if (executionController.signal.aborted) return
   let heartbeatError: unknown
   let heartbeatInFlight: Promise<void> | undefined
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined
   let iterator: AsyncIterator<SandboxStreamEvent> | undefined
   try {
+    signal?.addEventListener('abort', forwardAbort, { once: true })
+    const executionBudget: SandboxExecutionBudget = sandboxContext?.apiKeyReservation?.executionBudget ?? {
+      maxInputTokens: maxInputTokens ?? maximumBillableInputTokens(agent, userMessage),
+      maxOutputTokens: outputLimit,
+      ...(config.executionBudget?.maxReasoningTokens !== undefined ? { maxReasoningTokens: config.executionBudget.maxReasoningTokens } : {}),
+      ...(config.executionBudget?.maxToolTokens !== undefined ? { maxToolTokens: config.executionBudget.maxToolTokens } : {}),
+      maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
+      maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd ?? (
+        (maxInputTokens ?? maximumBillableInputTokens(agent, userMessage)) + outputLimit
+      ) * agent.pricePerTokenUsd,
+    }
+    const { prepared, promptOptions } = await prepareApiKeyPrompt(box, userMessage, consumerId,
+      agent.systemPrompt, executionBudget, executionController.signal, sessionId, sandboxContext)
+    if (prepared) requiresReceipt = true
+    if (executionController.signal.aborted) return
+    await onExecutionStart?.()
+    if (executionController.signal.aborted) return
     // This durable handoff is after sandbox acquisition and immediately before
     // the adapter call that may start paid work.
     await onSandboxStart?.()
-    const promptStream = box.streamPrompt(userMessage, {
-      sessionId: sessionId ?? `consumer:${consumerId}`,
-      systemPrompt: agent.systemPrompt,
-      maxOutputTokens: outputLimit,
-      executionBudget,
-      signal: executionController.signal,
-    })
+    const promptStream = prepared ? prepared.start() : box.streamPrompt(userMessage, promptOptions)
     iterator = promptStream[Symbol.asyncIterator]()
     const heartbeatMs = onExecutionHeartbeat
       ? Math.max(100, Math.min(
@@ -180,10 +156,20 @@ export async function* dispatchSandboxStreamRich(
       }
       if (next.done) break
       const event = next.value
+      if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
       if (event.type === 'error' || event.type === 'session.run.failed') {
+        // A failed run can still have a final, provider-enforced charge.
+        // The producer must send that receipt before its terminal error.
+        let usage: SandboxUsageReceipt
+        try {
+          usage = finalizeUsage(withObservedUsage(usageParts, observedReasoningTokens,
+            observedToolTokens, observedToolCalls), executionBudget)
+        } catch (cause) {
+          throw new SandboxStreamError(event, { cause })
+        }
+        yield { kind: 'usage', usage }
         throw new SandboxStreamError(event)
       }
-      if (event.data?.usage) usageParts = mergeUsage(usageParts, event.data.usage)
       if (event.data?.reasoning?.tokens !== undefined) {
         observedReasoningTokens += nonNegativeSafeInteger(event.data.reasoning.tokens, 'reasoning tokens')
         yield { kind: 'activity' }
@@ -314,9 +300,9 @@ function mergeUsage(
   update: Partial<SandboxUsageReceipt>,
 ): Partial<SandboxUsageReceipt> {
   const merged = { ...current, ...update }
-  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd'] as const) {
+  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const) {
     const value = update[key]
-    if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new Error(`sandbox usage field ${key} is invalid`)
     }
     if (value !== undefined && current[key] !== undefined) {
@@ -324,6 +310,16 @@ function mergeUsage(
       // final event erase spend observed earlier in the same execution.
       merged[key] = Math.max(current[key]!, value)
     }
+  }
+  const providerCostUsd = update.providerCostUsd
+  if (providerCostUsd !== undefined && (!Number.isFinite(providerCostUsd) || providerCostUsd < 0)) {
+    throw new Error('sandbox usage field providerCostUsd is invalid')
+  }
+  if (providerCostUsd !== undefined && current.providerCostUsd !== undefined) {
+    merged.providerCostUsd = Math.max(current.providerCostUsd, providerCostUsd)
+  }
+  if (update.budgetEnforced !== undefined && typeof update.budgetEnforced !== 'boolean') {
+    throw new Error('sandbox usage budget flag is invalid')
   }
   if (current.budgetEnforced === false || update.budgetEnforced === false) {
     merged.budgetEnforced = false
@@ -368,10 +364,10 @@ function enforceUsageBudget(
   if (usage.outputTokens !== undefined && usage.outputTokens > budget.maxOutputTokens) {
     throw new Error('sandbox exceeded max output tokens')
   }
-  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > budget.maxReasoningTokens) {
+  if (budget.maxReasoningTokens !== undefined && usage.reasoningTokens !== undefined && usage.reasoningTokens > budget.maxReasoningTokens) {
     throw new Error('sandbox exceeded max reasoning tokens')
   }
-  if (usage.toolTokens !== undefined && usage.toolTokens > budget.maxToolTokens) {
+  if (budget.maxToolTokens !== undefined && usage.toolTokens !== undefined && usage.toolTokens > budget.maxToolTokens) {
     throw new Error('sandbox exceeded max tool tokens')
   }
   if (usage.toolCallCount !== undefined && usage.toolCallCount > budget.maxToolCalls) {
@@ -386,13 +382,17 @@ function finalizeUsage(
   parts: Partial<SandboxUsageReceipt>,
   budget: SandboxExecutionBudget,
 ): SandboxUsageReceipt {
-  const fields = ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount', 'providerCostUsd', 'budgetEnforced'] as const
+  const fields = ['inputTokens', 'outputTokens', 'toolCallCount', 'providerCostUsd', 'budgetEnforced'] as const
   if (fields.some((field) => parts[field] === undefined)) {
     throw new Error('sandbox did not provide a complete usage receipt')
   }
+  if ((budget.maxReasoningTokens !== undefined && parts.reasoningTokens === undefined)
+    || (budget.maxToolTokens !== undefined && parts.toolTokens === undefined)) {
+    throw new Error('sandbox did not provide usage for an explicit token cap')
+  }
   const usage = parts as SandboxUsageReceipt
   for (const field of ['inputTokens', 'outputTokens', 'reasoningTokens', 'toolTokens', 'toolCallCount'] as const) {
-    if (!Number.isSafeInteger(usage[field]) || usage[field] < 0) {
+    if (usage[field] !== undefined && (!Number.isSafeInteger(usage[field]) || usage[field]! < 0)) {
       throw new Error(`sandbox usage field ${field} is invalid`)
     }
   }
@@ -403,12 +403,37 @@ function finalizeUsage(
     throw new Error('sandbox usage budget flag is invalid')
   }
   if (!Number.isSafeInteger(
-    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens,
+    usage.inputTokens + usage.outputTokens,
   )) {
     throw new Error('sandbox usage token total exceeds safe integer range')
   }
   enforceUsageBudget(usage, budget)
   if (!usage.budgetEnforced) throw new Error('sandbox did not enforce the execution budget')
+  return usage
+}
+
+/** Complete a legacy receipt without claiming provider budget enforcement. */
+function completeLegacyUsage(
+  parts: Partial<SandboxUsageReceipt>,
+  userMessage: string,
+  outputText: string,
+  budget: SandboxExecutionBudget,
+): SandboxUsageReceipt {
+  const usage = {
+    inputTokens: parts.inputTokens ?? estimateTokens(userMessage),
+    outputTokens: parts.outputTokens ?? estimateTokens(outputText),
+    ...(parts.reasoningTokens !== undefined ? { reasoningTokens: parts.reasoningTokens } : {}),
+    ...(parts.toolTokens !== undefined ? { toolTokens: parts.toolTokens } : {}),
+    toolCallCount: parts.toolCallCount ?? 0,
+    providerCostUsd: parts.providerCostUsd ?? 0,
+    budgetEnforced: false,
+  }
+  if (!Number.isSafeInteger(
+    usage.inputTokens + usage.outputTokens,
+  )) {
+    throw new Error('sandbox usage token total exceeds safe integer range')
+  }
+  enforceUsageBudget(usage, budget)
   return usage
 }
 
@@ -423,26 +448,21 @@ function completeUsage(
   requiresReceipt: boolean,
 ): SandboxUsageReceipt {
   const observed = withObservedUsage(parts, reasoningTokens, toolTokens, toolCallCount)
-  if (
-    !requiresReceipt &&
-    Object.keys(parts).length === 0 &&
-    reasoningTokens === 0 &&
-    toolTokens === 0 &&
-    toolCallCount === 0
-  ) {
-    // Preserve the pre-receipt SandboxBox contract for legacy API-key
-    // adapters. Durable payment operations must use provider-enforced usage.
-    return {
-      inputTokens: estimateTokens(userMessage),
-      outputTokens: estimateTokens(outputText),
-      reasoningTokens: 0,
-      toolTokens: 0,
-      toolCallCount: 0,
-      providerCostUsd: 0,
-      budgetEnforced: false,
-    }
+  if (requiresReceipt) return finalizeUsage(observed, budget)
+
+  // Legacy API-key calls may report only the fields their adapter knows. Keep
+  // those values, estimate only absent fields, and mark the receipt as not
+  // provider-enforced. Durable payment operations stay on finalizeUsage above.
+  const complete = [
+    'inputTokens',
+    'outputTokens',
+    'toolCallCount',
+    'providerCostUsd',
+  ] as const
+  if (complete.every((field) => observed[field] !== undefined) && observed.budgetEnforced === true) {
+    return finalizeUsage(observed, budget)
   }
-  return finalizeUsage(observed, budget)
+  return completeLegacyUsage(observed, userMessage, outputText, budget)
 }
 
 export function truncateUtf8(

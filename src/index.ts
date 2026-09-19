@@ -1,5 +1,6 @@
+export { ApiKeyBudgetUnsupportedError } from './api-key-budget'
 export { createAgentGateway } from './middleware'
-export { reclaimPayment, SandboxStreamError } from './dispatch'
+export { maximumBillableInputTokens, reclaimPayment, SandboxStreamError } from './dispatch'
 export {
   recoverPayment,
   recoverPayments,
@@ -69,9 +70,12 @@ export {
 } from './rate-limit'
 export {
   apiKeySettlementCostCents,
+  createApiKeyRequestClaim,
   createApiKeyUsageSettlement,
   createApiKeyRoutes,
   verifyApiKeyFromStore,
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
   type ApiKey,
   type ApiKeyCreateRequest,
   type ApiKeyStore,
@@ -120,18 +124,24 @@ export type {
   MppConfig,
   PaymentResult,
   ApiKeyInfo,
+  ApiKeyRequestClaimInput,
+  ApiKeyRequestClaimResult,
   GatewayUsageEvent,
   SandboxExecutionBudget,
   SandboxUsageReceipt,
   SandboxStreamEvent,
   SandboxBox,
+  SandboxPromptOptions,
   GatewaySandboxContext,
   ApiKeyGatewayConfig,
   CreateAgentGatewayConfig,
   GatewayConfig,
   ChatMessage,
+  ChatCompletion,
+  ChatCompletionUsage,
   ChatCompletionRequest,
   ChatCompletionChunk,
+  ApiKeyPurchaseUrl,
 } from './types'
 
 // --- A2A protocol surface (Google Agent-to-Agent) ---

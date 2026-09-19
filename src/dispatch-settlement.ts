@@ -1,5 +1,5 @@
 import { type GatewayObserver, type RequestContext } from './observer'
-import { actualX402Amount } from './dispatch-pricing'
+import { actualX402Amount, billableTokenCount } from './dispatch-pricing'
 import {
   assertX402V1SettlementSafe,
   markRecoveryReconciled,
@@ -29,9 +29,8 @@ export async function settleAndRecord(
   const settlementBasis = options.settlementBasis ?? 'usage-receipt'
   await markRecoverySettling(authz, usage, settlementBasis, config)
   if (options.usageAlreadyRecorded) await markRecoveryUsageRecorded(authz, config)
-  const tokenCost = (
-    usage.inputTokens + usage.outputTokens + usage.reasoningTokens + usage.toolTokens
-  ) * agent.pricePerTokenUsd
+  const tokenCost = billableTokenCount(usage.inputTokens, usage.outputTokens,
+    usage.reasoningTokens, usage.toolTokens, authz.tokenAccounting) * agent.pricePerTokenUsd
   const totalCost = Math.max(tokenCost, usage.providerCostUsd)
   const ownerEarned = totalCost * (1 - agent.platformFeePercent)
   const platformFee = totalCost * agent.platformFeePercent
@@ -68,6 +67,7 @@ export async function settleAndRecord(
         usage.toolTokens,
         config.x402.currencyDecimals,
         usage.providerCostUsd,
+        authz.tokenAccounting ?? 'inclusive',
       )
       if (options.paymentAlreadySettled) {
         if (

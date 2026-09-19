@@ -141,6 +141,7 @@ describe('A2A payment ownership races', () => {
     const authorizationReleased = new Promise<void>((resolve) => { finishAuthorization = resolve })
     let runs = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -210,6 +211,7 @@ describe('A2A payment ownership races', () => {
     const recoveryStore = new MemoryPaymentRecoveryStore()
     let runs = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -297,6 +299,7 @@ describe('A2A payment ownership races', () => {
 
     const operations = new BlockingExecutionOperations()
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         streamPrompt() {
@@ -374,6 +377,7 @@ describe('A2A payment ownership races', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -420,6 +424,7 @@ describe('A2A payment ownership races', () => {
     let releaseSandbox!: () => void
     const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -503,6 +508,7 @@ describe('A2A payment ownership races', () => {
       onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -591,6 +597,7 @@ describe('A2A payment ownership races', () => {
       onReclaim: async () => undefined,
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -665,6 +672,7 @@ describe('A2A payment ownership races', () => {
     const never = new Promise<void>(() => undefined)
     let sandboxSignal: AbortSignal | undefined
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt(_message, opts) {
@@ -739,6 +747,7 @@ describe('A2A payment ownership races', () => {
       },
     }
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => box,
       recordUsage: async () => undefined,
@@ -830,6 +839,7 @@ describe('A2A payment ownership races', () => {
       onReclaim: async () => { recoveryAttempts += 1 },
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -953,6 +963,7 @@ describe('A2A payment ownership races', () => {
       onReclaim: async () => { recoveryCalls += 1 },
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         streamPrompt() {
@@ -1064,6 +1075,7 @@ describe('A2A payment ownership races', () => {
       },
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         streamPrompt() {
@@ -1143,6 +1155,7 @@ describe('A2A payment ownership races', () => {
     let rows = 0
     let firstCall = true
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -1242,6 +1255,7 @@ describe('A2A payment ownership races', () => {
     lifecycle.confirmationGate = new Promise<void>((resolve) => { releaseConfirmation = resolve })
     let runs = 0
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -1311,6 +1325,7 @@ describe('A2A payment ownership races', () => {
     const taskStore = new InMemoryTaskStore()
     const lifecycle = new A2AChargeLifecycle()
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {
@@ -1374,6 +1389,7 @@ describe('A2A payment ownership races', () => {
     let recordCalls = 0
     let firstAcknowledgement = true
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async () => agent,
       getSandbox: async () => ({
         async *streamPrompt() {

@@ -122,6 +122,7 @@ function atomicityConfig(
     },
   }
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
     getSandbox: async () => durableSandbox(sandbox, 'atomicity-sandbox'),
     recordUsage: async () => { counters.records += 1 },
@@ -219,7 +220,8 @@ describe('A2A task atomicity and restart recovery', () => {
     }
   })
 
-  it('replays a crashed finalization after restart and clears the lease marker', async () => {
+  it.each([{ tokenAccounting: undefined, complete: true }, { tokenAccounting: 'inclusive', complete: true },
+    { tokenAccounting: undefined, complete: false }] as const)('recovers $tokenAccounting A2A finalization without changing accounting (complete=$complete)', async ({ tokenAccounting, complete }) => {
     const taskStore = new InMemoryTaskStore()
     const counters = { records: 0, settlements: 0 }
     const operations = new MemoryPaymentOperations({
@@ -267,6 +269,7 @@ describe('A2A task atomicity and restart recovery', () => {
         gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
         gatewayFinalizing: {
           version: 1,
+          ...(tokenAccounting ? { tokenAccounting } : {}),
           lease: { id: 'crashed-lease', expiresAt: Date.now() - 1 },
           agentSlug: agent.slug,
           requestId: 'crashed-request',
@@ -275,7 +278,8 @@ describe('A2A task atomicity and restart recovery', () => {
           startMs: Date.now() - 100,
           operationId: executing.operationId,
           paymentOperation: recoveredOperation(executing),
-          receipt,
+          receipt: { ...receipt, inputTokens: 10, outputTokens: 6,
+            reasoningTokens: complete ? 2 : undefined, toolTokens: complete ? 4 : undefined },
           artifact,
           inputRequired: false,
           maxOutputTokens: 1024,
@@ -286,6 +290,7 @@ describe('A2A task atomicity and restart recovery', () => {
     await taskStore.put(task)
 
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
       getSandbox: async () => durableSandbox({ async *streamPrompt() { throw new Error('restart recovery must not execute sandbox') } }, 'restart-sandbox'),
       recordUsage: async () => { counters.records += 1 },
@@ -321,11 +326,19 @@ describe('A2A task atomicity and restart recovery', () => {
       error?: unknown
     }
 
+    if (!complete) {
+      expect(body.result?.status.state).toBe('working')
+      expect(counters.settlements).toBe(0)
+      expect(operations.get(executing.operationId)?.state).toBe('executing')
+      expect(JSON.stringify((await taskStore.get('task-restart'))?.metadata)).toContain('historical additive accounting requires complete token details')
+      return
+    }
     expect(body.error).toBeUndefined()
     expect(body.result?.status.state).toBe('completed')
     expect(body.result?.artifacts).toEqual([artifact])
     expect((await taskStore.get('task-restart'))?.metadata?.gatewayFinalizing).toBeUndefined()
     expect(operations.get(executing.operationId)?.state).toBe('settled')
+    expect(operations.get(executing.operationId)?.settledAmount).toBe(tokenAccounting === 'inclusive' ? 16n : 22n)
     expect(counters.records).toBe(1)
     expect(counters.settlements).toBe(1)
 
@@ -434,6 +447,7 @@ describe('A2A task atomicity and restart recovery', () => {
       },
     })
     const config: GatewayConfig = {
+      authorizeConsumer: async () => ({ allow: true }),
       resolveAgent: async (slug) => (slug === agent.slug ? agent : null),
       getSandbox: async () => durableSandbox({ async *streamPrompt() { throw new Error('recovery must not execute sandbox') } }, 'recovery-sandbox'),
       recordUsage: async () => { records += 1 },

@@ -80,6 +80,7 @@ function gatewayConfig(taskStore: TaskStore, overrides: Partial<GatewayConfig> =
   const getSandbox = overrides.getSandbox ?? (async () => standardSandbox())
   let sandbox: SandboxBox | undefined
   return {
+    authorizeConsumer: async () => ({ allow: true }),
     resolveAgent: async (slug) => (slug === agentA.slug ? agentA : null),
     recordUsage: async () => undefined,
     x402: { operatorAddress, chainId: 1, demoMode: true },

@@ -1,7 +1,13 @@
+import { settleAndRecord } from './dispatch-settlement'
+import { apiKeyReservationQuote, assertApiKeyRequestClaim } from './api-key-budget'
 import {
   assertMppChargeOperation,
   mppPaymentOperationId,
 } from './mpp-payment'
+import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from './api-keys'
 import { claimStoredNonce, nonceTtlSeconds, type NonceStore } from './nonce-store'
 import {
   paymentNonceKey,
@@ -35,7 +41,53 @@ export async function claimPayment(
   hooks: PaymentClaimHooks = {},
 ): Promise<void> {
   assertX402V1SettlementSafe(authz, config)
-  if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
+  if (authz.paymentMethod === 'apikey') {
+    if (!authz.keyInfo) {
+      throw new ApiKeyRequestClaimUnavailableError('Verified API key identity is unavailable')
+    }
+    const claimRequest = config.claimApiKeyRequest
+    if (!claimRequest) {
+      if (
+        authz.keyInfo.rateLimitPerMinute !== undefined ||
+        authz.keyInfo.dailyLimit !== undefined ||
+        (authz.keyInfo.spendingLimitCents !== undefined && authz.keyInfo.spendingLimitCents !== null)
+      ) {
+        throw new ApiKeyRequestClaimUnavailableError(
+          'API key request limits are not configured',
+        )
+      }
+    } else {
+      const reservationCents = apiKeyReservationQuote(authz, config)
+      let claim
+      try {
+        claim = await claimRequest({
+          keyInfo: authz.keyInfo,
+          requestId: authz.requestId,
+          requestedAt: new Date(authz.startMs),
+          ...(reservationCents !== undefined ? { reservationCents } : {}),
+        })
+      } catch (error) {
+        if (
+          error instanceof ApiKeyRequestClaimUnavailableError ||
+          error instanceof ApiKeyRequestLimitExceededError
+        ) throw error
+        throw new ApiKeyRequestClaimUnavailableError(
+          'API key request limits could not be checked',
+          { cause: error },
+        )
+      }
+      assertApiKeyRequestClaim(claim)
+      if (!claim.allowed) throw new ApiKeyRequestLimitExceededError(claim)
+      if (reservationCents !== undefined) {
+        if (claim.reservedCents !== reservationCents) throw new ApiKeyRequestClaimUnavailableError('API key spending reservation is invalid')
+        authz.apiKeyReservedCents = reservationCents
+      }
+      authz.rateLimitRemaining = Math.min(
+        authz.rateLimitRemaining ?? claim.minuteRemaining,
+        claim.minuteRemaining,
+      )
+    }
+  } else if (authz.paymentMethod === 'x402' && authz.paymentPayload) {
     const context = paymentAuthorizationContext(authz)
     if (config.x402.paymentProtocolVersion === 2) {
       await preparePaymentRecovery(authz, config, {
@@ -227,6 +279,9 @@ export async function releasePayment(
   config: GatewayConfig,
   reason: string,
 ): Promise<void> {
+  if (authz.apiKeyReservedCents !== undefined && authz.keyInfo) {
+    await config.apiKeyReservationLifecycle!.release(authz.keyInfo.keyId, authz.requestId)
+  }
   const ownsX402 = authz.paymentOperation &&
     authz.paymentOperationAcquired === true &&
     config.x402.paymentOperations
@@ -286,6 +341,9 @@ export async function markPaymentExecutionStarted(
   authz: AuthorizedRequest,
   config: GatewayConfig,
 ): Promise<void> {
+  if (authz.apiKeyReservedCents !== undefined && authz.keyInfo) {
+    await config.apiKeyReservationLifecycle!.begin(authz.keyInfo.keyId, authz.requestId)
+  }
   await updateExecutionLease(authz, config, true)
 }
 
@@ -321,15 +379,27 @@ async function updateExecutionLease(
 }
 
 /**
- * Release only when no sandbox work was observed. Once output or a receipt
- * exists, retain the owner for settlement or background recovery.
+ * Settle enforced failed-run usage; release only before sandbox work.
+ * Retain unresolved ownership and measured receipts for background recovery.
  */
 export async function releasePaymentAfterFailure(
   authz: AuthorizedRequest,
   config: GatewayConfig,
   reason: string,
   workObserved: boolean,
+  usage?: import('./types').SandboxUsageReceipt,
 ): Promise<void> {
+  if (usage?.budgetEnforced === true) {
+    try {
+      await settleAndRecord(authz.agent, authz, usage, config, config.observer)
+      return
+    } catch (error) {
+      // Settlement owns durable receipt capture before external effects. Keep
+      // its measured recovery record if acknowledgement or attribution failed.
+      console.error(`[agent-gateway] failed-run receipt settlement pending for ${authz.requestId}:`,
+        error instanceof Error ? error.message : String(error))
+    }
+  }
   if (workObserved) {
     const recovery = config.paymentRecovery
     if (recovery && authz.paymentRecoveryId) {

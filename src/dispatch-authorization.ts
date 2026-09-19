@@ -4,17 +4,16 @@ import { isChatMessageArray } from './chat-input'
 import { filterConsumerMessagesStrict } from './filter'
 import { type RequestContext, generateRequestId } from './observer'
 import { type GatewayState, type AuthorizedRequest } from './dispatch-types'
-import { checkRateLimit } from './rate-limit'
 import {
-  maximumBillableInputTokens,
-  requiredX402Amount,
-} from './dispatch-pricing'
+  initialInputQuote,
+  resolveAuthorizedInputQuote,
+} from './dispatch-input-bound'
+import { checkRateLimit } from './rate-limit'
 import type {
   ApiKeyInfo,
   ChatMessage,
   GatewayConfig,
   PaymentMethod,
-  SandboxExecutionBudget,
 } from './types'
 import {
   defaultVerifyApiKey,
@@ -26,6 +25,15 @@ import {
   verifyMppCredential,
   verifyX402,
 } from './verify'
+
+function apiKeyPurchaseUrl(config: GatewayConfig, slug: string): string | undefined {
+  const configured = config.apiKeyPurchaseUrl
+  if (typeof configured === 'function') return configured(slug)
+  if (configured !== undefined) return configured
+  return config.baseUrl
+    ? `${config.baseUrl}/agents/${slug}/api-keys`
+    : undefined
+}
 
 /**
  * Resolve the agent, then run the full pre-dispatch pipeline: payment +
@@ -113,8 +121,9 @@ export async function authenticateAndGuard(
     )
   }
 
-  // Quote the maximum UTF-8 input plus every hidden provider cost before
-  // verification. The verifier must remain read-only at this point.
+  // Quote a conservative input bound plus every hidden provider cost before
+  // verification. The verifier must remain read-only at this point. A
+  // dynamic bound is deliberately deferred until the payer is authorized.
   const { messages: filtered, injectionWarnings } = filterConsumerMessagesStrict(
     messages,
     state.maxLen,
@@ -134,74 +143,9 @@ export async function authenticateAndGuard(
     )
   }
 
-  let requiredPaymentAmount: bigint
-  const messageInputBound = maximumBillableInputTokens(agent, filtered)
-  let maxInputTokens = messageInputBound
-  if (config.inputTokenBound) {
-    let configuredBound: number
-    try {
-      configuredBound = config.inputTokenBound({ agent, messages: filtered })
-    } catch {
-      return c.json(
-        {
-          error: {
-            message: 'Agent input token bound is unavailable',
-            type: 'server_error',
-            code: 'input_token_bound_unavailable',
-          },
-        },
-        503,
-      )
-    }
-    if (!Number.isSafeInteger(configuredBound) || configuredBound < messageInputBound) {
-      return c.json(
-        {
-          error: {
-            message: 'Agent input token bound is invalid',
-            type: 'server_error',
-            code: 'invalid_input_token_bound',
-          },
-        },
-        503,
-      )
-    }
-    maxInputTokens = configuredBound
-  }
-  const maxReasoningTokens = state.maxReasoningTokens
-  const maxToolTokens = state.maxToolTokens
-  const maxToolCalls = state.maxToolCalls
-  const maxProviderCostUsd = state.maxProviderCostUsd ??
-    (maxInputTokens + maxOutputTokens + maxReasoningTokens + maxToolTokens) * agent.pricePerTokenUsd
-  const executionBudget: SandboxExecutionBudget = {
-    maxInputTokens,
-    maxOutputTokens,
-    maxReasoningTokens,
-    maxToolTokens,
-    maxToolCalls,
-    maxProviderCostUsd,
-  }
-  try {
-    requiredPaymentAmount = requiredX402Amount(
-      agent.pricePerTokenUsd,
-      maxInputTokens,
-      maxOutputTokens,
-      config.x402.currencyDecimals,
-      maxReasoningTokens,
-      maxToolTokens,
-      maxProviderCostUsd,
-    )
-  } catch {
-    return c.json(
-      {
-        error: {
-          message: 'Agent payment configuration is invalid',
-          type: 'server_error',
-          code: 'invalid_payment_configuration',
-        },
-      },
-      503,
-    )
-  }
+  const initialQuote = initialInputQuote(c, agent, config, state, maxOutputTokens, filtered)
+  if (initialQuote instanceof Response) return initialQuote
+  let { executionBudget, requiredPaymentAmount } = initialQuote
 
   // Payment / auth.
   const spendAuthHeader = c.req.header('X-Payment-Signature')
@@ -383,9 +327,7 @@ export async function authenticateAndGuard(
           ...(isApiKeyAuthEnabled(config)
             ? {
                 api_key: {
-                  purchase_url: config.baseUrl
-                    ? `${config.baseUrl}/agents/${slug}/api-keys`
-                    : undefined,
+                  purchase_url: apiKeyPurchaseUrl(config, slug),
                 },
               }
             : {}),
@@ -444,28 +386,46 @@ export async function authenticateAndGuard(
     }
   }
 
-  if (config.authorizeConsumer) {
-    const authz = await config.authorizeConsumer(agent, {
-      method: paymentMethod,
-      consumerId: consumerId,
-      keyId: keyInfo?.keyId,
-      ownerId: keyInfo?.ownerId,
-      requestId,
-      ...(threadId ? { threadId } : {}),
-    })
-    if (!authz.allow) {
-      return c.json(
-        {
-          error: {
-            message: authz.reason,
-            type: 'authorization_denied',
-            code: authz.code,
-          },
+  const authz = await config.authorizeConsumer(agent, {
+    method: paymentMethod,
+    consumerId: consumerId,
+    keyId: keyInfo?.keyId,
+    ownerId: keyInfo?.ownerId,
+    requestId,
+    ...(threadId ? { threadId } : {}),
+  })
+  if (authz?.allow !== true) {
+    return c.json(
+      {
+        error: {
+          message: authz?.allow === false ? authz.reason : 'Invalid consumer authorization decision',
+          type: 'authorization_denied',
+          code: authz?.allow === false ? authz.code : 'invalid_authorization_decision',
         },
-        { status: 403, headers: { 'X-Request-Id': requestId } },
-      )
-    }
+      },
+      { status: 403, headers: { 'X-Request-Id': requestId } },
+    )
   }
+
+  const authorizedQuote = await resolveAuthorizedInputQuote(
+    c,
+    agent,
+    config,
+    state,
+    maxOutputTokens,
+    filtered,
+    requestId,
+    threadId,
+    consumerId,
+    paymentMethod,
+    keyInfo,
+    x402Payload,
+    mppMethod,
+    initialQuote,
+  )
+  if (authorizedQuote instanceof Response) return authorizedQuote
+  executionBudget = authorizedQuote.executionBudget
+  requiredPaymentAmount = authorizedQuote.requiredPaymentAmount
 
   return {
     agent,

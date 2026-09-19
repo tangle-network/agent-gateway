@@ -1,0 +1,11 @@
+{
+  "skill": "critical-audit",
+  "mode": "reaudit",
+  "prior": ".agent/critical-audit/2026-09-02T02-57-58Z",
+  "base": "ad9c58f679ec7bcf664b1be1962c47dc9ee1dbea",
+  "head": "c88bfea789f544e0d70409c631e16b3e57a53a7f",
+  "files": 12,
+  "resolved": 3,
+  "remaining": 0,
+  "verdict": "APPROVE"
+}

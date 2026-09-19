@@ -10,7 +10,11 @@
  */
 
 import { Hono } from 'hono'
-import type { PaymentResult } from './types'
+import type {
+  ApiKeyRequestClaimInput,
+  ApiKeyRequestClaimResult,
+  PaymentResult,
+} from './types'
 
 // --- Types ---
 
@@ -21,8 +25,8 @@ export interface ApiKey {
   keyHash: string
   keyPrefix: string
   scopes: string[]
-  rateLimit: number      // requests per minute
-  dailyLimit: number     // requests per day
+  rateLimit: number      // requests per rolling minute
+  dailyLimit: number     // requests per UTC day
   spendingLimitCents: number | null  // max spend in cents (null = unlimited)
   spentCents: number     // running total spent
   lastUsedAt: Date | null
@@ -59,6 +63,14 @@ export interface ApiKeyStore {
   delete(userId: string, keyId: string): Promise<boolean>
 
   recordUsage(keyId: string, costCents: number, requestId?: string): Promise<void>
+
+  /** Atomically count one request against the key's minute and daily limits. */
+  claimRequest?(
+    keyId: string,
+    requestId: string,
+    requestedAt?: Date,
+    reservationCents?: number,
+  ): Promise<ApiKeyRequestClaimResult>
 }
 
 const API_KEY_CONSUMER_PREFIX = 'apikey:'
@@ -102,6 +114,36 @@ export function createApiKeyUsageSettlement(
   }
 }
 
+/** Connect a durable API-key store to the gateway request-claim callback. */
+export function createApiKeyRequestClaim(
+  store: { claimRequest: NonNullable<ApiKeyStore['claimRequest']> },
+): (input: ApiKeyRequestClaimInput) => Promise<ApiKeyRequestClaimResult> {
+  return (input) => store.claimRequest(
+    input.keyInfo.keyId,
+    input.requestId,
+    input.requestedAt,
+    input.reservationCents,
+  )
+}
+
+export class ApiKeyRequestLimitExceededError extends Error {
+  readonly code = 'api_key.request_limit_exceeded'
+
+  constructor(readonly claim: ApiKeyRequestClaimResult) {
+    super(`API key ${claim.reason ?? 'request'} limit exceeded`)
+    this.name = 'ApiKeyRequestLimitExceededError'
+  }
+}
+
+export class ApiKeyRequestClaimUnavailableError extends Error {
+  readonly code = 'api_key.request_claim_unavailable'
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ApiKeyRequestClaimUnavailableError'
+  }
+}
+
 // --- Key generation ---
 
 function generateRawKey(prefix: string): string {
@@ -123,7 +165,7 @@ export async function verifyApiKeyFromStore(
   authHeader: string,
   store: ApiKeyStore,
   prefix = 'ak_',
-): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number } | null> {
+): Promise<{ key: ApiKey; keyId: string; consumerId: string; ownerId: string; scopes: string[]; rateLimitPerMinute: number; dailyLimit: number; spendingLimitCents: number | null } | null> {
   const bearerPrefix = `Bearer ${prefix}`
   if (!authHeader.startsWith(bearerPrefix)) return null
 
@@ -146,6 +188,7 @@ export async function verifyApiKeyFromStore(
     scopes: key.scopes,
     rateLimitPerMinute: key.rateLimit,
     dailyLimit: key.dailyLimit,
+    spendingLimitCents: key.spendingLimitCents,
   }
 }
 
@@ -159,6 +202,10 @@ export interface ApiKeyRoutesConfig {
   prefix?: string
   /** Valid scopes for this agent (default: ["chat"]) */
   validScopes?: string[]
+  /** Prerequisites callers must explicitly include when requesting a scope. */
+  scopeDependencies?: Readonly<Record<string, readonly string[]>>
+  /** Scopes that require an explicit finite future expiry when issued. */
+  requireExpiryForScopes?: readonly string[]
 }
 
 function positiveInteger(value: unknown, fallback: number): number | null {
@@ -173,6 +220,25 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
   const prefix = config.prefix ?? 'ak_'
   const validScopes = config.validScopes ?? ['chat']
   if (validScopes.length === 0) throw new TypeError('At least one API key scope is required')
+  const configuredDependencies = config.scopeDependencies ?? {}
+  const prototype = Object.getPrototypeOf(configuredDependencies)
+  // A literal __proto__ entry changes the prototype instead of defining a scope.
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('API key scope dependencies must be a plain record')
+  }
+  const dependencies = new Map(Object.entries(configuredDependencies))
+  for (const [scope, required] of dependencies) {
+    if (!validScopes.includes(scope) || [...required].some(value => !validScopes.includes(value))) {
+      throw new TypeError(`API key scope dependencies must use configured scopes: ${scope}`)
+    }
+  }
+  if (config.requireExpiryForScopes !== undefined && !Array.isArray(config.requireExpiryForScopes)) {
+    throw new TypeError('API key expiry requirements must be an array of configured scopes')
+  }
+  const expiryScopes = new Set(config.requireExpiryForScopes ?? [])
+  if ([...expiryScopes].some(scope => !validScopes.includes(scope))) {
+    throw new TypeError('API key expiry requirements must use configured scopes')
+  }
   const defaultScope = validScopes.includes('chat') ? 'chat' : validScopes[0]
 
   // List keys
@@ -210,6 +276,12 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
       (scope): scope is string => typeof scope === 'string' && validScopes.includes(scope),
     ))]
     if (scopes.length === 0) scopes.push(defaultScope)
+    for (const scope of scopes) {
+      const missing = (dependencies.get(scope) ?? []).filter(required => !scopes.includes(required))
+      if (missing.length) {
+        return c.json({ error: `${scope} requires ${missing.join(', ')}`, code: 'api_key.scope_dependency', scope, missingScopes: missing }, 400)
+      }
+    }
 
     const rateLimit = positiveInteger(body.rateLimit, 60)
     if (rateLimit === null) return c.json({ error: 'rateLimit must be a positive integer' }, 400)
@@ -242,6 +314,10 @@ export function createApiKeyRoutes(config: ApiKeyRoutesConfig) {
     const rawKey = generateRawKey(prefix)
     const keyHash = await hashKey(rawKey)
     const keyPrefix = rawKey.slice(0, prefix.length + 8)
+
+    if (scopes.some(scope => expiryScopes.has(scope)) && (!expiresAt || Math.floor(expiresAt.getTime() / 1000) * 1000 <= Date.now())) {
+      return c.json({ error: 'These scopes require a future expiresAt', code: 'api_key.expiry_required' }, 400)
+    }
 
     const created = await config.store.create(userId, {
       name,

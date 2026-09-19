@@ -1,19 +1,23 @@
 export type PaymentMethod = 'x402' | 'mpp' | 'apikey' | 'none'
 
+/** Inclusive totals bound all calls, retries, and tool messages within one execution. */
 export interface SandboxExecutionBudget {
   maxInputTokens: number
   maxOutputTokens: number
-  maxReasoningTokens: number
-  maxToolTokens: number
+  /** Optional subset cap. Omission does not add a separate reasoning budget. */
+  maxReasoningTokens?: number
+  /** Optional subset cap for tool-attributed tokens already included in input/output. */
+  maxToolTokens?: number
   maxToolCalls: number
   maxProviderCostUsd: number
 }
 
+/** Input/output are inclusive provider totals. Optional reasoning/tool counts are subsets, never extra charges. */
 export interface SandboxUsageReceipt {
   inputTokens: number
   outputTokens: number
-  reasoningTokens: number
-  toolTokens: number
+  reasoningTokens?: number
+  toolTokens?: number
   toolCallCount: number
   providerCostUsd: number
   /** True only when the provider/adapter enforced every supplied budget. */
@@ -31,13 +35,13 @@ export interface GatewayUsageEvent {
   paymentMethod: PaymentMethod
   inputTokens: number
   outputTokens: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  /** Optional measured detail. Omitted when the adapter cannot report it. */
   reasoningTokens?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  /** Optional measured detail. Omitted when the adapter cannot report it. */
   toolTokens?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  /** Optional measured detail. Omitted when the adapter cannot report it. */
   toolCallCount?: number
-  /** Optional in 0.7.2 so 0.7.1 event constructors remain source-compatible. */
+  /** Optional measured detail. Omitted when the adapter cannot report it. */
   providerCostUsd?: number
   totalCostUsd: number
   ownerEarnedUsd: number

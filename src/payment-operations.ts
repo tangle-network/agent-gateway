@@ -1,6 +1,7 @@
 import type {
   PaymentSettlementBasis,
   SandboxUsageReceipt,
+  SandboxExecutionBudget,
 } from './payment-types'
 
 /** Version negotiated by gateways that use durable payment operations. */
@@ -49,14 +50,7 @@ export interface PaymentAuthorizationContext {
   agentId: string
   requiredAmount: bigint
   maxOutputTokens: number
-  executionBudget: {
-    maxInputTokens: number
-    maxOutputTokens: number
-    maxReasoningTokens: number
-    maxToolTokens: number
-    maxToolCalls: number
-    maxProviderCostUsd: number
-  }
+  executionBudget: SandboxExecutionBudget
 }
 
 export interface PaymentSettlementInput {

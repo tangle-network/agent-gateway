@@ -1,8 +1,14 @@
+import { SandboxStreamError } from './dispatch-sandbox'
+import { ApiKeyBudgetUnsupportedError } from './api-key-budget'
 import { Hono } from 'hono'
 
 import { isChatMessageArray } from './chat-input'
 import { createA2AHandlers } from './a2a/handler'
 import { InMemoryTaskStore } from './a2a/task-store'
+import {
+  ApiKeyRequestClaimUnavailableError,
+  ApiKeyRequestLimitExceededError,
+} from './api-keys'
 import {
   type AuthorizedRequest,
   type GatewayState,
@@ -27,6 +33,7 @@ import {
 import { MemoryRateLimitStore, type RateLimitStore } from './rate-limit'
 import type {
   ChatCompletionChunk,
+  ChatCompletion,
   ChatCompletionRequest,
   CreateAgentGatewayConfig,
   GatewayConfig,
@@ -44,12 +51,16 @@ import { isApiKeyAuthEnabled, isMppAuthEnabled, isX402AuthEnabled } from './veri
  *   POST /:slug/chat/completions  — OpenAI-compatible chat endpoint (paid)
  */
 export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
+  if (typeof inputConfig.authorizeConsumer !== 'function') {
+    throw new Error('createAgentGateway: authorizeConsumer must be an explicit authorization function')
+  }
   let config: GatewayConfig = inputConfig.x402
     ? inputConfig
     : {
         ...inputConfig,
         x402: { operatorAddress: '', chainId: 0 },
       }
+  const a2aConfig = config.a2a === false ? undefined : config.a2a
   // Production gateways must verify x402 signatures. Tests and local
   // dev can opt into the explicit demo path.
   if (!isX402AuthEnabled(config) && !config.verifyApiKey) {
@@ -74,6 +85,27 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     )
   }
   if (
+    config.unauthenticatedInputTokenBound !== undefined &&
+    (!Number.isSafeInteger(config.unauthenticatedInputTokenBound) ||
+      config.unauthenticatedInputTokenBound < 0)
+  ) {
+    throw new Error(
+      'createAgentGateway: unauthenticatedInputTokenBound must be a non-negative safe integer',
+    )
+  }
+  if (
+    config.continueOnDisconnect !== undefined &&
+    typeof config.continueOnDisconnect !== 'function'
+  ) {
+    throw new Error('createAgentGateway: continueOnDisconnect must be a function')
+  }
+  if (config.inputTokenBound && isX402AuthEnabled(config) &&
+      config.unauthenticatedInputTokenBound === undefined) {
+    throw new Error(
+      'createAgentGateway: inputTokenBound requires unauthenticatedInputTokenBound for x402 authentication',
+    )
+  }
+  if (
     config.x402.currencyDecimals !== undefined &&
     (!Number.isInteger(config.x402.currencyDecimals) ||
       config.x402.currencyDecimals < 0 ||
@@ -83,11 +115,11 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   }
   const executionBudget = config.executionBudget
   for (const [name, value] of [
-    ['maxReasoningTokens', executionBudget?.maxReasoningTokens ?? maxOutputTokens],
-    ['maxToolTokens', executionBudget?.maxToolTokens ?? maxOutputTokens],
+    ['maxReasoningTokens', executionBudget?.maxReasoningTokens],
+    ['maxToolTokens', executionBudget?.maxToolTokens],
     ['maxToolCalls', executionBudget?.maxToolCalls ?? 8],
   ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new Error(`createAgentGateway: executionBudget.${name} must be a non-negative safe integer`)
     }
   }
@@ -118,9 +150,9 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     throw new Error('createAgentGateway: version 1 cannot be combined with version 2 payment operations')
   }
   if (
-    config.a2a?.pushStore &&
+    a2aConfig?.pushStore &&
     !config.x402.demoMode &&
-    (!config.a2a.webhookSecret || config.a2a.webhookSecret.trim().length === 0)
+    (!a2aConfig.webhookSecret || a2aConfig.webhookSecret.trim().length === 0)
   ) {
     throw new Error('createAgentGateway: production A2A push requires a webhookSecret')
   }
@@ -183,8 +215,8 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     maxLen: config.maxMessageLength ?? 8000,
     maxOutputTokens,
     defaultOutputTokens,
-    maxReasoningTokens: config.executionBudget?.maxReasoningTokens ?? maxOutputTokens,
-    maxToolTokens: config.executionBudget?.maxToolTokens ?? maxOutputTokens,
+    maxReasoningTokens: config.executionBudget?.maxReasoningTokens,
+    maxToolTokens: config.executionBudget?.maxToolTokens,
     maxToolCalls: config.executionBudget?.maxToolCalls ?? 8,
     maxProviderCostUsd: config.executionBudget?.maxProviderCostUsd,
     obs: config.observer,
@@ -297,6 +329,51 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
     try {
       await claimPayment(authz, config, state)
     } catch (error) {
+      if (error instanceof ApiKeyRequestLimitExceededError) {
+        const resetAt = error.claim.reason === 'daily'
+          ? error.claim.dailyResetAt
+          : error.claim.minuteResetAt
+        const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1_000))
+        await obs?.onRateLimited?.(
+          {
+            requestId: authz.requestId,
+            agentSlug: authz.agent.slug,
+            startMs: authz.startMs,
+          },
+          { consumerId: authz.consumerId, retryAfterSeconds },
+        )
+        return c.json(
+          {
+            error: {
+              message: `API key ${error.claim.reason} request limit exceeded`,
+              type: 'rate_limit_error',
+              code: `api_key_${error.claim.reason}_limit_exceeded`,
+              retry_after: retryAfterSeconds,
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              'Retry-After': String(retryAfterSeconds),
+              'X-Request-Id': authz.requestId,
+              'X-RateLimit-Remaining': String(error.claim.minuteRemaining),
+              'X-RateLimit-Daily-Remaining': String(error.claim.dailyRemaining),
+            },
+          },
+        )
+      }
+      if (error instanceof ApiKeyRequestClaimUnavailableError) {
+        return c.json(
+          {
+            error: {
+              message: 'API key request limits are unavailable',
+              type: 'server_error',
+              code: error.code,
+            },
+          },
+          { status: 503, headers: { 'X-Request-Id': authz.requestId } },
+        )
+      }
       const replayedGenericMpp = error instanceof PaymentRecoveryReplayError &&
         authz.paymentMethod === 'mpp' &&
         authz.mppMethod !== 'blueprintevm'
@@ -341,7 +418,9 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
       )
     }
 
-    return streamChatCompletions(c, authz, config, obs)
+    return body.stream === true
+      ? streamChatCompletions(c, authz, config, obs)
+      : completeChatCompletion(c, authz, config, obs)
   })
 
   // --- A2A protocol surface (Google Agent-to-Agent, JSON-RPC 2.0 + AgentCard) ---
@@ -349,29 +428,31 @@ export function createAgentGateway(inputConfig: CreateAgentGatewayConfig) {
   // Both surfaces share authenticateAndGuard + dispatchSandboxStream +
   // settleAndRecord, so every security and billing guarantee applies uniformly
   // regardless of which protocol the caller used.
-  const pushStore = config.a2a?.pushStore
-  try {
-    // Do not create process-local state for production A2A.
-    if (!config.x402.demoMode && !config.a2a?.taskStore) {
-      throw new Error('A2A production requires an explicitly configured atomic task store')
+  if (config.a2a !== false) {
+    const pushStore = a2aConfig?.pushStore
+    try {
+      // Do not create process-local state for production A2A.
+      if (!config.x402.demoMode && !a2aConfig?.taskStore) {
+        throw new Error('A2A production requires an explicitly configured atomic task store')
+      }
+      const taskStore = a2aConfig?.taskStore ?? new InMemoryTaskStore()
+      const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
+      gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
+      gw.post('/:slug', a2a.handleJsonRpc)
+    } catch (error) {
+      // A missing or older custom store must not take down the OpenAI surface.
+      // Keep A2A unavailable until its owner supplies atomic methods.
+      console.error(
+        '[agent-gateway] A2A is unavailable until its task store is configured with atomic methods:',
+        error instanceof Error ? error.message : String(error),
+      )
+      const unavailable = (c: import('hono').Context) => c.json(
+        { error: 'A2A task persistence is not configured for concurrent workers' },
+        503,
+      )
+      gw.get('/:slug/.well-known/agent.json', unavailable)
+      gw.post('/:slug', unavailable)
     }
-    const taskStore = config.a2a?.taskStore ?? new InMemoryTaskStore()
-    const a2a = createA2AHandlers({ config, state, taskStore, pushStore })
-    gw.get('/:slug/.well-known/agent.json', a2a.handleAgentCard)
-    gw.post('/:slug', a2a.handleJsonRpc)
-  } catch (error) {
-    // A missing or older custom store must not take down the OpenAI surface.
-    // Keep A2A unavailable until its owner supplies atomic methods.
-    console.error(
-      '[agent-gateway] A2A is unavailable until its task store is configured with atomic methods:',
-      error instanceof Error ? error.message : String(error),
-    )
-    const unavailable = (c: import('hono').Context) => c.json(
-      { error: 'A2A task persistence is not configured for concurrent workers' },
-      503,
-    )
-    gw.get('/:slug/.well-known/agent.json', unavailable)
-    gw.post('/:slug', unavailable)
   }
 
   return gw
@@ -384,6 +465,228 @@ Object.assign(createAgentGateway, { paymentProtocolVersion: 2 as const })
 /** Public package-boundary version marker for durable payment operations. */
 export namespace createAgentGateway {
   export const paymentProtocolVersion = 2 as const
+}
+
+interface ChatCompletionRun {
+  text: string
+  usage: import('./types').SandboxUsageReceipt
+}
+
+interface ChatCompletionCallbacks {
+  onText?: (delta: string) => void
+  onActivity?: () => void
+  onUsage?: (usage: import('./types').SandboxUsageReceipt) => void
+}
+
+const DEFAULT_INPUT_REQUIRED_MESSAGE = 'Additional input is required.'
+
+function inputRequiredMessage(prompt?: string): string {
+  const trimmed = prompt?.trim()
+  return trimmed || DEFAULT_INPUT_REQUIRED_MESSAGE
+}
+
+/** Consume one sandbox run and normalize its output for both OpenAI modes. */
+async function runChatCompletion(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  signal: AbortSignal,
+  callbacks: ChatCompletionCallbacks = {},
+): Promise<ChatCompletionRun> {
+  let text = ''
+  let usage: import('./types').SandboxUsageReceipt | undefined
+
+  for await (const event of dispatchSandboxStreamRich(
+    authz.agent,
+    authz.userMessage,
+    authz.consumerId,
+    config,
+    signal,
+    authz.threadId,
+    authz.maxOutputTokens,
+    () => beginPaymentExecution(authz, config),
+    authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
+    async () => {
+      if (authz.paymentRecoveryId) callbacks.onActivity?.()
+      await markPaymentExecutionStarted(authz, config)
+    },
+    authz.executionBudget.maxInputTokens,
+    () => renewPaymentExecution(authz, config),
+    buildGatewaySandboxContext(authz),
+  )) {
+    if (event.kind === 'text') {
+      text += event.delta
+      callbacks.onActivity?.()
+      callbacks.onText?.(event.delta)
+    } else if (event.kind === 'input-required') {
+      const prompt = inputRequiredMessage(event.prompt)
+      const delta = text.length > 0 ? `\n\n${prompt}` : prompt
+      text += delta
+      callbacks.onActivity?.()
+      callbacks.onText?.(delta)
+    } else if (event.kind === 'activity') {
+      callbacks.onActivity?.()
+    } else {
+      usage = event.usage
+      callbacks.onUsage?.(usage)
+    }
+  }
+
+  if (!usage) throw new Error('sandbox did not provide a usage receipt')
+  return { text, usage }
+}
+
+function safeCompletionErrorMessage(error: unknown): string {
+  const rawMessage = error instanceof Error ? error.message : String(error)
+  // Never expose stack traces or absolute paths from sandbox internals.
+  return rawMessage.includes('/') || rawMessage.includes('\\')
+    ? 'Internal agent error'
+    : rawMessage
+}
+
+function completionHeaders(
+  authz: AuthorizedRequest,
+  paymentSettled: boolean,
+): Record<string, string> {
+  const {
+    agent,
+    paymentMethod,
+    requestId,
+    rateLimitRemaining,
+  } = authz
+  return {
+    'X-Request-Id': requestId,
+    'X-Agent-Slug': agent.slug,
+    'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
+    ...(authz.threadId ? { 'X-Tangle-Thread-Id': authz.threadId } : {}),
+    'X-Payment-Method': paymentMethod,
+    'X-Payment-Settled': paymentSettled
+      ? 'true'
+      : paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
+    ...(authz.mppChargeOperation
+      ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
+      : {}),
+    ...(authz.paymentRecoveryId
+      ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
+      : {}),
+    ...(rateLimitRemaining !== undefined
+      ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
+      : {}),
+  }
+}
+
+async function reportCompletionError(
+  obs: GatewayObserver | undefined,
+  ctx: RequestContext,
+  consumerId: string,
+  error: unknown,
+): Promise<void> {
+  try {
+    await obs?.onStreamError?.(ctx, {
+      consumerId,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    })
+  } catch (observerError) {
+    console.error(
+      `[agent-gateway] stream observer failed for ${ctx.requestId}:`,
+      observerError instanceof Error ? observerError.message : String(observerError),
+    )
+  }
+}
+
+async function releaseCompletionAfterFailure(
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  error: unknown,
+  workObserved: boolean,
+  usage: import('./types').SandboxUsageReceipt | undefined,
+): Promise<void> {
+  try {
+    await releasePaymentAfterFailure(
+      authz,
+      config,
+      error instanceof Error ? error.message : String(error),
+      workObserved || usage !== undefined,
+      error instanceof SandboxStreamError ? usage : undefined,
+    )
+  } catch (releaseError) {
+    console.error(
+      `[agent-gateway] payment release failed for ${authz.requestId}:`,
+      releaseError instanceof Error ? releaseError.message : String(releaseError),
+    )
+  }
+}
+
+async function completeChatCompletion(
+  c: import('hono').Context,
+  authz: AuthorizedRequest,
+  config: GatewayConfig,
+  obs: GatewayObserver | undefined,
+): Promise<Response> {
+  let usage: import('./types').SandboxUsageReceipt | undefined
+  let workObserved = false
+  const requestSignal = c.req.raw.signal
+  const abortController = new AbortController()
+  const abortFromRequest = () => abortController.abort()
+  const continueOnDisconnect = config.continueOnDisconnect
+  if (!continueOnDisconnect) {
+    if (requestSignal.aborted) abortFromRequest()
+    else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  }
+  const ctx: RequestContext = {
+    requestId: authz.requestId,
+    agentSlug: authz.agent.slug,
+    startMs: authz.startMs,
+  }
+
+  try {
+    const completion = await runChatCompletion(authz, config, abortController.signal, {
+      onText: () => { workObserved = true },
+      onActivity: () => { workObserved = true },
+      onUsage: (nextUsage) => { usage = nextUsage },
+    })
+    usage = completion.usage
+    await settleAndRecord(
+      authz.agent,
+      authz,
+      completion.usage,
+      config,
+      obs,
+    )
+
+    const response: ChatCompletion = {
+      id: `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: authz.agent.slug,
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: completion.text },
+        finish_reason: 'stop',
+      }],
+      usage: {
+        prompt_tokens: completion.usage.inputTokens,
+        completion_tokens: completion.usage.outputTokens,
+        total_tokens: completion.usage.inputTokens + completion.usage.outputTokens,
+      },
+    }
+    return c.json(response, {
+      headers: completionHeaders(authz, true),
+    })
+  } catch (error) {
+    await reportCompletionError(obs, ctx, authz.consumerId, error)
+    await releaseCompletionAfterFailure(authz, config, error, workObserved, usage)
+    return c.json(
+      { error: { message: safeCompletionErrorMessage(error), type: 'server_error', ...(error instanceof ApiKeyBudgetUnsupportedError ? { code: error.code } : {}) } },
+      {
+        status: error instanceof ApiKeyBudgetUnsupportedError ? 503 : 500,
+        headers: completionHeaders(authz, false),
+      },
+    )
+  } finally {
+    if (!continueOnDisconnect) {
+      requestSignal.removeEventListener('abort', abortFromRequest)
+    }
+  }
 }
 
 /**
@@ -401,20 +704,23 @@ function streamChatCompletions(
   const {
     agent,
     consumerId,
-    paymentMethod,
     requestId,
-    userMessage,
-    rateLimitRemaining,
-    maxOutputTokens,
   } = authz
-  let outputText = ''
   let usage: import('./types').SandboxUsageReceipt | undefined
   let workObserved = false
+  let clientDisconnected = false
   const requestSignal = c.req.raw.signal
   const abortController = new AbortController()
   const abortFromRequest = () => abortController.abort()
-  if (requestSignal.aborted) abortFromRequest()
-  else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  const continueOnDisconnect = config.continueOnDisconnect
+  if (!continueOnDisconnect) {
+    if (requestSignal.aborted) abortFromRequest()
+    else requestSignal.addEventListener('abort', abortFromRequest, { once: true })
+  }
+  let finishBackgroundTask!: () => void
+  const backgroundTask = new Promise<void>((resolve) => {
+    finishBackgroundTask = resolve
+  })
   const ctx: RequestContext = {
     requestId,
     agentSlug: agent.slug,
@@ -425,8 +731,7 @@ function streamChatCompletions(
     async start(controller) {
       const encoder = new TextEncoder()
       const sendChunk = (delta: string, role?: string) => {
-        if (controller.desiredSize === null) return
-        outputText += delta
+        if (clientDisconnected || controller.desiredSize === null) return
         const chunk: ChatCompletionChunk = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion.chunk',
@@ -437,40 +742,19 @@ function streamChatCompletions(
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
       }
       const sendKeepalive = () => {
-        if (controller.desiredSize === null) return
+        if (clientDisconnected || controller.desiredSize === null) return
         controller.enqueue(encoder.encode(': keep-alive\n\n'))
       }
       const keepaliveTimer = setInterval(sendKeepalive, 15_000)
 
       try {
         sendChunk('', 'assistant')
-        for await (const event of dispatchSandboxStreamRich(
-          agent,
-          userMessage,
-          consumerId,
-          config,
-          abortController.signal,
-          authz.threadId,
-          maxOutputTokens,
-          () => beginPaymentExecution(authz, config),
-          authz.paymentOperation !== undefined || authz.mppChargeOperation !== undefined,
-          async () => {
-            if (authz.paymentRecoveryId) workObserved = true
-            await markPaymentExecutionStarted(authz, config)
-          },
-          authz.executionBudget.maxInputTokens,
-          () => renewPaymentExecution(authz, config),
-          buildGatewaySandboxContext(authz),
-        )) {
-          if (event.kind === 'text') {
-            sendChunk(event.delta)
-            workObserved = true
-          }
-          if (event.kind === 'activity') workObserved = true
-          if (event.kind === 'usage') usage = event.usage
-        }
-
-        if (!usage) throw new Error('sandbox did not provide a usage receipt')
+        const completion = await runChatCompletion(authz, config, abortController.signal, {
+          onText: sendChunk,
+          onActivity: () => { workObserved = true },
+          onUsage: (nextUsage) => { usage = nextUsage },
+        })
+        usage = completion.usage
 
         await settleAndRecord(
           agent,
@@ -487,70 +771,55 @@ function streamChatCompletions(
           model: agent.slug,
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         }
-        if (controller.desiredSize !== null) {
+        if (!clientDisconnected && controller.desiredSize !== null) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(done)}\n\n`))
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         }
       } catch (err) {
-        const rawMessage = err instanceof Error ? err.message : String(err)
-        // Never expose stack traces / absolute paths from sandbox internals.
-        const safeMessage =
-          rawMessage.includes('/') || rawMessage.includes('\\')
-            ? 'Internal agent error'
-            : rawMessage
-        try {
-          await obs?.onStreamError?.(ctx, { consumerId, errorMessage: rawMessage })
-        } catch (observerError) {
-          console.error(
-            `[agent-gateway] stream observer failed for ${requestId}:`,
-            observerError instanceof Error ? observerError.message : String(observerError),
-          )
-        }
-        try {
-          await releasePaymentAfterFailure(authz, config, rawMessage, workObserved || usage !== undefined)
-        } catch (releaseError) {
-          console.error(
-            `[agent-gateway] payment release failed for ${authz.requestId}:`,
-            releaseError instanceof Error ? releaseError.message : String(releaseError),
-          )
-        }
-        if (!abortController.signal.aborted && controller.desiredSize !== null) {
+        const safeMessage = safeCompletionErrorMessage(err)
+        await reportCompletionError(obs, ctx, consumerId, err)
+        await releaseCompletionAfterFailure(authz, config, err, workObserved, usage)
+        if (
+          !clientDisconnected &&
+          !abortController.signal.aborted &&
+          controller.desiredSize !== null
+        ) {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error' } })}\n\n`,
+              `data: ${JSON.stringify({ error: { message: safeMessage, type: 'server_error', ...(err instanceof ApiKeyBudgetUnsupportedError ? { code: err.code } : {}) } })}\n\n`,
             ),
           )
         }
       } finally {
         clearInterval(keepaliveTimer)
-        requestSignal.removeEventListener('abort', abortFromRequest)
-        if (controller.desiredSize !== null) controller.close()
+        if (!continueOnDisconnect) {
+          requestSignal.removeEventListener('abort', abortFromRequest)
+        }
+        finishBackgroundTask()
+        if (!clientDisconnected && controller.desiredSize !== null) controller.close()
       }
     },
     cancel() {
-      abortController.abort()
+      clientDisconnected = true
+      if (!continueOnDisconnect) abortController.abort()
     },
   })
+
+  if (continueOnDisconnect) {
+    try {
+      continueOnDisconnect(backgroundTask)
+    } catch (error) {
+      abortController.abort()
+      void stream.cancel()
+      throw error
+    }
+  }
 
   return new Response(stream, {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'X-Request-Id': requestId,
-      'X-Agent-Slug': agent.slug,
-      'X-Agent-Hosting': agent.sandboxEndpoint ? 'sovereign' : 'centralized',
-      ...(authz.threadId ? { 'X-Tangle-Thread-Id': authz.threadId } : {}),
-      'X-Payment-Method': paymentMethod,
-      'X-Payment-Settled': paymentMethod === 'x402' || authz.paymentOperation ? 'pending' : 'true',
-      ...(authz.mppChargeOperation
-        ? { 'Payment-Receipt': authz.mppChargeOperation.receipt }
-        : {}),
-      ...(authz.paymentRecoveryId
-        ? { 'X-Payment-Operation-Id': authz.paymentRecoveryId }
-        : {}),
-      ...(rateLimitRemaining !== undefined
-        ? { 'X-RateLimit-Remaining': String(rateLimitRemaining) }
-        : {}),
+      ...completionHeaders(authz, false),
     },
   })
 }
