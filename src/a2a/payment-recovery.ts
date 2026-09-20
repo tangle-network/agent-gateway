@@ -8,6 +8,7 @@ import {
   type SerializedPaymentOperation,
 } from '../payment-recovery'
 import type { SandboxUsageReceipt } from '../types'
+import { TASK_EXECUTION_RECOVERY_METADATA_KEY } from './execution-fence'
 import type { Task } from './types'
 import {
   asError,
@@ -327,7 +328,7 @@ async function clearReconciledPaymentRecoveryMarker(
       ...withStatus(cleared, 'failed'),
       metadata: {
         ...(cleared.metadata ?? {}),
-        gatewayExecutionRecovery: {
+        [TASK_EXECUTION_RECOVERY_METADATA_KEY]: {
           error: 'payment recovery completed without a task result',
         },
       },

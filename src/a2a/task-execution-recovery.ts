@@ -7,6 +7,7 @@ import {
   hasMalformedTaskExecution,
   inspectTaskExecution,
   readTaskExecutionReference,
+  TASK_EXECUTION_RECOVERY_METADATA_KEY,
 } from './execution-fence'
 import { getTaskExecutionSource } from './detached-sandbox'
 import {
@@ -221,7 +222,7 @@ export async function recoverExpiredExecutionIfNeeded(
     ...withStatus(task, 'failed'),
     metadata: {
       ...(clearTaskExecution(task).metadata ?? {}),
-      gatewayExecutionRecovery: {
+      [TASK_EXECUTION_RECOVERY_METADATA_KEY]: {
         error: inspection.state === 'malformed'
           ? `A2A execution marker was malformed: ${inspection.reason}`
           : 'A2A execution lease expired before a task result was stored',

@@ -30,7 +30,7 @@ type DetachedSandboxBox = SandboxBox & {
   session: NonNullable<SandboxBox['session']>
 }
 
-export function hasDetachedSandbox(box: SandboxBox): box is DetachedSandboxBox {
+function hasDetachedSandbox(box: SandboxBox): box is DetachedSandboxBox {
   return typeof box.id === 'string' && box.id.length > 0 &&
     typeof box.dispatchPrompt === 'function' && typeof box.session === 'function'
 }
@@ -122,25 +122,18 @@ interface DetachedDispatchOptions {
   onExecutionAccepted: (reference: SandboxRunControlRef) => Promise<void>
 }
 
-/** Keep detached dispatch private to A2A while reusing the common event adapter. */
+/**
+ * Keep detached dispatch private to A2A while reusing the common event adapter.
+ * The trailing arguments are `dispatchSandboxStreamRich`'s own, forwarded with
+ * only the sandbox factory swapped, so a change to that signature cannot drift
+ * out of sync here.
+ */
 export function dispatchDetachedSandboxStreamRich(
-  agent: AgentMeta,
-  userMessage: string,
-  consumerId: string,
-  config: GatewayConfig,
-  signal?: AbortSignal,
-  sessionId?: string,
-  maxOutputTokens?: number,
-  onExecutionStart?: () => Promise<void>,
-  requiresReceipt = config.x402.paymentOperations !== undefined,
-  onSandboxStart?: () => void | Promise<void>,
-  maxInputTokens?: number,
-  onExecutionHeartbeat?: () => Promise<void>,
-  sandboxContext?: GatewaySandboxContext,
-  options?: DetachedDispatchOptions,
+  options: DetachedDispatchOptions,
+  ...args: Parameters<typeof dispatchSandboxStreamRich>
 ): AsyncIterable<A2ADispatchEvent> {
-  if (!options) throw new Error('A2A detached execution identity is unavailable')
-  const detachedConfig: GatewayConfig = {
+  const [, , consumerId, config, signal, , maxOutputTokens] = args
+  args[3] = {
     ...config,
     getSandbox: async (requestedAgent, context) => {
       const box = await config.getSandbox(requestedAgent, context)
@@ -172,21 +165,7 @@ export function dispatchDetachedSandboxStreamRich(
       }
     },
   }
-  return dispatchSandboxStreamRich(
-    agent,
-    userMessage,
-    consumerId,
-    detachedConfig,
-    signal,
-    sessionId,
-    maxOutputTokens,
-    onExecutionStart,
-    requiresReceipt,
-    onSandboxStart,
-    maxInputTokens,
-    onExecutionHeartbeat,
-    sandboxContext,
-  )
+  return dispatchSandboxStreamRich(...args)
 }
 
 async function dispatchRun(
@@ -231,19 +210,16 @@ function exactReference(
   dispatched: Awaited<ReturnType<DetachedSandboxBox['dispatchPrompt']>>,
   operation: string,
 ): SandboxRunControlRef {
+  const declared = normalizeRunControlRef(dispatched?.runControlRef)
   const sessionId = nonEmptyString(dispatched?.sessionId)
-  const executionId = nonEmptyString(dispatched?.executionId) ??
-    normalizeRunControlRef(dispatched?.runControlRef)?.executionId
-  if (dispatched?.dispatched === false && !executionId) {
-    throw new Error(`sandbox detached ${operation} returned no exact execution id`)
-  }
-  const reference = normalizeRunControlRef(dispatched?.runControlRef) ?? (
+  const executionId = nonEmptyString(dispatched?.executionId) ?? declared?.executionId
+  const reference = declared ?? (
     sessionId && executionId
       ? { environmentId: box.id, sessionId, executionId }
       : undefined
   )
   if (
-    !sessionId || !executionId || !reference ||
+    !reference ||
     reference.environmentId !== box.id ||
     reference.sessionId !== sessionId ||
     reference.executionId !== executionId

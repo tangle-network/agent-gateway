@@ -131,6 +131,17 @@ export async function executeMessageStream(
           send(workingStatus)
 
           for await (const event of dispatchDetachedSandboxStreamRich(
+            {
+              turnId: taskExecutionTurnId(task),
+              onExecutionAccepted: async (reference) => {
+                workingTask = await attachTaskExecutionReference(
+                  deps.taskStore,
+                  workingTask,
+                  authz.requestId,
+                  reference,
+                )
+              },
+            },
             authz.agent,
             authz.userMessage,
             authz.consumerId,
@@ -153,17 +164,6 @@ export async function executeMessageStream(
               await renewPaymentExecution(authz, deps.config)
             },
             buildGatewaySandboxContext(authz),
-            {
-              turnId: taskExecutionTurnId(task),
-              onExecutionAccepted: async (reference) => {
-                workingTask = await attachTaskExecutionReference(
-                  deps.taskStore,
-                  workingTask,
-                  authz.requestId,
-                  reference,
-                )
-              },
-            },
           )) {
             if (event.kind === 'text') {
               responseText += event.delta
