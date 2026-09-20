@@ -493,6 +493,88 @@ describe('A2A client disconnect cancellation', () => {
     await reader.cancel()
   })
 
+  async function readFrames(res: Response, done: (frames: string[]) => boolean): Promise<string[]> {
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    const frames: string[] = []
+    let buffer = ''
+    while (!done(frames)) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      buffer += decoder.decode(chunk.value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        frames.push(buffer.slice(0, boundary))
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+      }
+    }
+    await reader.cancel().catch(() => undefined)
+    return frames
+  }
+
+  it('gives resubscribe clients an event cursor they can resume from', async () => {
+    const taskStore = new InMemoryTaskStore()
+    let releaseSecond!: () => void
+    let releaseUsage!: () => void
+    const secondDelta = new Promise<void>((resolve) => { releaseSecond = resolve })
+    const finalUsage = new Promise<void>((resolve) => { releaseUsage = resolve })
+    const sandbox = durableSandbox({
+      async *streamPrompt() {
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'one' } }
+        await secondDelta
+        yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta: 'two' } }
+        await finalUsage
+        yield { type: 'sandbox.usage', data: { usage: delayedUsage } }
+      },
+    }, 'sandbox-cursor')
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(gatewayConfig(taskStore, {
+      getSandbox: async () => sandbox,
+    })))
+
+    const stream = await post(
+      app,
+      agentA.slug,
+      body('message/stream'),
+      { 'X-Payment-Signature': paymentHeader('992') },
+    )
+    const taskId = stream.headers.get('X-Task-Id')!
+    const streamReader = stream.body!.getReader()
+    const firstStreamRead = streamReader.read()
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const marker = (await taskStore.get(taskId))?.metadata?.gatewayExecution as
+        { runControlRef?: unknown } | undefined
+      if (marker?.runControlRef) break
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    await streamReader.cancel()
+
+    const hasDelta = (frames: string[]) => frames.some((frame) => frame.includes('artifact-update'))
+    const first = await post(app, agentA.slug, body('tasks/resubscribe', taskId))
+    const firstFrames = await readFrames(first, hasDelta)
+    const firstDelta = firstFrames.find((frame) => frame.includes('artifact-update'))!
+    expect(firstDelta).toContain('"text":"one"')
+    const cursor = /^id: (.+)$/m.exec(firstDelta)?.[1]
+    expect(cursor).toBeTruthy()
+
+    releaseSecond()
+    const resumed = await post(app, agentA.slug, {
+      jsonrpc: '2.0',
+      id: 'resume',
+      method: 'tasks/resubscribe',
+      params: { id: taskId, lastEventId: cursor },
+    })
+    const resumedFrames = await readFrames(resumed, hasDelta)
+    const resumedDelta = resumedFrames.find((frame) => frame.includes('artifact-update'))!
+    expect(resumedDelta).toContain('"text":"two"')
+    expect(resumedFrames.join('\n')).not.toContain('"text":"one"')
+
+    releaseUsage()
+    await waitForTaskState(taskStore, taskId, 'completed')
+    await firstStreamRead
+  })
+
   it('interrupts only the exact detached run for tasks/cancel', async () => {
     const { app, sandbox, taskStore, startedPromise, interrupts } = await makeDisconnectHarness()
     const response = await post(
