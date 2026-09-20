@@ -25,60 +25,20 @@ import { ServerAssignedTaskStore } from './server-assigned-task-store'
 import { durableSandbox } from './detached-sandbox'
 import type {
   AgentMeta,
-  ApiKeyInfo,
   GatewayConfig,
   GatewaySandboxContext,
   GatewayUsageEvent,
-  SandboxBox,
   SandboxStreamEvent,
 } from '../src/types'
-
-const operatorAddress = '0x1111111111111111111111111111111111111111'
-
-class StubSandbox implements SandboxBox {
-  constructor(
-    private chunks: string[],
-    private opts: { delayMs?: number } = {},
-  ) {}
-  async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
-    let output = ''
-    for (const delta of this.chunks) {
-      if (this.opts.delayMs) await new Promise((r) => setTimeout(r, this.opts.delayMs))
-      output += delta
-      yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
-    }
-    yield {
-      type: 'sandbox.usage',
-      data: {
-        usage: {
-          inputTokens: 1,
-          outputTokens: Math.ceil(output.length / 4),
-          reasoningTokens: 0,
-          toolTokens: 0,
-          toolCallCount: 0,
-          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
-          budgetEnforced: true,
-        },
-      },
-    }
-  }
-}
-
-function makeAgent(overrides: Partial<AgentMeta> = {}): AgentMeta {
-  return {
-    id: 'agent_1',
-    ownerId: 'user_owner',
-    slug: 'test-agent',
-    systemPrompt: 'You are a test assistant.',
-    pricePerTokenUsd: 0.00002,
-    platformFeePercent: 0.2,
-    sandboxEndpoint: null,
-    remoteSandboxId: null,
-    remoteBearerToken: null,
-    enabled: true,
-    ...overrides,
-  }
-}
+import {
+  StubSandbox,
+  apiKeyHeader,
+  makeAgent,
+  operatorAddress,
+  parseSseEvents,
+  textMessage,
+  verifyDemoApiKey,
+} from './a2a-harness'
 
 interface Harness {
   app: Hono
@@ -108,17 +68,7 @@ function buildHarness(
     settlePayment: async (p, cost) => {
       settlements.push({ method: p.method, cost })
     },
-    verifyApiKey: async (header) => {
-      const token = header.replace(/^Bearer\s+/, '')
-      if (token.startsWith('sk_agent_')) {
-        return {
-          consumerId: `consumer_${token}`,
-          keyId: token,
-          scopes: ['chat'],
-        } as ApiKeyInfo
-      }
-      return null
-    },
+    verifyApiKey: verifyDemoApiKey,
     x402: {
       operatorAddress,
       chainId: 3799,
@@ -152,10 +102,6 @@ async function postJsonRpc(
   })
 }
 
-function apiKeyHeader(): Record<string, string> {
-  return { Authorization: 'Bearer sk_agent_test_key_1' }
-}
-
 const structuredSandboxFailure: SandboxStreamEvent = {
   type: 'error',
   data: {
@@ -163,26 +109,6 @@ const structuredSandboxFailure: SandboxStreamEvent = {
     message: 'Unable to connect',
     details: { supportDetails: 'sandbox unavailable' },
   },
-}
-
-function textMessage(text: string, taskId?: string, contextId?: string) {
-  return {
-    kind: 'message' as const,
-    role: 'user' as const,
-    parts: [{ kind: 'text' as const, text }],
-    messageId: `msg_${Math.random().toString(36).slice(2)}`,
-    ...(taskId ? { taskId } : {}),
-    ...(contextId ? { contextId } : {}),
-  }
-}
-
-async function parseSseEvents(res: Response): Promise<StreamingEvent[]> {
-  const body = await res.text()
-  const lines = body.split('\n').filter((l) => l.startsWith('data: '))
-  return lines.map((l) => {
-    const env = JSON.parse(l.slice(6)) as JSONRPCSuccessResponse<StreamingEvent>
-    return env.result
-  })
 }
 
 // ── AgentCard discovery ──────────────────────────────────────────────────
@@ -493,7 +419,7 @@ describe('A2A — message/send', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: textMessage('connect', undefined, 'structured-failure-context') },
+        params: { message: textMessage('connect', { contextId: 'structured-failure-context' }) },
       },
       apiKeyHeader(),
     )
@@ -713,7 +639,7 @@ describe('A2A — authenticated sandbox context', () => {
           jsonrpc: '2.0',
           id: request.id,
           method: request.method,
-          params: { message: textMessage(request.text, undefined, request.contextId) },
+          params: { message: textMessage(request.text, { contextId: request.contextId }) },
         },
         apiKeyHeader(),
       )
@@ -762,7 +688,7 @@ describe('A2A — authenticated sandbox context', () => {
         jsonrpc: '2.0',
         id: 1,
         method: 'message/send',
-        params: { message: textMessage('send', undefined, 'a2a-context') },
+        params: { message: textMessage('send', { contextId: 'a2a-context' }) },
       },
       { ...apiKeyHeader(), 'X-Tangle-Thread-Id': 'header-context' },
     )
