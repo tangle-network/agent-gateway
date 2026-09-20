@@ -1678,7 +1678,9 @@ describe('PR #11 production regressions', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
-  it('leaves a lapsed lease alone while its sandbox run is still active', async () => {
+  it.each(['active', 'running', 'queued', 'ACTIVE'])(
+    'leaves a lapsed lease alone while its sandbox run reports %s',
+    async (runStatus) => {
     const taskStore = new InMemoryTaskStore()
     const expired = Date.now() - 60_000
     const task: Task = {
@@ -1720,7 +1722,7 @@ describe('PR #11 production regressions', () => {
         },
         session: () => ({
           events: async function* () {},
-          runs: async () => [{ executionId: 'orphan-execution', status: 'active' }],
+          runs: async () => [{ executionId: 'orphan-execution', status: runStatus }],
           interrupt: async () => ({ cancelled: false }),
           result: async () => {
             awaited = true
@@ -1743,7 +1745,8 @@ describe('PR #11 production regressions', () => {
     const body = await (response as Response).json() as { result?: Task }
     expect(body.result?.status.state).toBe('working')
     expect((await taskStore.get(task.id))?.status.state).toBe('working')
-  })
+  },
+  )
 
   it('reads the input-required prompt out of the runtime question payload', async () => {
     const taskStore = new InMemoryTaskStore()

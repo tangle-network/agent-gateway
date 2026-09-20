@@ -36,6 +36,13 @@ function hasDetachedSandbox(box: SandboxBox): box is DetachedSandboxBox {
 }
 
 /** Stable identity for one task turn. Retries must address the same SDK turn. */
+/**
+ * Only a known terminal status releases the run probe. An unrecognized status
+ * defers to the next poll, because mistaking a live run for a finished one
+ * sends reconciliation into the blocking `session.result()`.
+ */
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'canceled'])
+
 export function taskExecutionTurnId(task: Task): string {
   return `${task.id}:turn:${task.history?.length ?? 0}`
 }
@@ -106,8 +113,8 @@ export async function getTaskExecutionSource(
       ...(options ?? {}),
       executionId: run.executionId,
     }),
-    isRunning: async () => (await session.runs())
-      .some((info) => info.executionId === run.executionId && info.status === 'active'),
+    isRunning: async () => (await session.runs()).some((info) =>
+      info.executionId === run.executionId && !TERMINAL_RUN_STATUSES.has(info.status.toLowerCase())),
     result: () => session.result({ executionId: run.executionId }),
     interrupt: () => session.interrupt({ executionId: run.executionId }),
     translateText: (value) => redactSystemPromptFromOutput(

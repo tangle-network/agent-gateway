@@ -270,7 +270,11 @@ interface SandboxDurableSession {
   events: (opts?: { since?: string; executionId?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
   result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
   interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
-  /** Execution status without awaiting the run. `result()` blocks until terminal. */
+  /**
+   * Execution status without awaiting the run; `result()` blocks until terminal.
+   * Only `completed`, `failed`, `cancelled` and `canceled` are read as terminal.
+   * Any other status, case-insensitively, means the run is still owned.
+   */
   runs: () => Promise<Array<{ executionId: string; status: string }>>
 }
 
