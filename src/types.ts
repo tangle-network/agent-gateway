@@ -260,7 +260,8 @@ export interface SandboxPromptResult {
   executionId?: string
   response?: string
   error?: string
-  question?: string
+  /** Runtime question payload, not a sentence: `{ questionId, questions }`. */
+  question?: { questionId: string; questions?: unknown }
   usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   costUsd?: number
 }
@@ -269,6 +270,12 @@ interface SandboxDurableSession {
   events: (opts?: { since?: string; executionId?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
   result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
   interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
+  /**
+   * Execution status without awaiting the run; `result()` blocks until terminal.
+   * Only `completed`, `failed`, `cancelled` and `canceled` are read as terminal.
+   * Any other status, case-insensitively, means the run is still owned.
+   */
+  runs: () => Promise<Array<{ executionId: string; status: string }>>
 }
 
 export type SandboxPromptOptions = {

@@ -17,6 +17,9 @@ interface ExecutionTaskStore {
 /** Durable marker that prevents cancellation from racing sandbox start. */
 export const TASK_EXECUTION_METADATA_KEY = 'gatewayExecution'
 
+/** Why a working task was failed instead of settled from its sandbox run. */
+export const TASK_EXECUTION_RECOVERY_METADATA_KEY = 'gatewayExecutionRecovery'
+
 const TASK_EXECUTION_VERSION = 1 as const
 const TASK_EXECUTION_LEASE_MS = 5 * 60 * 1000
 
@@ -106,7 +109,7 @@ export function hasActiveTaskExecution(task: Task, now = Date.now()): boolean {
 /** A working task with this marker has lost its execution owner. */
 export function hasExpiredTaskExecution(task: Task, now = Date.now()): boolean {
   const marker = readTaskExecution(task)
-  return marker !== undefined && !hasActiveTaskExecution(task, now)
+  return marker !== undefined && marker.lease.expiresAt <= now
 }
 
 /** A working task with an execution key that cannot be trusted. */
@@ -165,14 +168,10 @@ export async function attachTaskExecutionReference(
 /** Remove the marker when the task reaches a terminal or paused state. */
 export function clearTaskExecution(task: Task): Task {
   if (!task.metadata || !(TASK_EXECUTION_METADATA_KEY in task.metadata)) return task
-  const metadata = { ...task.metadata }
-  delete metadata[TASK_EXECUTION_METADATA_KEY]
-  return Object.keys(metadata).length > 0
-    ? { ...task, metadata }
-    : (() => {
-        const { metadata: _metadata, ...withoutMetadata } = task
-        return withoutMetadata
-      })()
+  const { [TASK_EXECUTION_METADATA_KEY]: _cleared, ...metadata } = task.metadata
+  if (Object.keys(metadata).length > 0) return { ...task, metadata }
+  const { metadata: _metadata, ...withoutMetadata } = task
+  return withoutMetadata
 }
 
 function withTaskExecution(
@@ -180,7 +179,7 @@ function withTaskExecution(
   requestId: string,
   now: number,
 ): Task {
-  const existing = readTaskExecution(task)
+  const runControlRef = readTaskExecution(task)?.runControlRef
   return {
     ...task,
     metadata: {
@@ -189,11 +188,7 @@ function withTaskExecution(
         version: TASK_EXECUTION_VERSION,
         requestId,
         lease: { id: requestId, expiresAt: now + TASK_EXECUTION_LEASE_MS },
-        ...(existing
-          ? {
-              ...(existing.runControlRef ? { runControlRef: existing.runControlRef } : {}),
-            }
-          : {}),
+        ...(runControlRef ? { runControlRef } : {}),
       } satisfies TaskExecutionMarker,
     },
   }

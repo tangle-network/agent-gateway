@@ -23,6 +23,8 @@ import type { SandboxPromptResult, SandboxRunControlRef, SandboxStreamEvent } fr
 export interface TaskExecutionSource {
   reference: SandboxRunControlRef
   events: (opts?: { since?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
+  /** True while the sandbox still owns this run. `result()` blocks until it is false. */
+  isRunning: () => Promise<boolean>
   result: () => Promise<SandboxPromptResult>
   interrupt: () => Promise<{ cancelled: boolean }>
   translateText: (value: string) => string
@@ -196,10 +198,13 @@ export async function handleTasksResubscribe(
   const stream = new ReadableStream({
     start(ctrl) {
       void (async () => {
-        const send = (value: StreamingEvent) => {
+        // The `id:` field is the only way a reconnecting client learns the
+        // cursor it must send back as `params.lastEventId`.
+        const send = (value: StreamingEvent, eventId?: string) => {
           if (ctrl.desiredSize === null) return
+          const cursor = eventId && !/[\r\n]/.test(eventId) ? `id: ${eventId}\n` : ''
           try {
-            ctrl.enqueue(encoder.encode(`data: ${JSON.stringify(ok(req.id, value))}\n\n`))
+            ctrl.enqueue(encoder.encode(`${cursor}data: ${JSON.stringify(ok(req.id, value))}\n\n`))
           } catch {
             observation.abort()
           }
@@ -223,7 +228,7 @@ export async function handleTasksResubscribe(
                   parts: [{ kind: 'text', text: execution!.translateText(sandboxEvent.data.delta) }],
                 },
                 append: true,
-              })
+              }, sandboxEvent.id)
             }
           }
         } catch (error) {

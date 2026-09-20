@@ -126,7 +126,9 @@ describe('PR #11 production regressions', () => {
     let sandboxEntered!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxEntered = resolve })
     let releaseSandbox!: () => void
+    let sandboxRunning = true
     const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+      .then(() => { sandboxRunning = false })
     let deliveries = 0
     const receivedTaskIds: string[] = []
     const webhook = new Hono()
@@ -394,6 +396,10 @@ describe('PR #11 production regressions', () => {
             usage: usage(),
           }),
           interrupt: async () => ({ cancelled: false }),
+          runs: async () => [{
+            executionId: 'runtime-secret-execution',
+            status: sandboxRunning ? 'active' : 'completed',
+          }],
         }),
       }),
       x402: {
@@ -1670,6 +1676,154 @@ describe('PR #11 production regressions', () => {
 
     expect(list).not.toHaveBeenCalled()
     expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each(['active', 'running', 'queued', 'ACTIVE'])(
+    'leaves a lapsed lease alone while its sandbox run reports %s',
+    async (runStatus) => {
+    const taskStore = new InMemoryTaskStore()
+    const expired = Date.now() - 60_000
+    const task: Task = {
+      kind: 'task',
+      id: 'orphaned-run-task',
+      contextId: 'orphaned-run-context',
+      status: { state: 'working', timestamp: new Date(expired).toISOString() },
+      history: [{
+        kind: 'message',
+        role: 'user',
+        messageId: 'orphaned-run-message',
+        parts: [{ kind: 'text', text: 'keep going' }],
+      }],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-orphan',
+          lease: { id: 'worker-orphan', expiresAt: expired },
+          runControlRef: {
+            environmentId: 'orphan-sandbox',
+            sessionId: 'orphaned-run-task',
+            executionId: 'orphan-execution',
+          },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    let awaited = false
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+      getSandbox: async () => ({
+        id: 'orphan-sandbox',
+        async *streamPrompt() {},
+        async dispatchPrompt() {
+          throw new Error('the stored run must be reattached, never redispatched')
+        },
+        session: () => ({
+          events: async function* () {},
+          runs: async () => [{ executionId: 'orphan-execution', status: runStatus }],
+          interrupt: async () => ({ cancelled: false }),
+          result: async () => {
+            awaited = true
+            return await new Promise<never>(() => {})
+          },
+        }),
+      } as unknown as Awaited<ReturnType<GatewayConfig['getSandbox']>>),
+    })))
+
+    const response = await Promise.race([
+      app.request('/v1/agents/pr11', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: task.id } }),
+      }),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+    ])
+    expect(response).not.toBe('timeout')
+    expect(awaited).toBe(false)
+    const body = await (response as Response).json() as { result?: Task }
+    expect(body.result?.status.state).toBe('working')
+    expect((await taskStore.get(task.id))?.status.state).toBe('working')
+  },
+  )
+
+  it('reads the input-required prompt out of the runtime question payload', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const expired = Date.now() - 60_000
+    const task: Task = {
+      kind: 'task',
+      id: 'awaiting-question-task',
+      contextId: 'awaiting-question-context',
+      status: { state: 'working', timestamp: new Date(expired).toISOString() },
+      history: [{
+        kind: 'message',
+        role: 'user',
+        messageId: 'awaiting-question-message',
+        parts: [{ kind: 'text', text: 'deploy it' }],
+      }],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewaySubmission: {
+          version: 1,
+          lease: { id: 'submission', expiresAt: Date.now() + 300_000 },
+          agentId: agent.id,
+          agentSlug: agent.slug,
+          requestId: 'worker-question',
+          consumerId: 'consumer-question',
+        },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-question',
+          lease: { id: 'worker-question', expiresAt: expired },
+          runControlRef: {
+            environmentId: 'question-sandbox',
+            sessionId: 'awaiting-question-task',
+            executionId: 'question-execution',
+          },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+      getSandbox: async () => ({
+        id: 'question-sandbox',
+        async *streamPrompt() {},
+        async dispatchPrompt() {
+          throw new Error('the stored run must be reattached, never redispatched')
+        },
+        session: () => ({
+          events: async function* () {},
+          runs: async () => [{ executionId: 'question-execution', status: 'completed' }],
+          interrupt: async () => ({ cancelled: false }),
+          result: async () => ({
+            success: false,
+            status: 'awaiting_question',
+            executionId: 'question-execution',
+            usage: usage(),
+            question: {
+              questionId: 'question-1',
+              questions: [{ prompt: 'Which environment should I deploy to?' }],
+            },
+          }),
+        }),
+      } as unknown as Awaited<ReturnType<GatewayConfig['getSandbox']>>),
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: task.id } }),
+    })
+    const body = await response.json() as { result?: Task; error?: unknown }
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status.state).toBe('input-required')
+    expect(body.result?.status.message?.parts).toEqual([
+      { kind: 'text', text: 'Which environment should I deploy to?' },
+    ])
   })
 
   it('closes a malformed execution marker through tasks/get and preserves payment recovery', async () => {

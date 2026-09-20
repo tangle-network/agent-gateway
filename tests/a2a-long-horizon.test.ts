@@ -28,14 +28,21 @@ import {
 import { MemoryRateLimitStore } from '../src/rate-limit'
 import type {
   AgentMeta,
-  ApiKeyInfo,
   GatewayConfig,
   SandboxBox,
   SandboxStreamEvent,
 } from '../src/types'
 import { durableSandbox } from './detached-sandbox'
-
-const operatorAddress = '0x1111111111111111111111111111111111111111'
+import {
+  StubSandbox,
+  apiKeyHeader,
+  makeAgent,
+  operatorAddress,
+  parseSseEvents,
+  stubUsage,
+  textMessage,
+  verifyDemoApiKey,
+} from './a2a-harness'
 
 /**
  * Sandbox that can inject an `input-required` signal mid-stream. Configurable
@@ -59,64 +66,10 @@ class InputRequiringSandbox implements SandboxBox {
       output += delta
       yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
     }
-    yield {
-      type: 'sandbox.usage',
-      data: {
-        usage: {
-          inputTokens: 1,
-          outputTokens: Math.ceil(output.length / 4),
-          reasoningTokens: 0,
-          toolTokens: 0,
-          toolCallCount: 0,
-          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
-          budgetEnforced: true,
-        },
-      },
-    }
+    yield { type: 'sandbox.usage', data: { usage: stubUsage(output) } }
     if (seq.pause) {
       yield { type: 'input-required', data: { inputRequired: { prompt: seq.pause.prompt } } }
     }
-  }
-}
-
-class StubSandbox implements SandboxBox {
-  constructor(private chunks: string[]) {}
-  async *streamPrompt(): AsyncIterable<SandboxStreamEvent> {
-    let output = ''
-    for (const delta of this.chunks) {
-      output += delta
-      yield { type: 'message.part.updated', data: { part: { type: 'text' }, delta } }
-    }
-    yield {
-      type: 'sandbox.usage',
-      data: {
-        usage: {
-          inputTokens: 1,
-          outputTokens: Math.ceil(output.length / 4),
-          reasoningTokens: 0,
-          toolTokens: 0,
-          toolCallCount: 0,
-          providerCostUsd: (1 + Math.ceil(output.length / 4)) * 0.00002,
-          budgetEnforced: true,
-        },
-      },
-    }
-  }
-}
-
-function makeAgent(overrides: Partial<AgentMeta> = {}): AgentMeta {
-  return {
-    id: 'agent_1',
-    ownerId: 'user_owner',
-    slug: 'test-agent',
-    systemPrompt: 'You are a test assistant.',
-    pricePerTokenUsd: 0.00002,
-    platformFeePercent: 0.2,
-    sandboxEndpoint: null,
-    remoteSandboxId: null,
-    remoteBearerToken: null,
-    enabled: true,
-    ...overrides,
   }
 }
 
@@ -146,17 +99,7 @@ function buildHarness(
     getSandbox: async () => durableSandbox(sandbox),
     recordUsage: async () => {},
     settlePayment: async () => {},
-    verifyApiKey: async (header) => {
-      const token = header.replace(/^Bearer\s+/, '')
-      if (token.startsWith('sk_agent_')) {
-        return {
-          consumerId: `consumer_${token}`,
-          keyId: token,
-          scopes: ['chat'],
-        } as ApiKeyInfo
-      }
-      return null
-    },
+    verifyApiKey: verifyDemoApiKey,
     x402: { operatorAddress, chainId: 3799, demoMode: true },
     rateLimitStore: new MemoryRateLimitStore(),
     nonceStore: new MemoryNonceStore(),
@@ -185,30 +128,6 @@ async function postJsonRpc(
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
-  })
-}
-
-function apiKeyHeader(): Record<string, string> {
-  return { Authorization: 'Bearer sk_agent_test_key_1' }
-}
-
-function textMessage(text: string, opts: { taskId?: string; contextId?: string } = {}) {
-  return {
-    kind: 'message' as const,
-    role: 'user' as const,
-    parts: [{ kind: 'text' as const, text }],
-    messageId: `msg_${Math.random().toString(36).slice(2)}`,
-    ...(opts.taskId ? { taskId: opts.taskId } : {}),
-    ...(opts.contextId ? { contextId: opts.contextId } : {}),
-  }
-}
-
-async function parseSseEvents(res: Response): Promise<StreamingEvent[]> {
-  const body = await res.text()
-  const lines = body.split('\n').filter((l) => l.startsWith('data: '))
-  return lines.map((l) => {
-    const env = JSON.parse(l.slice(6)) as JSONRPCSuccessResponse<StreamingEvent>
-    return env.result
   })
 }
 

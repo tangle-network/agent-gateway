@@ -599,8 +599,6 @@ function apiKeyClaimFailureResponse(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-const EXECUTION_RECOVERY_METADATA_KEY = 'gatewayExecutionRecovery'
-
 function setPaymentResponseHeaders(c: Context, authz: AuthorizedRequest): void {
   if (authz.mppChargeOperation) {
     c.header('Payment-Receipt', authz.mppChargeOperation.receipt)
