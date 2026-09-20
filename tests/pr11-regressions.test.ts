@@ -1678,6 +1678,84 @@ describe('PR #11 production regressions', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
+  it('reads the input-required prompt out of the runtime question payload', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const expired = Date.now() - 60_000
+    const task: Task = {
+      kind: 'task',
+      id: 'awaiting-question-task',
+      contextId: 'awaiting-question-context',
+      status: { state: 'working', timestamp: new Date(expired).toISOString() },
+      history: [{
+        kind: 'message',
+        role: 'user',
+        messageId: 'awaiting-question-message',
+        parts: [{ kind: 'text', text: 'deploy it' }],
+      }],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewaySubmission: {
+          version: 1,
+          lease: { id: 'submission', expiresAt: Date.now() + 300_000 },
+          agentId: agent.id,
+          agentSlug: agent.slug,
+          requestId: 'worker-question',
+          consumerId: 'consumer-question',
+        },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-question',
+          lease: { id: 'worker-question', expiresAt: expired },
+          runControlRef: {
+            environmentId: 'question-sandbox',
+            sessionId: 'awaiting-question-task',
+            executionId: 'question-execution',
+          },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+      getSandbox: async () => ({
+        id: 'question-sandbox',
+        async *streamPrompt() {},
+        async dispatchPrompt() {
+          throw new Error('the stored run must be reattached, never redispatched')
+        },
+        session: () => ({
+          events: async function* () {},
+          runs: async () => [{ executionId: 'question-execution', status: 'completed' }],
+          interrupt: async () => ({ cancelled: false }),
+          result: async () => ({
+            success: false,
+            status: 'awaiting_question',
+            executionId: 'question-execution',
+            usage: usage(),
+            question: {
+              questionId: 'question-1',
+              questions: [{ prompt: 'Which environment should I deploy to?' }],
+            },
+          }),
+        }),
+      } as unknown as Awaited<ReturnType<GatewayConfig['getSandbox']>>),
+    })))
+
+    const response = await app.request('/v1/agents/pr11', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: task.id } }),
+    })
+    const body = await response.json() as { result?: Task; error?: unknown }
+    expect(body.error).toBeUndefined()
+    expect(body.result?.status.state).toBe('input-required')
+    expect(body.result?.status.message?.parts).toEqual([
+      { kind: 'text', text: 'Which environment should I deploy to?' },
+    ])
+  })
+
   it('closes a malformed execution marker through tasks/get and preserves payment recovery', async () => {
     const taskStore = new InMemoryTaskStore()
     const task: Task = {

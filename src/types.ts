@@ -260,7 +260,8 @@ export interface SandboxPromptResult {
   executionId?: string
   response?: string
   error?: string
-  question?: string
+  /** Runtime question payload, not a sentence: `{ questionId, questions }`. */
+  question?: { questionId: string; questions?: unknown }
   usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   costUsd?: number
 }

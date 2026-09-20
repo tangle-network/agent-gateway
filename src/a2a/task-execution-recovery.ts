@@ -141,7 +141,7 @@ export async function reconcileTaskExecution(
     receipt,
     text ? responseTextToArtifact(text, `${current.id}-artifact-0`) : current.artifacts?.[0] ?? null,
     state === 'input-required',
-    result.question ?? result.error,
+    questionPrompt(result.question) ?? result.error,
     state === 'input-required' ? 'input-required' : 'completed',
   )
   const finalizingTask = withFinalizationRecord(current, finalization)
@@ -154,6 +154,21 @@ export async function reconcileTaskExecution(
     agent.slug,
     { force: true },
   )
+}
+
+/**
+ * The runtime reports an awaiting-question run as a payload, so read a prompt
+ * out of it rather than stringifying the object into the task status message.
+ */
+function questionPrompt(question: SandboxPromptResult['question']): string | undefined {
+  if (!question) return undefined
+  const entries = Array.isArray(question.questions) ? question.questions : [question.questions]
+  for (const entry of entries) {
+    if (typeof entry === 'string' && entry.length > 0) return entry
+    const prompt = (entry as { prompt?: unknown } | null | undefined)?.prompt
+    if (typeof prompt === 'string' && prompt.length > 0) return prompt
+  }
+  return undefined
 }
 
 function taskStateFromSandboxResult(result: SandboxPromptResult): Task['status']['state'] {
