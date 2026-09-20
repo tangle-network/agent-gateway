@@ -49,6 +49,10 @@ export async function reconcileTaskExecution(
     requestedAgentSlug,
   )
   if (!source) return task
+  // A live fence means the owning request is still streaming this run and will
+  // settle it. `result()` blocks until the run is terminal, so a status read
+  // must never reach it while the run is active.
+  if (hasActiveTaskExecution(task) && await source.isRunning()) return task
   const result = await source.result()
   if (result.executionId !== undefined && result.executionId !== source.reference.executionId) {
     throw new Error('A2A task execution result does not match its stored execution')

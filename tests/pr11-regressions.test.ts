@@ -126,7 +126,9 @@ describe('PR #11 production regressions', () => {
     let sandboxEntered!: () => void
     const sandboxReady = new Promise<void>((resolve) => { sandboxEntered = resolve })
     let releaseSandbox!: () => void
+    let sandboxRunning = true
     const sandboxReleased = new Promise<void>((resolve) => { releaseSandbox = resolve })
+      .then(() => { sandboxRunning = false })
     let deliveries = 0
     const receivedTaskIds: string[] = []
     const webhook = new Hono()
@@ -394,6 +396,10 @@ describe('PR #11 production regressions', () => {
             usage: usage(),
           }),
           interrupt: async () => ({ cancelled: false }),
+          runs: async () => [{
+            executionId: 'runtime-secret-execution',
+            status: sandboxRunning ? 'active' : 'completed',
+          }],
         }),
       }),
       x402: {

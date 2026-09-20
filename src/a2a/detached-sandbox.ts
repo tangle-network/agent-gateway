@@ -106,6 +106,8 @@ export async function getTaskExecutionSource(
       ...(options ?? {}),
       executionId: run.executionId,
     }),
+    isRunning: async () => (await session.runs())
+      .some((info) => info.executionId === run.executionId && info.status === 'active'),
     result: () => session.result({ executionId: run.executionId }),
     interrupt: () => session.interrupt({ executionId: run.executionId }),
     translateText: (value) => redactSystemPromptFromOutput(
@@ -217,9 +219,9 @@ function sessionFor(box: DetachedSandboxBox, sessionId: string) {
   const session = box.session(sessionId)
   if (
     !session ||
-    typeof session.events !== 'function' ||
-    typeof session.result !== 'function' ||
-    typeof session.interrupt !== 'function'
+    !(['events', 'result', 'interrupt', 'runs'] as const).every(
+      (control) => typeof session[control] === 'function',
+    )
   ) throw new Error('A2A task execution session controls are unavailable')
   return session
 }

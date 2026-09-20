@@ -469,6 +469,30 @@ describe('A2A client disconnect cancellation', () => {
     await firstRead
   })
 
+  it('answers tasks/get without waiting for the in-flight detached run', async () => {
+    const { app, taskStore, startedPromise, release } = await makeDisconnectHarness()
+    const response = await post(
+      app,
+      agentA.slug,
+      body('message/stream'),
+      { 'X-Payment-Signature': paymentHeader('991') },
+    )
+    const reader = response.body!.getReader()
+    const firstRead = reader.read()
+    await startedPromise
+    const taskId = response.headers.get('X-Task-Id')!
+    const got = await Promise.race([
+      post(app, agentA.slug, body('tasks/get', taskId)).then(async (r) => (await r.json()) as { result?: Task }),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+    ])
+    expect(got).not.toBe('timeout')
+    expect((got as { result?: Task }).result?.status.state).toBe('working')
+    release()
+    await waitForTaskState(taskStore, taskId, 'completed')
+    await firstRead
+    await reader.cancel()
+  })
+
   it('interrupts only the exact detached run for tasks/cancel', async () => {
     const { app, sandbox, taskStore, startedPromise, interrupts } = await makeDisconnectHarness()
     const response = await post(

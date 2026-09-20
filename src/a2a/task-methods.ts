@@ -23,6 +23,8 @@ import type { SandboxPromptResult, SandboxRunControlRef, SandboxStreamEvent } fr
 export interface TaskExecutionSource {
   reference: SandboxRunControlRef
   events: (opts?: { since?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
+  /** True while the sandbox still owns this run. `result()` blocks until it is false. */
+  isRunning: () => Promise<boolean>
   result: () => Promise<SandboxPromptResult>
   interrupt: () => Promise<{ cancelled: boolean }>
   translateText: (value: string) => string

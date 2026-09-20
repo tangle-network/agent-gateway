@@ -141,6 +141,12 @@ export function durableSandbox(source: SandboxBox, id = 'test-sandbox'): Durable
     session(sessionId) {
       return {
         events: (options) => events(find(sessionId, options?.executionId), options),
+        runs: async () => [...byExecution.values()]
+          .filter((run) => run.sessionId === sessionId)
+          .map((run) => ({
+            executionId: run.executionId,
+            status: run.done ? (run.interrupted ? 'cancelled' : 'completed') : 'active',
+          })),
         result: async (options) => {
           const run = find(sessionId, options?.executionId)
           await run.finished

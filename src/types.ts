@@ -269,6 +269,8 @@ interface SandboxDurableSession {
   events: (opts?: { since?: string; executionId?: string; signal?: AbortSignal }) => AsyncIterable<SandboxStreamEvent>
   result: (opts?: { executionId?: string }) => Promise<SandboxPromptResult>
   interrupt: (opts?: { executionId?: string }) => Promise<{ cancelled: boolean }>
+  /** Execution status without awaiting the run. `result()` blocks until terminal. */
+  runs: () => Promise<Array<{ executionId: string; status: string }>>
 }
 
 export type SandboxPromptOptions = {
