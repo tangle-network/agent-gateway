@@ -1678,6 +1678,73 @@ describe('PR #11 production regressions', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
+  it('leaves a lapsed lease alone while its sandbox run is still active', async () => {
+    const taskStore = new InMemoryTaskStore()
+    const expired = Date.now() - 60_000
+    const task: Task = {
+      kind: 'task',
+      id: 'orphaned-run-task',
+      contextId: 'orphaned-run-context',
+      status: { state: 'working', timestamp: new Date(expired).toISOString() },
+      history: [{
+        kind: 'message',
+        role: 'user',
+        messageId: 'orphaned-run-message',
+        parts: [{ kind: 'text', text: 'keep going' }],
+      }],
+      metadata: {
+        gatewayOrigin: { version: 1, agentId: agent.id, agentSlug: agent.slug },
+        gatewayExecution: {
+          version: 1,
+          requestId: 'worker-orphan',
+          lease: { id: 'worker-orphan', expiresAt: expired },
+          runControlRef: {
+            environmentId: 'orphan-sandbox',
+            sessionId: 'orphaned-run-task',
+            executionId: 'orphan-execution',
+          },
+        },
+      },
+    }
+    await taskStore.put(task)
+
+    let awaited = false
+    const app = new Hono()
+    app.route('/v1/agents', createAgentGateway(durableConfig({
+      a2a: { taskStore },
+      getSandbox: async () => ({
+        id: 'orphan-sandbox',
+        async *streamPrompt() {},
+        async dispatchPrompt() {
+          throw new Error('the stored run must be reattached, never redispatched')
+        },
+        session: () => ({
+          events: async function* () {},
+          runs: async () => [{ executionId: 'orphan-execution', status: 'active' }],
+          interrupt: async () => ({ cancelled: false }),
+          result: async () => {
+            awaited = true
+            return await new Promise<never>(() => {})
+          },
+        }),
+      } as unknown as Awaited<ReturnType<GatewayConfig['getSandbox']>>),
+    })))
+
+    const response = await Promise.race([
+      app.request('/v1/agents/pr11', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { id: task.id } }),
+      }),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+    ])
+    expect(response).not.toBe('timeout')
+    expect(awaited).toBe(false)
+    const body = await (response as Response).json() as { result?: Task }
+    expect(body.result?.status.state).toBe('working')
+    expect((await taskStore.get(task.id))?.status.state).toBe('working')
+  })
+
   it('reads the input-required prompt out of the runtime question payload', async () => {
     const taskStore = new InMemoryTaskStore()
     const expired = Date.now() - 60_000

@@ -50,10 +50,10 @@ export async function reconcileTaskExecution(
     requestedAgentSlug,
   )
   if (!source) return task
-  // A live fence means the owning request is still streaming this run and will
-  // settle it. `result()` blocks until the run is terminal, so a status read
-  // must never reach it while the run is active.
-  if (hasActiveTaskExecution(task) && await source.isRunning()) return task
+  // `result()` blocks until the run is terminal, so reconciliation must never
+  // reach it while the sandbox still owns the run — a lapsed lease says the
+  // owner is gone, not that the run stopped.
+  if (await source.isRunning()) return task
   const result = await source.result()
   if (result.executionId !== undefined && result.executionId !== source.reference.executionId) {
     throw new Error('A2A task execution result does not match its stored execution')
@@ -220,6 +220,14 @@ export async function recoverExpiredExecutionIfNeeded(
   ) return task
   if (!malformed) {
     try {
+      const source = await getTaskExecutionSource(
+        task,
+        { config: deps.config, taskStore: deps.taskStore },
+        requestedAgentSlug,
+      )
+      // The lease lapsed but the sandbox is still working. Failing the task
+      // here would abandon a live run; a later poll settles it from its result.
+      if (source && await source.isRunning()) return task
       const reconciled = await reconcileTaskExecution(task, deps, requestedAgentSlug)
       if (reconciled !== task && (
         reconciled.status.state !== 'working' ||
