@@ -1,7 +1,8 @@
 # @tangle-network/agent-gateway
 
 Hono middleware that turns any Tangle agent app into a paid API.
-It exposes one shared request pipeline for API keys, x402 SpendAuth, and MPP credentials, with scope enforcement, per-key rate limits, nonce replay protection, prompt-injection detection, and publish routes for the marketplace.
+
+One shared request pipeline for API keys, x402 SpendAuth, and MPP credentials — with scope enforcement, per-key rate limits, nonce replay protection, prompt-injection detection, usage billing, and Google A2A protocol support.
 
 ## Install
 
@@ -9,257 +10,100 @@ It exposes one shared request pipeline for API keys, x402 SpendAuth, and MPP cre
 npm install @tangle-network/agent-gateway
 ```
 
-## API key permissions
+## Contents
 
-Use `createApiKeyRoutes` with the app's existing key store and browser-session authenticator.
-The authenticator must reject operator keys for credential management.
-Declare prerequisites when one permission requires another:
+- [Quickstart](#quickstart) — the minimal gateway in 30 seconds
+- [Authentication methods](#authentication-methods) — API keys, x402, MPP
+- [A2A protocol](#a2a-protocol) — Google's agent-to-agent surface
+- [Payment recovery](./docs/payment-recovery.md) — the durable outbox
+- [API key details](./docs/api-keys.md) — scopes, reservations, rate limits
+- [A2A details](./docs/a2a-protocol.md) — task stores, push notifications
 
-```ts
-createApiKeyRoutes({
-  store: apiKeyStore,
-  getAuthUserId: getBrowserSessionUserId,
-  validScopes: ['operator:read', 'operator:write', 'operator:run'],
-  scopeDependencies: { 'operator:run': ['operator:read'] },
-  requireExpiryForScopes: ['operator:read', 'operator:run'],
-})
-```
+## Quickstart
 
-Missing prerequisites return HTTP 400 with `api_key.scope_dependency` before key creation.
-The issuer never adds missing prerequisites automatically.
-Existing default-scope behavior still applies when scopes are omitted or contain no configured values.
-Dependencies must name configured scopes in a plain record.
-Use a computed property (`['__proto__']`) if that literal scope needs prerequisites.
-`requireExpiryForScopes` rejects missing or nonfuture expiry dates for any matching normalized scope before storage.
-The expiry check uses whole seconds to match the bundled SQL store.
-Other scopes retain the existing optional-expiry behavior.
-Request-time authentication must still enforce all required permissions, expiry, revocation, and workspace access.
-
-## Usage
+The minimal gateway: an agent behind API-key authentication.
 
 ```ts
 import {
   createAgentGateway,
-  createApiKeyRequestClaim,
-  createApiKeyUsageSettlement,
-  recoverPayments,
   SqlApiKeyStore,
   SqlGatewayUsageStore,
-  SqlPaymentRecoveryStore,
   verifyApiKeyFromStore,
 } from '@tangle-network/agent-gateway'
 import { Hono } from 'hono'
 
 const app = new Hono()
-const paymentRecoveryStore = new SqlPaymentRecoveryStore(sqlAdapter)
-await paymentRecoveryStore.migrate()
 const apiKeyStore = new SqlApiKeyStore(sqlAdapter)
-await apiKeyStore.migrate()
 const usageStore = new SqlGatewayUsageStore(sqlAdapter)
-await usageStore.migrate()
+
 app.route('/v1/agents', createAgentGateway({
   resolveAgent: loadPublishedAgent,
   getSandbox: openAgentSandbox,
-  authorizeConsumer: authorizeAgentAccess,
+  authorizeConsumer: authorizeAgentAccess,   // required: your access policy
   recordUsage: usageStore.recordUsage,
-  claimApiKeyRequest: createApiKeyRequestClaim(apiKeyStore),
-  apiKeyReservationLifecycle: apiKeyStore.reservations,
-  settlePayment: createApiKeyUsageSettlement(apiKeyStore),
-  x402: {
-    operatorAddress: '0x…',
-    chainId: 3799,
-    currencyDecimals: 6,
-    verifySigner: verifySpendAuthSignature,
-    paymentProtocolVersion: 2,
-    paymentOperations,
-    authorizePayment: reserveSpendAuthorization,
-  },
-  paymentRecovery: { store: paymentRecoveryStore },
-  defaultOutputTokens: 1024,
-  maxOutputTokens: 4096,
   verifyApiKey: (authHeader) => verifyApiKeyFromStore(authHeader, apiKeyStore),
 }))
 ```
 
-Every gateway requires an explicit `authorizeConsumer` policy.
-Authentication or payment does not grant access to a private workspace.
-For private agents, resolve workspace and thread permissions from the verified consumer identity.
-Public services may explicitly allow consumers only when their execution environment contains approved public resources.
-Omitting the policy rejects gateway construction.
+Every gateway requires an explicit `authorizeConsumer` policy. Authentication or payment does not grant access to a private workspace.
 
-Configure `continueOnDisconnect` when the host keeps agent turns alive after a caller closes the API stream.
-The gateway then consumes the final usage receipt and settles payment in background time.
-When omitted, a disconnect aborts sandbox work.
-Create the gateway inside the Worker request when you need its execution context:
+## Authentication methods
 
-```ts
-const gateway = createAgentGateway({
-  ...gatewayConfig,
-  continueOnDisconnect: (task) => ctx.waitUntil(task),
-})
-```
+| Method | How | Who uses it |
+|---|---|---|
+| **API key** | `Authorization: Bearer ak_...` | paying customers with a Tangle account |
+| **x402 SpendAuth** | signed EIP-712 payment in the request | anonymous per-call payment (no account) |
+| **MPP credential** | method-specific credential + charge lifecycle | marketplace payments |
 
-Use `sqlApiKeyStoreSchemaStatements()` in deploy-time SQL migrations.
-Use `sqlGatewayUsageStoreSchemaStatements()` for retry-safe usage attribution.
-Use `sqlTaskStoreSchemaStatements()` for the durable A2A task table.
-The store defaults match the existing `agent_api_key` table used by Tangle agent apps.
-The API-key store claims each request before compute starts.
-It enforces the key's rolling-minute and UTC-day request limits with durable database slots.
-Concurrent workers cannot claim the same slot, and a retry with the same request ID does not consume another slot.
-When `verifyApiKey` returns a minute or daily limit, configure `claimApiKeyRequest` or the request fails closed with `503`.
-The SQL store retains the current and previous UTC day, then prunes older claim rows every 256 accepted requests.
-The API-key store also records each usage settlement once and refuses a settlement that would exceed the spending limit.
-Finite-cap keys also reserve the full quoted customer charge before execution.
-The quote uses the greater of service-token charges and the provider-cost ceiling, matching settlement pricing.
-Reservations use whole cents; provider budgets remain USD, and token limits remain token counts.
-Concurrent workers cannot reserve more than the remaining key cap.
-Settlement records actual charges once and releases the unused portion of the matching reservation.
-Only a pre-execution reservation can be released after failure.
-An execution without a final receipt retains its reservation until an authoritative receipt reconciles it.
-Reservation rows are separate from rate counters and never expire through rate-counter pruning.
+All three share the same downstream pipeline: rate limits → content checks → authorization → sandbox → settlement → usage recording.
 
-Existing installations must add the reservation table from `sqlApiKeyStoreSchemaStatements()` before adopting this version.
-Its default name is `${table}_reservation`; `reservationTable` overrides it for custom schemas.
-Wire `apiKeyReservationLifecycle: apiKeyStore.reservations` alongside the claim and settlement callbacks.
-Do not delete executing reservations to recover capacity without first reconciling the underlying work.
-
-Capped execution requires `SandboxBox.prepareBudgetedPrompt`.
-Preparation must start no compute and return either an unsupported result or a prepared stream that enforces every supplied limit.
-Enforcement includes provider calls, retries, child calls, and tools throughout that stream.
-The gateway uses only this prepared stream for capped requests and requires a complete, enforced usage receipt.
-Missing support fails with `api_key.execution_budget_unsupported` before compute; explicitly uncapped keys keep their existing execution path.
-A receipt ceiling alone does not prove that upstream provider spending was bounded.
-Current remote agent-app chat adapters forward execution limits but do not implement this preparation contract.
-They remain unsupported for capped execution until the maintained Sandbox backend enforces per-turn limits across its complete execution lifecycle.
-The usage store writes USD values as integer nanodollars instead of SQL floating-point values.
-
-Production requires either `x402.verifySigner` or `verifyApiKey`.
-API-key-only apps can omit `x402` entirely.
-Set `x402.demoMode: true` only for local development and tests; that explicit mode also enables the built-in `sk_agent_*` demo key verifier.
-Keep `verifySigner` free of side effects.
-Use version 2's `authorizePayment` to reserve or claim funds after rate limits, content checks, and product authorization succeed.
-For production version 2, set `x402.paymentProtocolVersion: 2`, provide `paymentOperations`, and return its operation from `authorizePayment`.
-Production version 2 also requires a durable `paymentRecovery.store`.
-Production version 1 is read-only and must not configure `authorizePayment`.
-Production x402 version 1 also rejects the legacy `settlePayment` callback before it consumes a nonce.
-Use version 2 whenever authorization can reserve, charge, or otherwise mutate external funds.
-Run `recoverPayments(config)` from a private scheduled worker.
-Every live request and worker uses a unique durable fence token.
-A stale request or worker cannot update a row after another worker takes its lease.
-Provider settlement, recovery, and release methods must still use the operation ID idempotently.
-`paymentOperations.getPaymentOperation` must read the authoritative provider state by operation ID without changing it.
-This read is required for recovery of older A2A finalization records that predate the shared payment outbox.
-The operation store owns claim, execution start, receipt retention, partial settle, release, and expiry reclaim.
-An executing or retained operation cannot expire into a refund.
-A retained operation settles from its receipt when one exists.
-If the receipt does not arrive before `receiptTimeoutMs`, recovery settles the original quoted ceiling.
-The fallback never settles the payer's larger authorization amount.
-Keep version 1 explicitly configured while old and new gateways coexist; shared nonce storage must reject a version 1 claim owned by a version 2 operation.
-Before it calls the verifier, the gateway requires the signed amount to cover the complete filtered conversation plus the requested output limit.
-The default bound includes system text, message roles, and JSON framing.
-Set `unauthenticatedInputTokenBound` to a conservative bound when the provider adds hidden context.
-Set `inputTokenBound` when the final bound depends on retained history or another authorized consumer context.
-The asynchronous callback runs after payment authentication and `authorizeConsumer`.
-It receives the verified consumer, API-key owner, and `threadId` when one exists.
-The gateway recomputes the execution budget and rejects an underfunded payment before claiming it.
-The gateway rejects `max_tokens` above `maxOutputTokens` and stops the sandbox stream at the accepted limit.
-OpenAI chat requests return a JSON `chat.completion` by default; set `stream: true` for SSE chunks.
-Set `apiKeyPurchaseUrl` to override the API-key purchase link in payment errors; without it, `baseUrl` keeps the `/agents/{slug}/api-keys` default.
-An unpaid request receives `required_amount`, `currency_decimals`, and `max_output_tokens` in the 402 response.
-Sandbox adapters should emit a complete `sandbox.usage` receipt.
-Input and output token counts are inclusive provider totals across all model calls.
-Input totals include tool-result messages and applicable cache accounting.
-Output totals include reasoning tokens when the provider reports them as completion tokens.
-Reasoning and tool token fields are optional measured subsets; never add them again when billing.
-The gateway charges the greater of inclusive token charges and provider cost.
-It does not invent reasoning or tool token caps when the host omits them.
-Explicit detail caps, including zero, remain enforced and require the corresponding measured receipt field.
-Missing detail fields remain absent; absence does not mean measured zero.
-
-This accounting contract changes in 0.11.0.
-Normalize an adapter's provider totals before upgrading; do not report visible text alone as inclusive output.
-New payment outbox and A2A finalization records store `tokenAccounting: 'inclusive'`.
-Historical records without that field retain additive settlement arithmetic during recovery.
-Do not backfill the marker onto historical pending operations or replace their original quoted amounts.
-Requests with a version 2 operation or generic MPP charge reject missing receipts.
-Uncapped API-key requests keep the legacy visible-token estimate path on successful completion.
-Capped requests require enforced usage receipts.
-A failed run must emit its complete, enforced receipt before `error` or `session.run.failed`.
-The gateway settles that measured usage while preserving the failed response or task state.
-Missing, invalid, or unenforced failed-run receipts never become estimated usage charges.
-Payment recovery retains unresolved ownership under its configured recovery policy.
-recordUsage must atomically upsert by event.requestId; recovery may retry an event after its acknowledgement is lost.
-Explicit demo mode exposes A2A with an in-memory task store.
-Production must configure an atomic durable task store; otherwise A2A returns `503` while the OpenAI surface remains available.
-Older custom A2A task stores remain source-compatible at the type boundary.
-The OpenAI surface stays available when such a store is configured, while A2A returns `503` until its owner supplies atomic methods.
-Use an atomic task store for multi-worker production deployments.
-
-MPP is method-specific.
-Configure `mpp.authenticateCredential` for production MPP credentials.
-This callback receives the decoded payload and live credential.
-It returns `{ consumerId, paymentIdentity }` or `null`.
-`paymentIdentity` must be a stable, non-secret processor identity.
-Equivalent encodings of one credential must return the same payment identity.
-It must not reserve, confirm, or consume payment.
-The default `blueprintevm` method may reuse `x402.verifySigner` when its credential has the compatible x402 payload shape.
-Every other method requires an `mpp.charge` lifecycle.
-The lifecycle confirms payment after all request denials.
-The gateway then acquires its execution fence before it returns a response or starts sandbox work.
-`confirmPayment` must bind the provider operation to the supplied `operationId` before confirmation.
-It must return only after it verifies final payment success.
-`recoverPayment` must inspect that operation ID and must never create another charge.
-An authoritative `not-found` result must fence the operation ID against a later charge.
-`releasePayment` must perform an idempotent refund or release.
-The live credential is passed to `confirmPayment` only on the original request.
-The nonce and recovery stores persist only the SHA-256 digest of `paymentIdentity`.
-`Payment-Receipt` values must contain visible ASCII only.
-
-`NonceStore` remains source-compatible with 0.7.1 `hasSeen`/`markSeen` stores.
-Payment requests now require its atomic `claim` method, including version 1.
-This is a deliberate safety boundary: a check followed by a write can accept two concurrent payments.
-`KvNonceStore` with plain Cloudflare KV is not atomic and is rejected by `createAgentGateway`.
-Provide `KvNonceStore` an `atomicClaim` callback backed by D1, a Durable Object, or another linearizable store.
-Payment paths fail closed unless the store also provides one atomic `claim` method.
-The 0.7.1 `mpp.verifySigner` callback is also supported; the gateway derives a stable identity until the integration moves to `authenticateCredential`.
-
-The same authentication, authorization, rate-limit, filtering, sandbox, settlement, and usage-recording pipeline is used by the OpenAI-compatible and A2A endpoints.
-Wire protocol handlers only translate their request and response shapes.
-
-Set `conversationMode: 'thread'` when API calls must use the app's visible conversations.
-The gateway accepts an optional `X-Tangle-Thread-Id` and returns the resolved ID in the same response header.
-Its authenticated `getSandbox` context contains that thread ID, the API-key identity, and the filtered messages.
-An `agent-app` host can use this context to drive its normal persisted chat route instead of opening a second sandbox session.
+Production requires at least one of `x402.verifySigner` or `verifyApiKey`. API-key-only apps can omit `x402` entirely.
 
 ## A2A protocol
 
-The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 dispatch for `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, and the four `tasks/pushNotificationConfig/*` methods. Long-horizon agents — durable tasks across worker restarts, webhook delivery on terminal state, `input-required` pauses with multi-turn continuation — are documented in [`docs/a2a-long-horizon.md`](./docs/a2a-long-horizon.md).
-Production A2A task control requires `a2a.authorizeTaskAccess`; explicit demo mode is the local-test exception.
-Set `a2a: false` when the application does not expose A2A routes.
-Custom production task stores must implement atomic `createIfAbsent`, `compareAndSet`, and `compareAndSetExecution` methods.
-`compareAndSetExecution` must reject a renewal when the stored owner lease has expired.
-Task stores must retain payment recovery metadata until reconciliation clears it.
-The short-lived `gatewaySubmission` marker is not a payment recovery record and may expire with its task.
-The bundled memory and SQL stores enforce this rule even after the normal task TTL.
-Push destinations must use HTTPS without URL credentials.
-Push delivery does not follow redirects.
-Production push delivery also requires `a2a.pushUrlValidator` to reject private DNS destinations.
-Production push delivery requires `a2a.webhookSecret` so every webhook has an HMAC signature.
-The exported `deliverPushNotifications` function also requires a non-empty secret.
-Use `deliverDemoPushNotifications` only for explicit local demo mode.
-Tasks created before this release have no recorded origin and fail closed; migrate them with a verified owner binding or let them expire.
-The payment claim keeps its submission lease until the atomic submitted-to-working transition.
-An expired execution lease fails the working task and preserves its payment recovery markers.
+The gateway speaks Google's A2A protocol alongside its OpenAI-compatible surface: discovery via `.well-known/agent.json`, JSON-RPC 2.0 for `message/send`, `message/stream`, task management, and push notifications.
 
-## Tier
+Set `a2a: false` when the application does not expose A2A routes. See [docs/a2a-protocol.md](./docs/a2a-protocol.md) for task stores, push delivery, and long-horizon agents.
 
-Marketplace tier of the [agent-builder](https://github.com/drewstone/tangle-agent-builder) three-tier architecture (Forge / Workbench / Marketplace). Used by every `*.tangle.tools` agent app that publishes a paid API.
+## Consumers call this with agent-client
+
+[`@tangle-network/agent-client`](https://github.com/tangle-network/agent-client) is the consumer SDK for the endpoints this gateway fronts:
+
+```ts
+import { AgentClient } from '@tangle-network/agent-client'
+const client = new AgentClient('https://your-agent.tangle.tools')
+const response = await client.chat('my-agent', messages, { apiKey: 'ak_...' })
+```
+
+## Architecture
+
+```
+agent-gateway (this package — server middleware)
+  ├── createAgentGateway() — the request pipeline
+  ├── SqlApiKeyStore — API keys + rate limits + reservations
+  ├── SqlGatewayUsageStore — retry-safe usage attribution
+  ├── SqlPaymentRecoveryStore — durable payment outbox
+  └── A2A routes — Google agent-to-agent protocol
+
+agent-client (consumer SDK)
+  ├── AgentClient — discover, chat, stream
+  └── Auth: API key, x402 SpendAuth, MPP
+```
+
+## Documentation
+
+| Topic | Document |
+|---|---|
+| Payment recovery, reservations, nonce stores | [docs/payment-recovery.md](./docs/payment-recovery.md) |
+| API key scopes, dependencies, rate limits | [docs/api-keys.md](./docs/api-keys.md) |
+| A2A task stores, push notifications, long-horizon | [docs/a2a-protocol.md](./docs/a2a-protocol.md) |
+| Long-horizon agents | [docs/a2a-long-horizon.md](./docs/a2a-long-horizon.md) |
 
 ## Related
 
-- [`@tangle-network/agent-client`](https://github.com/tangle-network/agent-client) — consumer SDK for calling endpoints this gateway fronts
-- [`@tangle-network/agent-eval`](https://github.com/tangle-network/agent-eval) — evaluation framework for agents published behind this gateway
-- [`@tangle-network/tcloud`](https://github.com/tangle-network/tcloud) — consumer SDK for Tangle platform services (router, sandbox, browser)
+- [`agent-client`](https://github.com/tangle-network/agent-client) — consumer SDK for calling this gateway
+- [`agent-eval`](https://github.com/tangle-network/agent-eval) — evaluation framework
+- [`tcloud`](https://github.com/tangle-network/tcloud) — consumer SDK for Tangle platform services
 
 ## License
 
