@@ -45,10 +45,10 @@
     "hono": "^4.13.5"
   },
   "devDependencies": {
-    "@tangle-network/agent-app": "0.48.3",
-    "@tangle-network/agent-interface": "2.10.0",
-    "@tangle-network/agent-runtime": "0.240.0",
-    "@tangle-network/sandbox": "0.43.0",
+    "@tangle-network/agent-app": "0.60.168",
+    "@tangle-network/agent-interface": "5.2.0",
+    "@tangle-network/agent-runtime": "0.318.0",
+    "@tangle-network/sandbox": "0.60.49",
     "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.11",
     "tsup": "^8.0.0",
