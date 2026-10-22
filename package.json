@@ -54,7 +54,7 @@
     "tsup": "^8.0.0",
     "typescript": "^5.9.3",
     "viem": "^2.56.2",
-    "vite": "8.0.16",
+    "vite": "8.1.6",
     "vitest": "^4.1.11"
   },
   "pnpm": {
@@ -62,11 +62,12 @@
       "hono": "4.13.5",
       "nanoid": "3.3.18",
       "postcss": "8.5.23",
-      "vite": "8.0.16",
+      "vite": "8.1.6",
       "esbuild": "0.28.1"
     }
   },
   "overrides": {
-    "esbuild": "0.28.1"
+    "esbuild": "0.28.1",
+    "source-map-js": "1.2.2"
   }
 }
