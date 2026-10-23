@@ -7,8 +7,10 @@ One shared request pipeline for API keys, x402 SpendAuth, and MPP credentials â€
 ## Install
 
 ```bash
-npm install @tangle-network/agent-gateway
+npm install @tangle-network/agent-gateway hono
 ```
+
+Hono is a required peer dependency. Use the application's existing compatible Hono installation so the application and gateway share one router type identity. The supported range is declared in `package.json`.
 
 ## Contents
 
