@@ -8,9 +8,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  publish-check:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, Linux, X64, ci-public]
+    permissions:
+      contents: read
+    outputs:
+      needed: ${{ steps.registry.outputs.needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Start a hosted runner only for an unpublished npm version
+        id: registry
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs'
+          const { name, version } = JSON.parse(readFileSync('package.json', 'utf8'))
+          const url = `https://registry.npmjs.org/${encodeURIComponent(name).replace('%40', '@')}/${encodeURIComponent(version)}`
+          const response = await fetch(url, { signal: AbortSignal.timeout(15000) })
+          if (response.status !== 404 && !response.ok) throw new Error(`npm returned HTTP ${response.status}`)
+          if (response.ok) {
+            const published = await response.json()
+            if (published.name !== name || published.version !== version) throw new Error('Unexpected registry version')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `needed=${response.status === 404}\n`)
+          NODE
+
   verify:
     name: verify (Node ${{ matrix.node-version }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ci-public]
     strategy:
       fail-fast: false
       matrix:
@@ -51,8 +82,8 @@ jobs:
           echo "Version locked: $NPM_VERSION"
 
   publish-npm:
-    needs: verify
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, publish-check]
+    if: needs.publish-check.outputs.needed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
