@@ -14,10 +14,6 @@ overrides:
 importers:
 
   .:
-    dependencies:
-      hono:
-        specifier: 4.13.5
-        version: 4.13.5
     devDependencies:
       '@tangle-network/agent-app':
         specifier: 0.60.168
@@ -37,6 +33,9 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^4.1.11
         version: 4.1.11(vitest@4.1.11)
+      hono:
+        specifier: 4.13.5
+        version: 4.13.5
       tsup:
         specifier: ^8.0.0
         version: 8.5.1(postcss@8.5.23)(typescript@5.9.3)(yaml@2.9.1)

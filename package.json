@@ -1,6 +1,6 @@
 {
   "name": "@tangle-network/agent-gateway",
-  "version": "0.11.4",
+  "version": "0.11.5",
   "packageManager": "pnpm@10.28.0",
   "engines": {
     "node": ">=22.13.0"
@@ -41,7 +41,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
-  "dependencies": {
+  "peerDependencies": {
     "hono": "^4.13.5"
   },
   "devDependencies": {
@@ -51,6 +51,7 @@
     "@tangle-network/sandbox": "0.60.49",
     "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.11",
+    "hono": "^4.13.5",
     "tsup": "^8.0.0",
     "typescript": "^5.9.3",
     "viem": "^2.56.2",
