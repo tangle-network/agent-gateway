@@ -1,7 +1,6 @@
 name: Publish
 
 on:
-  pull_request:
   push:
     tags:
       - 'v*'
@@ -10,7 +9,7 @@ on:
 jobs:
   publish-check:
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, Linux, X64, ci-public]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -40,10 +39,11 @@ jobs:
           NODE
 
   verify:
+    if: startsWith(github.ref, 'refs/tags/v')
     name: verify (Node ${{ matrix.node-version }})
     permissions:
       contents: read
-    runs-on: [self-hosted, Linux, X64, ci-public]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

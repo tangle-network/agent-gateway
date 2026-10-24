@@ -92,6 +92,10 @@ agent-client (consumer SDK)
   └── Auth: API key, x402 SpendAuth, MPP
 ```
 
+## Local checks
+
+Local Beelink gate (set `TOUCHED_INTEGRATION_TEST` to the touched integration test file; the gate installs with the frozen pnpm lockfile): `beelink-gate auto https://github.com/tangle-network/agent-gateway.git "$(git rev-parse HEAD)" -- sh -c 'pnpm typecheck && pnpm exec vitest run "$1"' _ "${TOUCHED_INTEGRATION_TEST:?set touched integration test path}"`.
+
 ## Documentation
 
 | Topic | Document |
